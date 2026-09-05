@@ -1,0 +1,7 @@
+# 渲染引擎与大体积依赖不进 git（运行时按需安装）
+node_modules/
+engines/
+
+__pycache__/
+*.pyc
+.DS_Store

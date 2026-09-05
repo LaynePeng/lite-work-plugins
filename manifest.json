@@ -1,0 +1,81 @@
+{
+  "version": "1.0.0",
+  "min_app_version": "0.5.0",
+  "plugins": [
+    {
+      "name": "office-plugin",
+      "version": "1.0.0",
+      "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、数据分析、图表",
+      "path": "plugins/office-plugin",
+      "tools": [
+        "docx_create", "docx_append", "xlsx_create", "pptx_create", "pdf_create",
+        "data_analyze", "chart_make", "docx_read", "xlsx_read", "pptx_read", "pdf_read"
+      ]
+    },
+    {
+      "name": "ocr-plugin",
+      "version": "1.0.0",
+      "description": "OCR 识别：图片/PDF 页面/PPT 内嵌图片中的文字提取",
+      "path": "plugins/ocr-plugin",
+      "tools": ["ocr_image", "ocr_document", "ocr_pptx"]
+    },
+    {
+      "name": "webfetch-plugin",
+      "version": "1.0.0",
+      "description": "Web 抓取：webfetch/webfetch_batch 联网获取信息（三级反爬对抗）",
+      "path": "plugins/webfetch-plugin",
+      "tools": ["webfetch", "webfetch_batch"]
+    },
+    {
+      "name": "example-greeting",
+      "version": "1.0.0",
+      "description": "示例插件：文本统计工具（演示社区插件编写格式）",
+      "path": "plugins/example-greeting",
+      "tools": ["text_stats"]
+    }
+  ],
+  "skills": [
+    {
+      "name": "data-analysis",
+      "version": "1.0.0",
+      "description": "数据分析：对 CSV/JSON 数据做清洗、统计与可视化，输出结论并可选导出 Excel/图表",
+      "path": "skills/data-analysis"
+    },
+    {
+      "name": "diagram-to-office",
+      "version": "1.0.0",
+      "description": "图表转 Office：把 PlantUML / Mermaid 源码渲染成 PNG/SVG 图片，再嵌入 Word/PPT 文档",
+      "path": "skills/diagram-to-office"
+    },
+    {
+      "name": "document-writing",
+      "version": "1.0.0",
+      "description": "文档写作：方案/通知/制度/说明书等正式文档撰写，排版生成 Word 或 PDF",
+      "path": "skills/document-writing"
+    },
+    {
+      "name": "meeting-notes",
+      "version": "1.0.0",
+      "description": "会议纪要整理：根据会议记录/录音转写文本生成结构化会议纪要 Word 文档",
+      "path": "skills/meeting-notes"
+    },
+    {
+      "name": "presentation",
+      "version": "1.0.0",
+      "description": "演示文稿制作：把主题/大纲/文档内容转成 PPT 初稿（python-pptx 生成 .pptx）",
+      "path": "skills/presentation"
+    },
+    {
+      "name": "research-report",
+      "version": "1.0.0",
+      "description": "调研报告：多来源网络查证、交叉验证，输出带来源标注的调研报告（Word/PDF）",
+      "path": "skills/research-report"
+    },
+    {
+      "name": "weekly-report",
+      "version": "1.0.0",
+      "description": "生成周报：收集本周工作内容（可结合 git 提交记录），排版生成 Word 周报文档",
+      "path": "skills/weekly-report"
+    }
+  ]
+}
