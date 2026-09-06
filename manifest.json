@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "office-plugin",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、数据分析、图表",
       "path": "plugins/office-plugin",
       "tools": [

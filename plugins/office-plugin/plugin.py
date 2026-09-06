@@ -119,7 +119,9 @@ class OfficeTools:
                 name="docx_create",
                 description=(
                     "根据 Markdown 内容生成 Word (.docx) 文档，支持标题、段落、"
-                    "列表、表格、粗体/斜体、图片嵌入（Markdown 图片语法 "
+                    "列表、表格、粗体/斜体/文字颜色（<span style=\"color:red\">红字</span>"
+                    "或 <font color=\"red\">红字</font>，颜色支持命名色/#RGB/#RRGGBB/"
+                    "rgb()），以及图片嵌入（Markdown 图片语法 "
                     "![图注](图片路径)）。返回文件路径。"
                 ),
                 parameters={
@@ -127,7 +129,7 @@ class OfficeTools:
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "Markdown 格式的文档正文，支持图片嵌入语法 ![图注](图片路径)",
+                            "description": "Markdown 格式的文档正文，支持图片嵌入语法 ![图注](图片路径)、文字颜色语法 <span style='color:red'>文字</span>",
                         },
                         "filename": {
                             "type": "string",
@@ -145,8 +147,8 @@ class OfficeTools:
                 name="docx_append",
                 description=(
                     "向已有的 Word (.docx) 文档追加内容（Markdown 格式，支持标题/段落/"
-                    "列表/表格/图片），保留原有内容与样式。用于迭代式写作：在生成的"
-                    "文档上补充章节、追加内容。返回文件路径。"
+                    "列表/表格/图片/粗体/斜体/颜色），保留原有内容与样式。用于迭代式写作："
+                    "在生成的文档上补充章节、追加内容。返回文件路径。"
                 ),
                 parameters={
                     "type": "object",
@@ -537,12 +539,11 @@ class OfficeTools:
                             for c_idx, cell_text in enumerate(row_data):
                                 if c_idx < table_cols:
                                     cell = table.rows[r_idx].cells[c_idx]
-                                    cell.text = cell_text
-                                    if r_idx == 0:
-                                        # 表头加粗
-                                        for paragraph in cell.paragraphs:
-                                            for run in paragraph.runs:
-                                                run.bold = True
+                                    # 单元格内容同样支持内联格式（加粗/斜体/颜色），表头整体加粗
+                                    cell.text = ""
+                                    self._add_styled_run(
+                                        cell.paragraphs[0], cell_text, bold=(r_idx == 0)
+                                    )
                     doc.add_paragraph()  # 表后空行
                     table_data = []
                     in_table = False
@@ -558,7 +559,9 @@ class OfficeTools:
             if heading_match:
                 level = len(heading_match.group(1))
                 text = heading_match.group(2).strip()
-                doc.add_heading(text, level=level)
+                # 标题也解析内联格式（加粗/斜体/颜色），避免 ** 等原样输出
+                heading = doc.add_heading("", level=level)
+                self._add_styled_run(heading, text)
                 i += 1
                 continue
 
@@ -625,29 +628,123 @@ class OfficeTools:
             for r_idx, row_data in enumerate(table_data):
                 for c_idx, cell_text in enumerate(row_data):
                     if c_idx < table_cols:
-                        table.rows[r_idx].cells[c_idx].text = cell_text
+                        cell = table.rows[r_idx].cells[c_idx]
+                        cell.text = ""
+                        self._add_styled_run(
+                            cell.paragraphs[0], cell_text, bold=(r_idx == 0)
+                        )
 
-    def _add_styled_run(self, paragraph, text: str) -> None:
-        """解析内联 Markdown 格式（粗体、斜体、行内代码）并添加到段落。"""
-        # 分割：行内代码 `code`
-        parts = re.split(r"(`[^`]+`)", text)
-        for part in parts:
-            if part.startswith("`") and part.endswith("`"):
-                run = paragraph.add_run(part[1:-1])
-                run.font.name = "Courier New"
-                run.font.size = Pt(9)
+    # 常用命名颜色（CSS 兼容子集，便于直接书写）
+    _NAMED_COLORS = {
+        "black": (0x00, 0x00, 0x00),
+        "white": (0xFF, 0xFF, 0xFF),
+        "red": (0xFF, 0x00, 0x00),
+        "green": (0x00, 0x80, 0x00),
+        "blue": (0x00, 0x00, 0xFF),
+        "yellow": (0xFF, 0xFF, 0x00),
+        "orange": (0xFF, 0xA5, 0x00),
+        "purple": (0x80, 0x00, 0x80),
+        "gray": (0x80, 0x80, 0x80),
+        "grey": (0x80, 0x80, 0x80),
+        "cyan": (0x00, 0xFF, 0xFF),
+        "magenta": (0xFF, 0x00, 0xFF),
+        "pink": (0xFF, 0xC0, 0xCB),
+        "brown": (0xA5, 0x2A, 0x2A),
+        "navy": (0x00, 0x00, 0x80),
+        "darkred": (0x8B, 0x00, 0x00),
+        "darkgreen": (0x00, 0x64, 0x00),
+        "darkblue": (0x00, 0x00, 0x8B),
+        "lightgray": (0xD3, 0xD3, 0xD3),
+        "silver": (0xC0, 0xC0, 0xC0),
+        "gold": (0xFF, 0xD7, 0x00),
+        "teal": (0x00, 0x80, 0x80),
+        "maroon": (0x80, 0x00, 0x00),
+        "olive": (0x80, 0x80, 0x00),
+        "lime": (0x00, 0xFF, 0x00),
+    }
+
+    def _parse_color(self, color_str: str) -> Optional[Any]:
+        """解析颜色：命名色 / #RGB / #RRGGBB / rgb(r,g,b)，失败返回 None。"""
+        if not color_str:
+            return None
+        cs = color_str.strip().lower()
+        if cs.startswith("#"):
+            hex_val = cs[1:]
+            if re.fullmatch(r"[0-9a-f]{3}|[0-9a-f]{6}", hex_val):
+                if len(hex_val) == 3:
+                    hex_val = "".join(ch * 2 for ch in hex_val)
+                return RGBColor(int(hex_val[0:2], 16), int(hex_val[2:4], 16), int(hex_val[4:6], 16))
+        if cs.startswith("rgb("):
+            m = re.fullmatch(r"rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)", cs)
+            if m:
+                r, g, b = (min(255, max(0, int(v))) for v in m.groups())
+                return RGBColor(r, g, b)
+        if cs in self._NAMED_COLORS:
+            r, g, b = self._NAMED_COLORS[cs]
+            return RGBColor(r, g, b)
+        return None
+
+    def _add_styled_run(self, paragraph, text: str, *, bold: bool = False,
+                        italic: bool = False, color: Optional[Any] = None) -> None:
+        """解析内联 Markdown 格式（粗体、斜体、行内代码、颜色）并添加到段落。
+
+        颜色语法（可嵌套粗体/斜体）：
+          <span style="color:red">文字</span>  或  <font color="red">文字</font>
+        颜色取值：命名色（red/blue/green... 见 _NAMED_COLORS）、
+        #RGB、#RRGGBB、rgb(r,g,b)。
+        """
+        # 1) 行内代码 `code`（最高优先级，内部不再解析）
+        m = re.search(r"`[^`]+`", text)
+        if m:
+            self._add_styled_run(paragraph, text[:m.start()], bold=bold, italic=italic, color=color)
+            run = paragraph.add_run(m.group(0)[1:-1])
+            run.font.name = "Courier New"
+            run.font.size = Pt(9)
+            if bold:
+                run.bold = True
+            if italic:
+                run.italic = True
+            if color is not None:
+                run.font.color.rgb = color
+            self._add_styled_run(paragraph, text[m.end():], bold=bold, italic=italic, color=color)
+            return
+
+        # 2) 颜色标签 <span style="color:xxx">...</span> / <font color="xxx">...</font>
+        m = re.search(
+            r"<span[^>]*style=[\"']color\s*:\s*([^;\"']+)[\"'][^>]*>(.*?)</span>"
+            r"|<font[^>]*color=[\"']([^\"']+)[\"'][^>]*>(.*?)</font>",
+            text, re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            inner_color = self._parse_color(m.group(1) if m.group(1) is not None else m.group(3))
+            inner = m.group(2) if m.group(2) is not None else m.group(4)
+            self._add_styled_run(paragraph, text[:m.start()], bold=bold, italic=italic, color=color)
+            self._add_styled_run(paragraph, inner, bold=bold, italic=italic,
+                                 color=inner_color if inner_color is not None else color)
+            self._add_styled_run(paragraph, text[m.end():], bold=bold, italic=italic, color=color)
+            return
+
+        # 3) 粗体 / 斜体
+        m = re.search(r"\*\*[^*]+\*\*|\*[^*]+\*", text)
+        if m:
+            token = m.group(0)
+            self._add_styled_run(paragraph, text[:m.start()], bold=bold, italic=italic, color=color)
+            if token.startswith("**"):
+                self._add_styled_run(paragraph, token[2:-2], bold=True, italic=italic, color=color)
             else:
-                # 分割粗体 **text** 和斜体 *text*
-                sub_parts = re.split(r"(\*\*[^*]+\*\*|\*[^*]+\*)", part)
-                for sp in sub_parts:
-                    if sp.startswith("**") and sp.endswith("**"):
-                        run = paragraph.add_run(sp[2:-2])
-                        run.bold = True
-                    elif sp.startswith("*") and sp.endswith("*") and not sp.startswith("**"):
-                        run = paragraph.add_run(sp[1:-1])
-                        run.italic = True
-                    else:
-                        paragraph.add_run(sp)
+                self._add_styled_run(paragraph, token[1:-1], bold=bold, italic=True, color=color)
+            self._add_styled_run(paragraph, text[m.end():], bold=bold, italic=italic, color=color)
+            return
+
+        # 4) 纯文本
+        if text:
+            run = paragraph.add_run(text)
+            if bold:
+                run.bold = True
+            if italic:
+                run.italic = True
+            if color is not None:
+                run.font.color.rgb = color
 
     def _add_docx_image(self, doc, img_path: str, alt: str = "") -> None:
         """嵌入图片到 docx（居中，自动缩放适配页宽，可带图注）。"""
@@ -1481,7 +1578,7 @@ class OfficePlugin(ToolPlugin):
     """office-plugin 社区独立分发版。"""
 
     name = "office-plugin"
-    version = "1.0.0"
+    version = "1.1.0"
     description = "办公生产力：Word/Excel/PPT/PDF 生成与读取、数据分析、图表"
 
     def __init__(self) -> None:
