@@ -1,0 +1,18 @@
+name: Plugin Deps Audit
+
+on:
+  push:
+    paths: ["plugins/**", "scripts/check_plugin_deps.py"]
+  pull_request:
+    paths: ["plugins/**", "scripts/check_plugin_deps.py"]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 插件依赖审计（新依赖必须有 wheels，见 AGENTS.md）
+        run: python scripts/check_plugin_deps.py

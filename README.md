@@ -134,6 +134,10 @@ pip download some_pkg -d wheels/ \
   可用系统 pip/npm）或让用户预装
 - `requirements.txt` 保留作开发态便利（`npm run dev` 时 venv pip 安装），
   但**打包版安装会跳过并记录告警**，社区发布必须带 wheels
+- **更新插件引入新包时先跑审计**（CI 强制执行，规则见 [AGENTS.md](AGENTS.md)）：
+  ```bash
+  python scripts/check_plugin_deps.py
+  ```
 
 ## 编写技能
 
