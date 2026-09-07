@@ -4,12 +4,15 @@
   "plugins": [
     {
       "name": "office-plugin",
-      "version": "1.1.0",
-      "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、数据分析、图表",
+      "version": "1.2.0",
+      "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、格式化编辑与查找替换、数据分析、图表",
       "path": "plugins/office-plugin",
       "tools": [
-        "docx_create", "docx_append", "xlsx_create", "pptx_create", "pdf_create",
-        "data_analyze", "chart_make", "docx_read", "xlsx_read", "pptx_read", "pdf_read"
+        "docx_create", "docx_append", "docx_format", "docx_replace",
+        "xlsx_create", "xlsx_format", "xlsx_replace",
+        "pptx_create", "pptx_format",
+        "pdf_create", "data_analyze", "chart_make",
+        "docx_read", "xlsx_read", "pptx_read", "pdf_read"
       ]
     },
     {

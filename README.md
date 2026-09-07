@@ -13,7 +13,7 @@
 lite-work-plugins/
 ├── manifest.json            # 清单：全部可安装项（名称/版本/路径）
 ├── plugins/                 # Cordis 工具插件
-│   ├── office-plugin/       #   办公生产力（11 个工具，与主程序内置版同步）
+│   ├── office-plugin/       #   办公生产力（16 个工具：生成/读取/格式化编辑/查找替换）
 │   │   └── plugin.py
 │   ├── ocr-plugin/          #   OCR 识别（图片/PDF/PPT 内嵌图片）
 │   │   └── plugin.py
