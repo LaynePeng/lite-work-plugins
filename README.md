@@ -31,7 +31,9 @@ lite-work-plugins/
     └── weekly-report/
 ```
 
-> 渲染引擎（node_modules 等大体积依赖）不进 git；技能运行时按需自动安装。
+> 需要第三方依赖的插件：依赖以 `wheels/*.whl` 放在插件目录内分发
+> （见「插件依赖」），运行时自动解压生效；渲染引擎（node_modules 等
+> 大体积依赖）不进 git，技能运行时按需自动安装。
 
 ## 使用方式
 
@@ -88,10 +90,50 @@ class MyPlugin(ToolPlugin):
   `kernel.get_service("app")` 捕获
 - **覆盖**：`get_tools()` 返回与内置同名的工具即完成替换；
   `removed_tools` 声明移除
-- 依赖第三方库时：插件目录放 `requirements.txt`（安装时自动 pip），
-  纯 pip 依赖即可（主程序已捆绑 docx/openpyxl/pypdf/rapidocr/pymupdf/
-  curl_cffi 等）
+- **依赖**：优先用 `wheels/` 目录分发（见下节「插件依赖」）；
+  `requirements.txt` 仅开发态可用（打包版会跳过并告警）
 - 新插件记得登记进 `manifest.json`
+- 主程序已捆绑的库可直接 import：docx / openpyxl / pptx / reportlab /
+  pandas / matplotlib / pypdf / rapidocr / pymupdf / curl_cffi /
+  httpx / numpy / PIL——**这些不要打进 wheels**（体积巨大且版本可能冲突）
+
+## 插件依赖（wheels 分发）
+
+打包版 lite-work 是 PyInstaller frozen 进程：site-packages 已固化，
+`pip install` 装到任何位置 frozen 进程都无法 import。因此插件依赖的
+**唯一分发方式是自带 wheels**：
+
+```text
+plugins/my-plugin/
+├── plugin.py
+└── wheels/                  # 安装时自动解压到 libs/ 并加入 sys.path
+    └── some_pkg-1.0.0-py3-none-any.whl
+```
+
+安装时主程序自动把 `wheels/*.whl` 解压到插件目录 `libs/`（whl 即 zip，
+包结构在根目录），并把 `libs/` 加入 `sys.path`——插件代码直接
+`import some_pkg` 即可。解压幂等（stamp 记录 wheel 清单，更新才重解压）。
+
+**制作 wheels**（在插件目录下执行）：
+
+```bash
+# 当前平台（本机测试用）
+pip download some_pkg -d wheels/
+
+# 跨平台分发：按目标平台下载二进制 wheel（纯 Python 包无需指定平台）
+pip download some_pkg -d wheels/ \
+  --platform win_amd64 --python-version 3.12 --only-binary=:all:
+```
+
+约束与建议：
+
+- **纯 Python 依赖**（jinja2、pyyaml、markdown 等）：任意平台通用，首选
+- **带原生扩展的依赖**（lxml、pillow 等）：whl 与平台/Python 版本强绑定，
+  需为每个目标平台各放一个 wheel（文件名含平台标签，自动全部解压）
+- 超大依赖（>50MB）不建议打进 wheels——考虑改为技能（外部进程执行，
+  可用系统 pip/npm）或让用户预装
+- `requirements.txt` 保留作开发态便利（`npm run dev` 时 venv pip 安装），
+  但**打包版安装会跳过并记录告警**，社区发布必须带 wheels
 
 ## 编写技能
 
