@@ -166,30 +166,40 @@ triggers: 关键词1,关键词2
 
 MIT
 
-## 编写协作模式（kind: collab）
+## 协作模式（kind: collab）
 
-协作模式是特殊的插件包：安装后出现在 lite-work
-**设置 → 多智能体 → 协作模式**选择器中，选中即把该模式的派生指引
-（配方）注入 `spawn_agent` 工具描述，并可选提供行为钩子。
+lite-work v1.5.0 起，**7 个协作模式已内置随主程序发布**（v1.0.0）：
+编排-工人 / 流水线 / 头脑风暴 / 互批 / 辩论 / 会议 / 测试驱动接力。
+
+本仓库的 `collab-*` 包是它们的**独立更新通道**（与 office-plugin 等内置插件
+同一机制）：
+
+- lite-work 内置 v1.0.0 ↔ 社区同版本 → 设置面板显示「已是最新」
+- 社区发布新版（如 v1.1.0）→ 显示「可更新」，安装后**覆盖内置版**
+- 删除本地版 → 自动回退内置版
+- 安装/覆盖判定按插件包名（`collab-meeting` 等）匹配，`kind: "collab"`
+  标记协作模式类别（lite-work 前端据此归入协作模式安装面板与标签）
+
+### 包格式
 
 ```
 plugins/collab-<mode>/
-  plugin.py    # CollabModePlugin 子类（声明元信息）
-  recipe.md    # 模式配方（给主 Agent 的编排指引，选中时生效）
-  icon.svg     # 可选 logo（48×48；对话框选择器与安装面板展示，无则回退默认图标）
+  plugin.py    # CollabModePlugin 子类（元信息与内置版保持一致）
+  recipe.md    # 模式配方（须与内置 RECIPE 常量同步——本仓库是上游事实源）
+  icon.svg     # logo（48×48；对话框选择器与安装面板展示）
 ```
 
-`plugin.py` 最小模板：
+`plugin.py` 模板（元信息必须与内置版一致，否则覆盖机制失效）：
 
 ```python
 from litework.orchestration.collab_policy import CollabModePlugin
 
 class MeetingCollabMode(CollabModePlugin):
-    name = "collab-meeting"        # 插件名（安装/更新/卸载的标识）
+    name = "collab-meeting"          # 插件包名（与内置一致 → 可覆盖更新）
     version = "1.0.0"
     description = "协作模式：多 Agent 围绕议题轮流发言、收敛共识"
-    mode_name = "meeting"          # 模式标识（config.collab_policy 的取值）
-    display_name = "会议（群聊共识）"  # 选择器显示名
+    mode_name = "meeting"            # 模式标识（会话选择器取值）
+    display_name = "会议（群聊共识）"   # 选择器显示名
 
     # 可选行为钩子（异常自动隔离，不影响任务执行）：
     # async def on_agent_spawned(self, ctx): ...
@@ -197,11 +207,7 @@ class MeetingCollabMode(CollabModePlugin):
     # async def on_task_done(self, ctx): ...
 ```
 
-`recipe.md` 写编排流程（怎么 spawn / wait / send_message / followup_task），
-参考本仓库 `plugins/collab-*` 的 7 个内置模式：
-编排-工人 / 流水线 / 头脑风暴 / 互批 / 辩论 / 会议 / 测试驱动接力。
-
-`manifest.json` 条目需带 `"kind": "collab"`（客户端据此归入协作模式安装区）：
+`manifest.json` 条目：
 
 ```json
 {
@@ -209,6 +215,12 @@ class MeetingCollabMode(CollabModePlugin):
   "version": "1.0.0",
   "description": "协作模式：多 Agent 围绕议题轮流发言、收敛共识",
   "path": "plugins/collab-meeting",
-  "kind": "collab"
+  "kind": "collab",
+  "icon": "plugins/collab-meeting/icon.svg"
 }
 ```
+
+### 新增协作模式（内置没有的）
+
+内置只含上述 7 种；社区可发布全新模式（如 `collab-swarm`），用户安装后
+即出现在对话框协作模式选择器中。
