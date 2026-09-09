@@ -111,6 +111,14 @@
       "path": "plugins/collab-code-sprint",
       "kind": "collab",
       "icon": "plugins/collab-code-sprint/icon.svg"
+    },
+    {
+      "name": "collab-roleplay",
+      "version": "1.0.0",
+      "description": "协作模式：多 Agent 扮演不同利益相关者角色，从各自立场审视方案，产出多角色风险清单与综合评审",
+      "path": "plugins/collab-roleplay",
+      "kind": "collab",
+      "icon": "plugins/collab-roleplay/icon.svg"
     }
   ],
   "skills": [
