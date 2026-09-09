@@ -176,6 +176,7 @@ MIT
 plugins/collab-<mode>/
   plugin.py    # CollabModePlugin 子类（声明元信息）
   recipe.md    # 模式配方（给主 Agent 的编排指引，选中时生效）
+  icon.svg     # 可选 logo（48×48；对话框选择器与安装面板展示，无则回退默认图标）
 ```
 
 `plugin.py` 最小模板：

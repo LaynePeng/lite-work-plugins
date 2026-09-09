@@ -61,49 +61,56 @@
       "version": "1.0.0",
       "description": "协作模式：并行派发互不依赖的子任务，主 Agent 继续关键路径工作，结果完成后自动送达",
       "path": "plugins/collab-orchestrate",
-      "kind": "collab"
+      "kind": "collab",
+      "icon": "plugins/collab-orchestrate/icon.svg"
     },
     {
       "name": "collab-pipeline",
       "version": "1.0.0",
       "description": "协作模式：顺序依赖的分工协作：每阶段一个 agent，前序产出交接给后续 agent 消费",
       "path": "plugins/collab-pipeline",
-      "kind": "collab"
+      "kind": "collab",
+      "icon": "plugins/collab-pipeline/icon.svg"
     },
     {
       "name": "collab-brainstorm",
       "version": "1.0.0",
       "description": "协作模式：多 Agent 不同视角并行提案、交叉批判后综合出最优方案",
       "path": "plugins/collab-brainstorm",
-      "kind": "collab"
+      "kind": "collab",
+      "icon": "plugins/collab-brainstorm/icon.svg"
     },
     {
       "name": "collab-critic",
       "version": "1.0.0",
       "description": "协作模式：spawn role=critic 批判者审查方案或代码，产出按严重度排序的问题清单",
       "path": "plugins/collab-critic",
-      "kind": "collab"
+      "kind": "collab",
+      "icon": "plugins/collab-critic/icon.svg"
     },
     {
       "name": "collab-debate",
       "version": "1.0.0",
       "description": "协作模式：提案者与批判者多轮对抗审查，迭代修订至方案收敛（红蓝对抗）",
       "path": "plugins/collab-debate",
-      "kind": "collab"
+      "kind": "collab",
+      "icon": "plugins/collab-debate/icon.svg"
     },
     {
       "name": "collab-meeting",
       "version": "1.0.0",
       "description": "协作模式：多 Agent 围绕议题轮流发言、互相看到彼此观点，多轮后收敛共识",
       "path": "plugins/collab-meeting",
-      "kind": "collab"
+      "kind": "collab",
+      "icon": "plugins/collab-meeting/icon.svg"
     },
     {
       "name": "collab-code-sprint",
       "version": "1.0.0",
       "description": "协作模式：实现与测试 agent 配对循环、按模块领地并行（allowed_dirs 硬隔离）",
       "path": "plugins/collab-code-sprint",
-      "kind": "collab"
+      "kind": "collab",
+      "icon": "plugins/collab-code-sprint/icon.svg"
     }
   ],
   "skills": [
