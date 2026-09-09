@@ -165,3 +165,49 @@ triggers: 关键词1,关键词2
 ## License
 
 MIT
+
+## 编写协作模式（kind: collab）
+
+协作模式是特殊的插件包：安装后出现在 lite-work
+**设置 → 多智能体 → 协作模式**选择器中，选中即把该模式的派生指引
+（配方）注入 `spawn_agent` 工具描述，并可选提供行为钩子。
+
+```
+plugins/collab-<mode>/
+  plugin.py    # CollabModePlugin 子类（声明元信息）
+  recipe.md    # 模式配方（给主 Agent 的编排指引，选中时生效）
+```
+
+`plugin.py` 最小模板：
+
+```python
+from litework.orchestration.collab_policy import CollabModePlugin
+
+class MeetingCollabMode(CollabModePlugin):
+    name = "collab-meeting"        # 插件名（安装/更新/卸载的标识）
+    version = "1.0.0"
+    description = "协作模式：多 Agent 围绕议题轮流发言、收敛共识"
+    mode_name = "meeting"          # 模式标识（config.collab_policy 的取值）
+    display_name = "会议（群聊共识）"  # 选择器显示名
+
+    # 可选行为钩子（异常自动隔离，不影响任务执行）：
+    # async def on_agent_spawned(self, ctx): ...
+    # async def on_agent_complete(self, ctx): ...
+    # async def on_task_done(self, ctx): ...
+```
+
+`recipe.md` 写编排流程（怎么 spawn / wait / send_message / followup_task），
+参考本仓库 `plugins/collab-*` 的 7 个内置模式：
+编排-工人 / 流水线 / 头脑风暴 / 互批 / 辩论 / 会议 / 测试驱动接力。
+
+`manifest.json` 条目需带 `"kind": "collab"`（客户端据此归入协作模式安装区）：
+
+```json
+{
+  "name": "collab-meeting",
+  "version": "1.0.0",
+  "description": "协作模式：多 Agent 围绕议题轮流发言、收敛共识",
+  "path": "plugins/collab-meeting",
+  "kind": "collab"
+}
+```

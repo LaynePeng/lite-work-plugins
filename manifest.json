@@ -8,11 +8,22 @@
       "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、格式化编辑与查找替换、数据分析、图表",
       "path": "plugins/office-plugin",
       "tools": [
-        "docx_create", "docx_append", "docx_format", "docx_replace",
-        "xlsx_create", "xlsx_format", "xlsx_replace",
-        "pptx_create", "pptx_format",
-        "pdf_create", "data_analyze", "chart_make",
-        "docx_read", "xlsx_read", "pptx_read", "pdf_read"
+        "docx_create",
+        "docx_append",
+        "docx_format",
+        "docx_replace",
+        "xlsx_create",
+        "xlsx_format",
+        "xlsx_replace",
+        "pptx_create",
+        "pptx_format",
+        "pdf_create",
+        "data_analyze",
+        "chart_make",
+        "docx_read",
+        "xlsx_read",
+        "pptx_read",
+        "pdf_read"
       ]
     },
     {
@@ -20,21 +31,79 @@
       "version": "1.0.0",
       "description": "OCR 识别：图片/PDF 页面/PPT 内嵌图片中的文字提取",
       "path": "plugins/ocr-plugin",
-      "tools": ["ocr_image", "ocr_document", "ocr_pptx"]
+      "tools": [
+        "ocr_image",
+        "ocr_document",
+        "ocr_pptx"
+      ]
     },
     {
       "name": "webfetch-plugin",
       "version": "1.0.0",
       "description": "Web 抓取：webfetch/webfetch_batch 联网获取信息（三级反爬对抗）",
       "path": "plugins/webfetch-plugin",
-      "tools": ["webfetch", "webfetch_batch"]
+      "tools": [
+        "webfetch",
+        "webfetch_batch"
+      ]
     },
     {
       "name": "example-greeting",
       "version": "1.0.0",
       "description": "示例插件：文本统计工具（演示社区插件编写格式）",
       "path": "plugins/example-greeting",
-      "tools": ["text_stats"]
+      "tools": [
+        "text_stats"
+      ]
+    },
+    {
+      "name": "collab-orchestrate",
+      "version": "1.0.0",
+      "description": "协作模式：并行派发互不依赖的子任务，主 Agent 继续关键路径工作，结果完成后自动送达",
+      "path": "plugins/collab-orchestrate",
+      "kind": "collab"
+    },
+    {
+      "name": "collab-pipeline",
+      "version": "1.0.0",
+      "description": "协作模式：顺序依赖的分工协作：每阶段一个 agent，前序产出交接给后续 agent 消费",
+      "path": "plugins/collab-pipeline",
+      "kind": "collab"
+    },
+    {
+      "name": "collab-brainstorm",
+      "version": "1.0.0",
+      "description": "协作模式：多 Agent 不同视角并行提案、交叉批判后综合出最优方案",
+      "path": "plugins/collab-brainstorm",
+      "kind": "collab"
+    },
+    {
+      "name": "collab-critic",
+      "version": "1.0.0",
+      "description": "协作模式：spawn role=critic 批判者审查方案或代码，产出按严重度排序的问题清单",
+      "path": "plugins/collab-critic",
+      "kind": "collab"
+    },
+    {
+      "name": "collab-debate",
+      "version": "1.0.0",
+      "description": "协作模式：提案者与批判者多轮对抗审查，迭代修订至方案收敛（红蓝对抗）",
+      "path": "plugins/collab-debate",
+      "kind": "collab"
+    },
+    {
+      "name": "collab-meeting",
+      "version": "1.0.0",
+      "description": "协作模式：多 Agent 围绕议题轮流发言、互相看到彼此观点，多轮后收敛共识",
+      "path": "plugins/collab-meeting",
+      "kind": "collab"
+    },
+    {
+      "name": "collab-code-sprint",
+      "version": "1.0.0",
+      "description": "协作模式：实现与测试 agent 配对循环、按模块领地并行（allowed_dirs 硬隔离）",
+      "path": "plugins/collab-code-sprint",
+      "kind": "collab"
     }
   ],
   "skills": [
