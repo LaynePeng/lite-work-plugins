@@ -91,8 +91,19 @@ def _missing_dep_msg(pkg: str, tools: str) -> str:
 # ---------------------------------------------------------------- 工具函数
 
 
-def _ensure_output_dir(workspace: str, subdir: str = ".outputs") -> str:
+# 产出物/素材目录名（1.3.0 起为工作区内**可见**目录——交付物要在
+# Finder/IDE 里直接可见，不再藏进 .outputs 隐藏目录；历史 .outputs/.uploads
+# 保留原地不动，不迁移）。
+OUTPUT_DIR_NAME = "产出物"
+UPLOADS_DIR_NAME = "素材"
+
+
+def _ensure_output_dir(workspace: str, subdir=None):
     """确保输出目录存在，返回绝对路径。"""
+    if subdir is None:
+        subdir = OUTPUT_DIR_NAME
+    elif not subdir.startswith(OUTPUT_DIR_NAME):
+        subdir = os.path.join(OUTPUT_DIR_NAME, subdir)
     out_dir = os.path.join(os.path.abspath(workspace), subdir)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
@@ -171,7 +182,7 @@ class OfficeTools:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "已有 docx 文件路径（相对工作区，如 .outputs/方案.docx）",
+                            "description": "已有 docx 文件路径（相对工作区，如 产出物/方案.docx）",
                         },
                         "content": {
                             "type": "string",
@@ -207,7 +218,7 @@ class OfficeTools:
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "docx 文件路径（相对工作区，如 .outputs/方案.docx）"},
+                        "path": {"type": "string", "description": "docx 文件路径（相对工作区，如 产出物/方案.docx）"},
                         "target": {"type": "string", "enum": ["all", "heading", "search"], "description": "格式化目标（默认 all）"},
                         "search_text": {"type": "string", "description": "target=search 时必填：要命中的文字"},
                         "heading_level": {"type": "number", "description": "target=heading 时必填：标题层级 1-6"},
@@ -407,7 +418,7 @@ class OfficeTools:
                         "path": {
                             "type": "string",
                             "description": "数据文件路径（相对工作区），支持 .xlsx/.xls/.csv/.json；"
-                                           "用户上传的文件在 .uploads/ 下。与 data 二选一，path 优先",
+                                           "用户上传的文件在 素材/ 下。与 data 二选一，path 优先",
                         },
                         "data": {
                             "type": "string",
@@ -482,7 +493,7 @@ class OfficeTools:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "docx 文件路径（相对工作区，如 .outputs/方案.docx 或 .uploads/素材.docx）",
+                            "description": "docx 文件路径（相对工作区，如 产出物/方案.docx 或 素材/素材.docx）",
                         },
                     },
                     "required": ["path"],
@@ -2217,7 +2228,7 @@ class OfficeTools:
 
         df: Any = None
 
-        # 优先：文件路径直读（.xlsx/.xls/.csv/.json，含用户上传的 .uploads/ 文件）
+        # 优先：文件路径直读（.xlsx/.xls/.csv/.json，含用户上传的 素材/ 文件）
         file_path = str(args.get("path", "") or "").strip()
         if file_path:
             resolved = os.path.abspath(
@@ -2591,7 +2602,7 @@ class OfficePlugin(ToolPlugin):
     """office-plugin 社区独立分发版。"""
 
     name = "office-plugin"
-    version = "1.2.0"
+    version = "1.3.0"
     description = "办公生产力：Word/Excel/PPT/PDF 生成与读取、格式化编辑与查找替换、数据分析、图表"
 
     def __init__(self) -> None:
