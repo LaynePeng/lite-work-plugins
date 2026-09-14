@@ -54,9 +54,16 @@
 
 ## 技能规则
 
-- 技能 = 目录 + `SKILL.md`（frontmatter：name / description / triggers）
+- 技能 = 目录 + `SKILL.md`（frontmatter：name / description / triggers / version）
+- **版本号（关键）**：`SKILL.md` frontmatter 的**顶层 `version`** 必须与
+  `manifest.json` 中该技能的 `version` 保持一致。主程序「检查社区更新 →
+  社区技能」就是拿这两者比对：已安装副本读的是 SKILL.md 的 `version`
+  （`litework/tools/skills.py` → `meta.get("version")`），缺失则更新永不显示。
+  写成嵌套的 `metadata: version:` **无效**（后端只读顶层）。
+- 技能的 `scripts/` / `themes/` / `assets/` 等子目录会随 GitHub 导入一起复制
+  （导入走 git clone 整仓 + 子路径过滤），无需额外登记
 - Python/Node 依赖走 `requirements.txt` / `package.json`（技能由系统
-  Python / npm 子进程执行，不受 frozen 限制）
+  Python / npm 子进程执行，不受 frozen 限制；导入时会自动 pip/npm 安装）
 - 新技能登记进 `manifest.json` 的 `skills` 段
 
 ## 提交规范

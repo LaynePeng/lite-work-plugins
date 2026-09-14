@@ -2,6 +2,7 @@
 name: document-styling
 description: 文档美化：为 Markdown 或已有 docx 套用专业排版主题，生成美观的 Word/PDF（封面、页眉页脚页码、标题配色、表格底纹、中文断行）
 triggers: 美化,排版,样式,主题,风格,好看,专业,太丑,文档美化,换风格
+version: "1.0.0"
 ---
 
 # 文档美化技能
