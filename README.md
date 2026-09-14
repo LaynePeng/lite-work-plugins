@@ -30,6 +30,7 @@ lite-work-plugins/
     ├── document-styling/
     ├── document-writing/
     ├── meeting-notes/
+    ├── patent-disclosure-skill/     #   中国专利技能（交底书/申请文件/检索/解读/地图/审查答复）
     ├── presentation/
     ├── research-report/
     └── weekly-report/
