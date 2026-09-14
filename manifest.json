@@ -129,6 +129,12 @@
       "path": "skills/academic-paper-composer"
     },
     {
+      "name": "academic-paper-engineering",
+      "version": "1.0.0",
+      "description": "学术论文工程化排版：把 DOCX/PDF/Markdown/LaTeX 转成可编译的期刊模板 LaTeX 工程（8+1 套模板、图表公式参考文献处理、无 TeX 时降级交付工程）",
+      "path": "skills/academic-paper-engineering"
+    },
+    {
       "name": "academic-paper-strategist",
       "version": "1.0.0",
       "description": "英文论文选题规划：平台与风格调研、文献检索与研究缺口论证、原创性评估、大纲优化（7 维度评审自评）",
