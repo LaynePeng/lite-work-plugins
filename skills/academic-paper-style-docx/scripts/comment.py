@@ -12,6 +12,8 @@ After running, add markers to document.xml:
   <w:commentRangeEnd w:id="0"/>
   <w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="0"/></w:r>
 """
+from __future__ import annotations
+
 
 import argparse
 import random

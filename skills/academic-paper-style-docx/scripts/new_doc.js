@@ -110,173 +110,178 @@ const UNICODE_TO_LATEX = {
  */
 function unicodeToLatex(text) {
   let result = text;
+
+  // 上标星号（`*`）必须特殊处理：
+  // - PDF 转换常见裸星号 `Q*` / `π*`，期望渲染成上标星号 → `Q^*`
+  // - 但也常见**已经写成上标**的 `{Q}^{ * }`；若再把其中的 `*` 提升为 `^*`，
+  //   会得到 `{Q}^{ ^* }` 这种非法嵌套 —— temml 能渲染但 OMML 转换结果为空，
+  //   公式会整条丢失（见 tests/ 回归用例）。
+  // 故：先把「已在上标花括号内」的星号规范化为 `^{*}`，再只提升「裸星号」。
+  result = result.replace(/\^\s*\{\s*\*\s*\}/g, '^{*}');
+  result = result.replace(/(?<![\\^{])\*/g, '^*');
+
   for (const [unicode, latex] of Object.entries(UNICODE_TO_LATEX)) {
+    if (unicode === '*') continue; // 已在上面处理
     result = result.split(unicode).join(latex);
   }
   return result;
 }
 
+
 /**
- * Detect if text contains math content (needs formula editor rendering)
- * ISSUE 7 FIX: Strict detection - don't match plain numbers or English words
- * @param {string} text - Text to detect
- * @returns {boolean}
+ * 内联 token 正则（分组顺序：引用 [n] → 行内公式 $...$ → 既有数学启发式）
+ *
+ * 关键：必须「先切数学与引用」，emphasis 只在切分后的纯文本片段上解析。
+ * 否则会把 $...$ 内部的 _{...}（如 {x}_{n}、{Q}^{ * }）从中间撕开。
  */
-function containsMath(text) {
-  // Detect Greek letters
-  if (/[αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ]/.test(text)) return true;
-  // Detect Unicode subscript/superscript characters
-  if (/[₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]/.test(text)) return true;
-  // Detect math operators and special symbols
-  if (/[∞∑∏∫≤≥≠≈→←↔∈∉⊂⊃∀∃∧∨×÷±∓·…⋯′″⟨⟩]/.test(text)) return true;
-  // Detect starred symbols like π*, Q* (but not plain words like Agent)
-  if (/[A-Z]\*/.test(text)) return true;
-  // Detect $...$ LaTeX delimiters
-  if (/\$[^$]+\$/.test(text)) return true;
-  return false;
+const INLINE_MATH_SRC =
+  '\\$([^$]+)\\$' +
+  '|([A-Z][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]+\\*?\\s*\\([^)]+\\))' +
+  '|([A-Z]\\s*\\([^)]*[αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ][^)]*\\))' +
+  '|([αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]*\\*?)' +
+  '|([A-Za-z][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]+\\*?)' +
+  '|([A-Z]\\*)';
+
+const INLINE_CITATION_SRC = '(\\[\\d+\\])|';
+
+/**
+ * Markdown emphasis：***粗斜体*** / **粗体** / __粗体__ / *斜体* / _斜体_
+ * - 开标记后必须非空白、闭标记前必须非空白 → 不会把 "a * b * c" 误判成斜体
+ * - 内部至少 1 个字符 → 孤立的 `**` / `*` 会按字面保留，不会被吞掉
+ * - 未闭合的标记不匹配，按字面保留（不抛错、不吞字）
+ */
+const EMPHASIS_RE = /(\*\*\*|___|\*\*|__|\*|_)(?=\S)([\s\S]+?)(?<=\S)\1/;
+
+/** 行内公式未能转成 Word 公式时收集告警（生成结束后统一汇报，避免静默交付） */
+const INLINE_MATH_WARNINGS = [];
+
+/**
+ * 把纯文本片段按 Markdown emphasis 拆成多个 TextRun（支持嵌套，如 **_粗斜体_**）。
+ * @param {Array} children 输出数组
+ * @param {string} text 纯文本片段（其中不应包含 $...$ 数学）
+ * @param {Object} base 继承样式（如 { bold: true }）
+ */
+function pushEmphasisRuns(children, text, base = {}) {
+  const re = new RegExp(EMPHASIS_RE.source, 'g');
+  let last = 0; // 已输出到的位置（其间文本累积为字面 TextRun）
+  let m;
+
+  while ((m = re.exec(text)) !== null) {
+    const marker = m[1];
+    const inner = m[2];
+    // 词内下划线（如 foo_bar_baz、{x}_n）不当作斜体：CommonMark 规则。
+    // 注意：这里只是「跳过这个起点继续向右找」，不能把文本切断输出，
+    // 否则会把 foo_bar_baz 碎成多个 TextRun。
+    const prev = m.index > 0 ? text[m.index - 1] : '';
+    if (marker[0] === '_' && /\w/.test(prev)) {
+      re.lastIndex = m.index + 1;
+      continue;
+    }
+
+    if (m.index > last) {
+      children.push(new TextRun({ ...base, text: text.slice(last, m.index) }));
+    }
+    const isBold = marker === '***' || marker === '___' || marker === '**' || marker === '__';
+    const isItalic = marker === '***' || marker === '___' || marker === '*' || marker === '_';
+    pushEmphasisRuns(children, inner, {
+      ...base,
+      bold: base.bold || isBold || undefined,
+      italics: base.italics || isItalic || undefined,
+    });
+
+    last = m.index + m[0].length;
+    re.lastIndex = last;
+  }
+
+  if (last < text.length) {
+    children.push(new TextRun({ ...base, text: text.slice(last) }));
+  }
+  if (children.length === 0 && text) {
+    children.push(new TextRun({ ...base, text }));
+  }
 }
 
 /**
- * ISSUE 8 FIX: Detect if text contains citation [n] format
+ * 统一内联解析：一次扫描产出【数学公式 / 引用上标 / 粗体 / 斜体】。
+ * 所有需要呈现正文文本的地方都应走这里，避免「某条路径忘了解析」。
+ * @param {string} text
+ * @param {{citations?: boolean, forceBold?: boolean}} options
+ *        citations: [n] 是否转上标（默认 true）
+ *        forceBold: 整个片段是否强制加粗（表头行用）
+ * @returns {Array} TextRun / Math 数组
  */
-function containsCitation(text) {
-  return /\[\d+\]/.test(text);
-}
-
-/**
- * ISSUE 7 FIX: Parse text into TextRun and Math mixed array (for inline formulas)
- * Strict regex - only matches actual math content, not plain numbers or words
- * @param {string} text - Input text
- * @returns {Array} Array of TextRun and Math objects
- */
-function parseInlineContent(text) {
+function buildInlineRuns(text, options = {}) {
+  const withCitations = options.citations !== false;
+  const base = options.forceBold ? { bold: true } : {};
   const children = [];
-  
-  // Regex matching math content blocks (in priority order):
-  // 1. $...$  explicit LaTeX (highest priority)
-  // 2. Function form Q(s,a) V(s) Rₓ(a) etc. (only with subscripts or specific single letters)
-  // 3. Greek letters (alone or with subscripts)
-  // 4. Variables with subscripts like Qₙ xₙ αₙ etc.
-  // 5. Starred symbols like π* Q* (single letter only)
-  // 
-  // NOTE: Does NOT match plain English words like Agent, Watkins, Dayan
-  // Does NOT match plain numbers like 1992, 500
-  // Does NOT match plain parentheses expressions like (1992)
-  
-  const mathPattern = /\$([^$]+)\$|([A-Z][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]+\*?\s*\([^)]+\))|([A-Z]\s*\([^)]*[αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ][^)]*\))|([αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]*\*?)|([A-Za-z][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]+\*?)|([A-Z]\*)/g;
-  
+  const pattern = new RegExp(
+    withCitations ? INLINE_CITATION_SRC + INLINE_MATH_SRC : INLINE_MATH_SRC,
+    'g',
+  );
+  const mathGroupsOf = (match) => (withCitations ? match.slice(2) : match.slice(1));
+
   let lastIndex = 0;
   let match;
-  
-  while ((match = mathPattern.exec(text)) !== null) {
-    // Add plain text before match
+
+  while ((match = pattern.exec(text)) !== null) {
     if (match.index > lastIndex) {
-      const plainText = text.slice(lastIndex, match.index);
-      if (plainText) {
-        children.push(new TextRun(plainText));
-      }
+      pushEmphasisRuns(children, text.slice(lastIndex, match.index), base);
     }
-    
-    // Get matched math content
-    const mathContent = match[1] || match[2] || match[3] || match[4] || match[5] || match[6];
-    if (mathContent) {
-      // Convert Unicode to LaTeX and create Math object
-      const latex = unicodeToLatex(mathContent);
-      try {
-        const mathml = temml.renderToString(latex, { displayMode: false, throwOnError: false });
-        const mathChildren = mathmlToDocxChildren(mathml);
+
+    if (withCitations && match[1]) {
+      // 引用 [n] → 上标
+      children.push(new TextRun({ ...base, text: match[1], superScript: true }));
+    } else {
+      const mathContent = mathGroupsOf(match).find((v) => v !== undefined);
+      if (mathContent) {
+        const latex = unicodeToLatex(mathContent);
+        let mathChildren = null;
+        try {
+          const mathml = temml.renderToString(latex, { displayMode: false, throwOnError: false });
+          mathChildren = mathmlToDocxChildren(mathml);
+        } catch (e) {
+          mathChildren = null;
+        }
         if (mathChildren && mathChildren.length) {
           children.push(new Math({ children: mathChildren }));
         } else {
-          // fallback
+          // 行内公式解析失败：保留原文并登记告警
+          // （块公式走 latexToMath 会「响亮失败」；行内由告警 + scripts/check_formulas.py 兜底）
+          INLINE_MATH_WARNINGS.push(mathContent);
           children.push(new Math({ children: [new MathRun(mathContent)] }));
         }
-      } catch (e) {
-        // Parse failed, use MathRun to display original text
-        children.push(new Math({ children: [new MathRun(mathContent)] }));
       }
     }
-    
+
     lastIndex = match.index + match[0].length;
   }
-  
-  // Add remaining plain text
+
   if (lastIndex < text.length) {
-    children.push(new TextRun(text.slice(lastIndex)));
+    pushEmphasisRuns(children, text.slice(lastIndex), base);
   }
-  
-  // If no math content matched, return plain text
   if (children.length === 0) {
-    children.push(new TextRun(text));
+    pushEmphasisRuns(children, text, base);
   }
-  
+
   return children;
 }
 
 /**
- * ISSUE 8 FIX: Parse text with math content and citations
- * Citations [n] are converted to superscript format
- * @param {string} text - Input text
- * @returns {Array} Array of TextRun and Math objects
+ * 内联解析（不把 [n] 转上标）—— 表格单元格等场景，保持历史行为。
+ * @param {string} text
+ * @returns {Array} TextRun / Math 数组
  */
-function parseInlineContentWithCitations(text) {
-  const children = [];
-  
-  // Combined regex: match math content or citations
-  // Citations [n] become superscript
-  // Math content becomes Math objects
-  const combinedPattern = /(\[\d+\])|\$([^$]+)\$|([A-Z][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]+\*?\s*\([^)]+\))|([A-Z]\s*\([^)]*[αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ][^)]*\))|([αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]*\*?)|([A-Za-z][₀₁₂₃₄₅₆₇₈₉ₙₓᵢₜₛ⁰¹²³⁴⁵⁶⁷⁸⁹ⁿⁱ]+\*?)|([A-Z]\*)/g;
-  
-  let lastIndex = 0;
-  let match;
-  
-  while ((match = combinedPattern.exec(text)) !== null) {
-    // Add plain text before match
-    if (match.index > lastIndex) {
-      const plainText = text.slice(lastIndex, match.index);
-      if (plainText) {
-        children.push(new TextRun(plainText));
-      }
-    }
-    
-    if (match[1]) {
-      // Citation [n] - convert to superscript
-      children.push(new TextRun({
-        text: match[1],
-        superScript: true,
-      }));
-    } else {
-      // Math content
-      const mathContent = match[2] || match[3] || match[4] || match[5] || match[6] || match[7];
-      if (mathContent) {
-        const latex = unicodeToLatex(mathContent);
-        try {
-          const mathml = temml.renderToString(latex, { displayMode: false, throwOnError: false });
-          const mathChildren = mathmlToDocxChildren(mathml);
-          if (mathChildren && mathChildren.length) {
-            children.push(new Math({ children: mathChildren }));
-          } else {
-            children.push(new Math({ children: [new MathRun(mathContent)] }));
-          }
-        } catch (e) {
-          children.push(new Math({ children: [new MathRun(mathContent)] }));
-        }
-      }
-    }
-    
-    lastIndex = match.index + match[0].length;
-  }
-  
-  // Add remaining plain text
-  if (lastIndex < text.length) {
-    children.push(new TextRun(text.slice(lastIndex)));
-  }
-  
-  if (children.length === 0) {
-    children.push(new TextRun(text));
-  }
-  
-  return children;
+function parseInlineContent(text, options = {}) {
+  return buildInlineRuns(text, { ...options, citations: false });
+}
+
+/**
+ * 内联解析（引用 [n] → 上标）—— 正文 / 列表 / 关键词等场景。
+ * @param {string} text
+ * @returns {Array} TextRun / Math 数组
+ */
+function parseInlineContentWithCitations(text, options = {}) {
+  return buildInlineRuns(text, { ...options, citations: true });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -284,13 +289,12 @@ function parseInlineContentWithCitations(text) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function makeBodyParagraph(text, overrides = {}) {
-  const children = containsMath(text) || containsCitation(text)
-    ? parseInlineContentWithCitations(text)
-    : [new TextRun(text)];
-
+  // 始终走统一内联解析（数学 / 引用 / 粗体 / 斜体）。
+  // 旧实现在「无数学且无引用」时短路成 [new TextRun(text)]，
+  // 导致正文里的 **粗体** 原样输出到 docx。
   return new Paragraph({
     ...overrides,
-    children,
+    children: parseInlineContentWithCitations(text),
   });
 }
 
@@ -560,9 +564,7 @@ function centeredText(text, options = {}) {
 function bullet(text) {
   return new Paragraph({
     numbering: { reference: 'bullets', level: 0 },
-    children: containsMath(text) || containsCitation(text)
-      ? parseInlineContentWithCitations(text)
-      : [new TextRun(text)],
+    children: buildInlineRuns(text),
   });
 }
 
@@ -664,6 +666,18 @@ function imageBlock(imagePath) {
   });
 }
 
+/**
+ * 从原始 LaTeX 中剥离尾部的 \tag{n} 编号。
+ * 多行块与单行块公式共用，保证编号处理只有一处实现。
+ * @returns {{latex: string, number: string}}
+ */
+function splitTag(rawLatex) {
+  const trimmed = (rawLatex || '').trim();
+  const tagMatch = trimmed.match(/\\tag\{([^}]+)\}\s*$/);
+  if (!tagMatch) return { latex: trimmed, number: '' };
+  return { latex: trimmed.slice(0, tagMatch.index).trim(), number: tagMatch[1] };
+}
+
 function parseFormulaBlock(lines, startIndex) {
   const formulaLines = [];
   let i = startIndex + 1;
@@ -672,10 +686,7 @@ function parseFormulaBlock(lines, startIndex) {
     i += 1;
   }
 
-  const rawLatex = formulaLines.join(' ').trim();
-  const tagMatch = rawLatex.match(/\\tag\{([^}]+)\}\s*$/);
-  const number = tagMatch ? tagMatch[1] : '';
-  const latex = tagMatch ? rawLatex.slice(0, tagMatch.index).trim() : rawLatex;
+  const { latex, number } = splitTag(formulaLines.join(' '));
 
   return {
     block: formula(latex, number),
@@ -771,6 +782,33 @@ function buildContentFromMarkdown(markdownPath) {
       content.push(block);
       i = nextIndex + 1;
       continue;
+    }
+
+    // 单行块公式：$$...$$（可选前置引导文字，如「由…可得 $$E=mc^2 \tag{1}$$」）
+    // 约束：
+    //  - 放在 line === '$$' 之后 → 与「单独一行 $$」（多行块起止）天然不冲突
+    //  - 引导文字与公式内部都不允许再出现 `$$` → 保证「一行内只有一个块公式」
+    const singleLineBlock = line.match(
+      /^((?:(?!\$\$)[\s\S])*?)\$\$((?:(?!\$\$)[\s\S])+?)\$\$$/,
+    );
+    if (singleLineBlock) {
+      const leading = singleLineBlock[1].trim();
+      if (leading) content.push(body(leading));
+      const { latex, number } = splitTag(singleLineBlock[2]);
+      content.push(formula(latex, number));
+      i += 1;
+      continue;
+    }
+
+    // 含 `$$` 但没被上面的规则接住 = 写法不规范（一行多个公式 / 公式后又跟内容）。
+    // 这里必须报错：否则会退化成行内公式，导致正文字面残留 `$`、编号丢失、公式降级。
+    if (line.includes('$$')) {
+      throw new Error(
+        `[formula] 无法解析的块公式写法：\n  ${line}\n` +
+        `  规则：一行内只能有一个块公式，且公式后面不要再跟内容。\n` +
+        `  请改为每行一个，或使用多行写法：\n` +
+        `   $$\n   ...\\tag{n}\n   $$`
+      );
     }
 
     const imageMatch = line.match(/^!\[[^\]]*]\(([^)]+)\)$/);
@@ -1004,22 +1042,10 @@ function threeLineTable(headers, rows, colWidths) {
 
   // Cell helper function - supports math content in cells
   const cellOf = (text, w, borders, bold = false) => {
-    // Detect if contains math content
-    let cellChildren;
-    if (containsMath(text)) {
-      cellChildren = parseInlineContent(text);
-      // If bold needed, add bold property to TextRuns
-      if (bold) {
-        cellChildren = cellChildren.map(child => {
-          if (child instanceof TextRun) {
-            return new TextRun({ text: child.text || '', bold: true });
-          }
-          return child;
-        });
-      }
-    } else {
-      cellChildren = [new TextRun({ text, bold })];
-    }
+    // 统一内联解析（数学 / 粗体 / 斜体）；表头整体加粗通过 forceBold 传递，
+    // 而不是事后重建 TextRun（旧写法会丢掉斜体等 run 级样式）。
+    // 这里保持历史行为：单元格内 [n] 不做上标处理。
+    const cellChildren = buildInlineRuns(text, { citations: false, forceBold: bold });
     
     return new TableCell({
       width:   { size: w, type: WidthType.DXA },
@@ -1106,22 +1132,44 @@ function pageBreak() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Convert LaTeX formula to docx Math component
+ * Convert LaTeX formula to docx Math component（块公式路径）
+ *
+ * 失败必须「响亮失败」：绝不静默回退成 MathRun(原始 LaTeX)，
+ * 否则用户拿到的 docx 里会直接显示 LaTeX 源码（例如 "F_{c3} = ma \tag{2}"）。
  * @param {string} latex - LaTeX formula string
  * @returns {Math} docx Math object
  */
 function latexToMath(latex) {
+  let mathml;
   try {
-    const mathml = temml.renderToString(latex, { displayMode: true, throwOnError: false });
-    const children = mathmlToDocxChildren(mathml);
-    if (children && children.length) {
-      return new Math({ children });
-    }
+    mathml = temml.renderToString(latex, { displayMode: true, throwOnError: true });
   } catch (e) {
-    console.warn(`[formula] LaTeX parse error: ${latex}`, e.message);
+    throw new Error(
+      `[formula] LaTeX 解析失败：${latex}\n` +
+      `  temml：${String(e.message).split('\n')[0]}\n` +
+      `  常见原因：使用了 temml/KaTeX 不支持的宏；或括号、花括号不配对。\n` +
+      `  块公式请使用多行写法，并让 \\tag{n} 单独占一行：\n` +
+      `   $$\n   ...\\tag{n}\n   $$`
+    );
   }
-  // Fallback: return plain text
-  return new Math({ children: [new MathRun(latex)] });
+
+  // 双保险：temml 在 throwOnError 未覆盖的场景下会用「红色错误文本 / 错误块」呈现而不是抛错
+  if (mathml.includes('temml-error') || mathml.includes('color:#b22222')) {
+    throw new Error(
+      `[formula] LaTeX 解析异常（temml 内部报错）：${latex}\n` +
+      `  请检查是否使用了不支持的宏，或数学语法有误（如 ^ / _ 后面缺花括号）。`
+    );
+  }
+
+  const children = mathmlToDocxChildren(mathml);
+  if (!children || !children.length) {
+    throw new Error(
+      `[formula] LaTeX 转换后未生成任何公式内容：${latex}\n` +
+      `  请检查公式语法是否正确。`
+    );
+  }
+
+  return new Math({ children });
 }
 
 /**
@@ -1402,6 +1450,16 @@ Packer.toBuffer(doc).then(buf => {
   const out = path.resolve(OUTPUT_PATH);
   fs.writeFileSync(out, buf);
   console.log(`✓  Written: ${out}`);
+
+  // 行内公式若有未能转换的，明确汇报（不静默交付）
+  if (INLINE_MATH_WARNINGS.length) {
+    console.error(
+      `\n[formula] 警告：${INLINE_MATH_WARNINGS.length} 处行内公式未能转为 Word 原生公式（已按文本保留）：`,
+    );
+    for (const w of INLINE_MATH_WARNINGS.slice(0, 10)) console.error(`  - ${w}`);
+    console.error('  建议修正后重跑，或运行 scripts/check_formulas.py 复核产物。');
+    process.exitCode = 1;
+  }
 }).catch(err => {
   console.error('Error building document:', err.message);
   process.exit(1);

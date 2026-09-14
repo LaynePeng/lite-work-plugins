@@ -28,6 +28,8 @@ Usage:
         --rows '[["lr","0.001","学习率"]]' \\
         --widths "1800,1500,5770"
 """
+from __future__ import annotations
+
 
 import argparse
 import json

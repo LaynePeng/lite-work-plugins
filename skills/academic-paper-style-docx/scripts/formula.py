@@ -16,6 +16,8 @@ Usage:
     # Read LaTeX from stdin:
     echo "E=mc^2" | python scripts/formula.py unpacked/ - 3 --anchor "其中"
 """
+from __future__ import annotations
+
 
 import argparse
 import re

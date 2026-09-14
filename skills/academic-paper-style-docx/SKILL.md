@@ -36,11 +36,25 @@ Word，或提出「三线表 / 带编号公式 / [n] 上标引用 / 论文格式
 `LICENSE.txt`）。本地适配内容：
 
 1. 脚本调用路径统一改为相对**技能目录**（下文 `${SKILL_DIR}`）；
-2. 补充依赖安装说明与 Node ≥ 18 / Python ≥ 3.10 要求；
+2. 补充依赖安装说明与 Node ≥ 18 / Python ≥ 3.9 要求；
 3. **修复上游 bug**：`table.py` / `formula.py` 生成的 `<w:pPr>` 子元素顺序违反
    OOXML schema（`<w:jc>` 被放在 `<w:spacing>` / `<w:ind>` 之前），导致
    `pack.py` 自动校验报 `spacing/ind: This element is not expected`。已调整为先
-   `spacing → ind → jc`。
+   `spacing → ind → jc`；
+4. **修复上游 bug**：单行块公式 `$$...$$` 被误当成行内公式 —— 正文字面残留 `$`、
+   `\tag{n}` 未剥离、公式整条丢失。现支持单行块公式，并**复用**同一套 `\tag{n}`
+   剥离逻辑（`splitTag`）；
+5. **修复上游 bug**：`unicodeToLatex` 把裸 `*` 一律提升为 `^*`，令 `{Q}^{ * }` 变成
+   `{Q}^{ ^* }` 非法嵌套 → temml 能渲染但 OMML 转换结果为空，**公式整条丢失**。
+   现改为「只提升裸星号」；
+6. **修复上游 bug**：Markdown 强调（`**粗体**` / `*斜体*`）从不解析，正文里原样输出
+   `**程序级**` 这类标记。现由统一的 `buildInlineRuns` 处理（含表格单元格 / 列表 / 关键词）；
+7. **改为响亮失败**：块公式解析失败不再静默回退成「原始 LaTeX 文本」，而是直接报错
+   （含公式原文与原因）；行内公式失败会汇总告警并置退出码 1；
+8. **新增** `scripts/check_formulas.py`：与 schema 校验互补的**内容**健康检查
+   （残留 `$` / 未转换的 LaTeX / 未解析的强调标记）；
+9. **Python 3.9 兼容**：`office/*.py`、`table.py`、`formula.py`、`comment.py` 在
+   3.9 下也能运行（原先 `match` 语句与 `X | Y` 注解要求 3.10+）。
 
 完整上游正文（XML 参考、11 个已解决问题的细节等）原样保留在同级 `REFERENCE.md`。
 
@@ -50,7 +64,7 @@ Word，或提出「三线表 / 带编号公式 / [n] 上标引用 / 论文格式
 # Node 依赖：docx / temml / fast-xml-parser（Node ≥ 18）
 cd "${SKILL_DIR}" && npm install
 
-# Python 依赖：仅解包/校验/批注脚本需要（Python ≥ 3.10）
+# Python 依赖：仅解包/校验/批注脚本需要（Python ≥ 3.9）
 python3 -m pip install -r "${SKILL_DIR}/requirements.txt"
 # lxml 由宿主 lite-work 提供（内置包），无需额外安装
 ```
@@ -71,8 +85,10 @@ academic-paper-style-docx/
 ├── package.json / package-lock.json
 ├── requirements.txt
 ├── example/markdown论文/     # 可运行的示例论文（md + images + 参考成品 docx）
+├── tests/                   # 回归套件（fixture + 断言运行器）
 └── scripts/
     ├── new_doc.js           # ★ Markdown → 论文 docx（主入口）
+    ├── check_formulas.py    # ★ 交付前内容健康检查（见「完成后必须校验」）
     ├── convert_paper.js     # 内置内容写死的示例（排版函数参考）
     ├── mathml-to-docx.js    # MathML → docx Math(OMML) 转换器
     ├── table.py             # 向解包目录插入三线表（XML 级）
@@ -114,6 +130,7 @@ node "${SKILL_DIR}/scripts/new_doc.js" "论文.md" "产出物/论文.docx"
 | `$$` … `\tag{3}` … `$$` | 块公式，居中 + 右对齐编号 `(3)`，Word 原生公式 |
 | `$E = mc^2$`（行内） | 行内公式 |
 | `[1]` / `[2][3]` | **上标**引用 |
+| `**粗体**` / `*斜体*` / `_斜体_` | 粗体 / 斜体（支持嵌套：`**_粗斜体_**`、`***粗斜体***`） |
 | `<table>…</table>`（**单行 HTML 表格**） | 三线表；上一行以「表」开头 → 表题 |
 | `![图注](images/1.png)` | 居中图片（自动按尺寸缩放）；下一行以「图」开头 → 图题 |
 | `- 列表项` | 项目符号 |
@@ -122,13 +139,36 @@ node "${SKILL_DIR}/scripts/new_doc.js" "论文.md" "产出物/论文.docx"
 > **注意**：管道式 Markdown 表格（`| a | b |`）**不支持**，请写成**单行**的
 > `<table><tr><td>…</td></tr>…</table>`。表格单元格内可用 `$...$` 行内公式。
 
-### 完成后必须校验
+### 公式与强调：推荐写法（避免踩坑）
+
+| 场景 | ✅ 推荐 | ❌ 避免 |
+| --- | --- | --- |
+| 块公式（带编号） | 多行写法，`\tag{n}` 单独占一行：<br>`$$`<br>`E = mc^{2} \tag{1}`<br>`$$` | 一行里塞两个块公式：`$$A$$ 和 $$B$$`（会直接报错） |
+| 单行块公式 | `$$E = mc^{2} \tag{1}$$` 单独占一行（前面可有引导文字） | 公式后面再跟内容（`$$A$$ 说明`）；会直接报错 |
+| 上标星号 | `{Q}^{*}`、`\pi^{*}` | `{Q}^{ * }`（多余空格，不规范） |
+| 乘号 | `\times` / `\cdot` | 裸 `*`（会被理解为上标星号） |
+| 粗体 / 斜体 | `**程序级**`、`*斜体*`、`**_粗斜体_**` | 不支持的：`~~删除线~~`、`` `代码` ``、文字链接 |
+
+补充规则：
+
+- **块公式出错会直接终止**（不再静默降级成文本）：报错信息含公式原文与原因，
+  按提示修正后重跑。所以不要指望「生成出来再看」——有错会当场失败。
+- **强调标记不要跨数学**：`**` / `_` 只在 `$...$` 之外解析，
+  因此 `{x}_{n}`、`{Q}^{ * }` 这类写法不会被从中间撕开。
+
+### 完成后必须校验（两步都要做）
 
 ```bash
+# 1) OOXML 结构校验（schema）
 cd "${SKILL_DIR}/scripts/office" && python3 validate.py "产出物/论文.docx"
+
+# 2) 内容健康检查（公式是否真的成了 Word 公式、有无残留标记）
+python3 "${SKILL_DIR}/scripts/check_formulas.py" "产出物/论文.docx"
 ```
 
-输出 `All validations PASSED!` 才算成功；报错时按下面工作流 B 排查 XML。
+- 第 1 步输出 `All validations PASSED!` = 结构合法；报错时按工作流 B 排查 XML。
+- 第 2 步输出 `OK`（退出码 0）= 内容正确；若 `FAIL`，按明细修正 Markdown 后重跑。
+- **两步都通过再交付**：schema 校验保证不了内容——公式整条丢失也能「校验通过」。
 
 ## 工作流 B：编辑已有 Word（XML 级）
 
@@ -190,8 +230,16 @@ python3 "${SKILL_DIR}/scripts/formula.py" unpacked/ 'E = mc^2' 9 \
 6. 公式单元格加 `verticalAlign: CENTER`，公式与编号才会同基线对齐。
 7. 修改已有文档时保留 `<w:rPr>` 原格式、不要重建 `styles.xml`。
 8. Word 的目录域需在 Word 中按 F9 更新；脚本插入的是域，不是静态文本。
+9. 公式里的裸 `*` 会被当作「上标星号」提升为 `^*`；但它**已经**在 `^{ }` 里时
+   （`{Q}^{ * }`）不能再提升，否则产生非法嵌套 → 公式整条丢失。
+10. 强调标记（`**` / `_`）与数学必须**先切分再解析**：`$...$` 内部的 `_{n}`
+    不能被当作斜体。
+11. 「写了生成脚本」≠「所有文本都会被解析」：历史上 `makeBodyParagraph` / `bullet` /
+    表格单元格各自有「无数学就直出」的短路，导致强调漏解析。统一走 `buildInlineRuns`
+    才能杜绝这类漏洞。
 
-> 上述问题的完整成因与代码示例见 `REFERENCE.md`（Issues 1–11）。
+> 上述问题的完整成因与代码示例见 `REFERENCE.md`（Issues 1–11）；
+> 本仓库新增的修复见上文「上游来源与许可」第 3–9 条。
 
 ## 深入参考
 
@@ -206,6 +254,8 @@ python3 "${SKILL_DIR}/scripts/formula.py" unpacked/ 'E = mc^2' 9 \
 - 涉及学术诚信：本技能只负责**排版与格式转换**，不得替用户编造数据、结论或参考文献。
 - 生成后请提醒用户在 Word/WPS 中按 F9 更新目录，并通读核对公式与表格渲染。
 - 各高校格式细则不一（字号、行距、页边距），如用户给出具体《格式要求》，以其为准。
+- **交付前务必跑 `scripts/check_formulas.py`**：它检查「内容」，与 `validate.py`
+  的「结构」互补 —— 公式整条丢失时 schema 校验照样会通过。
 - **上游已知限制（非本仓库引入）**：`new_doc.js` 产物未声明默认段落样式
   （`styles.xml` 缺 `w:default="1"`），且 `Heading1/2/3` 与 `docx` 库内置样式重名
   导致 `styleId` 重复。Word/WPS 可正常打开，但第三方库（如 python-docx）读取时
