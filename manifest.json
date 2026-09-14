@@ -124,7 +124,7 @@
   "skills": [
     {
       "name": "academic-paper-style-docx",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "中文学术论文风格docx：Markdown 论文（LaTeX 公式/三线表/图/[n] 引用）转规范 .docx，亦可解包/编辑/重打包已有 Word",
       "path": "skills/academic-paper-style-docx"
     },

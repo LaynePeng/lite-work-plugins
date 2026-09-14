@@ -2,7 +2,7 @@
 name: academic-paper-style-docx
 description: 中文学术论文风格docx：把 Markdown 论文（LaTeX 公式、三线表、图片、[n] 引用）转成符合国内高校规范的 .docx，也可解包/编辑/重打包已有 Word（三线表、公式、批注、修订）。适用于课程论文、毕业设计/学位论文、数学建模论文、期刊投稿等场景。
 triggers: 论文,课程论文,毕业论文,学位论文,数学建模,学术论文,期刊投稿,三线表,参考文献,LaTeX公式,公式编号,上标引用,论文格式,GB/T 7714,docx排版,word排版,查重,摘要,关键词
-version: "1.0.0"
+version: "1.0.1"
 ---
 
 # 中文学术论文风格docx
