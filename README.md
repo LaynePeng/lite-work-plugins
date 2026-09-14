@@ -24,7 +24,9 @@ lite-work-plugins/
 └── skills/                  # 技能（SKILL.md 指令文档）
     ├── data-analysis/
     ├── diagram-to-office/
+    ├── document-styling/
     ├── document-writing/
+    ├── docx-editor-cn/      #   中文学术论文 Word 排版（Node 脚本：md→docx / XML 编辑）
     ├── meeting-notes/
     ├── presentation/
     ├── research-report/

@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "office-plugin",
-      "version": "1.4.0",
+      "version": "1.4.1",
       "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、PDF 中文排版（主题/表格/页码）、格式化编辑与查找替换、数据分析、图表（产出物写入工作区「产出物/」可见目录）",
       "path": "plugins/office-plugin",
       "tools": [
@@ -145,6 +145,12 @@
       "version": "1.1.0",
       "description": "文档写作：方案/通知/制度/说明书等正式文档撰写，排版生成 Word 或 PDF",
       "path": "skills/document-writing"
+    },
+    {
+      "name": "docx-editor-cn",
+      "version": "1.0.0",
+      "description": "中文学术论文 Word 排版：Markdown 论文（LaTeX 公式/三线表/图/[n] 引用）转规范 .docx，亦可解包/编辑/重打包已有 Word",
+      "path": "skills/docx-editor-cn"
     },
     {
       "name": "meeting-notes",

@@ -2742,7 +2742,8 @@ class OfficeTools:
         parts = []
         for p in doc.paragraphs:
             if p.text.strip():
-                style = (p.style.name or "").lower()
+                # p.style 可能为 None：文档未声明默认段落样式时 python-docx 返回 None
+                style = (getattr(p.style, "name", "") or "").lower()
                 prefix = "#" * min(4, 1 + sum(1 for c in style if c.isdigit() and c != "0")) \
                     if "heading" in style else ""
                 parts.append(f"{prefix} {p.text.strip()}".strip())
@@ -2877,7 +2878,7 @@ class OfficePlugin(ToolPlugin):
     """office-plugin 社区独立分发版。"""
 
     name = "office-plugin"
-    version = "1.4.0"
+    version = "1.4.1"
     description = "办公生产力：Word/Excel/PPT/PDF 生成与读取、PDF 中文排版（主题/表格/页码）、格式化编辑与查找替换、数据分析、图表"
 
     def __init__(self) -> None:
