@@ -141,12 +141,6 @@
       "path": "skills/academic-paper-strategist"
     },
     {
-      "name": "academic-paper-style-docx",
-      "version": "1.0.1",
-      "description": "中文学术论文风格docx：Markdown 论文（LaTeX 公式/三线表/图/[n] 引用）转规范 .docx，亦可解包/编辑/重打包已有 Word",
-      "path": "skills/academic-paper-style-docx"
-    },
-    {
       "name": "data-analysis",
       "version": "1.0.0",
       "description": "数据分析：对 CSV/JSON 数据做清洗、统计与可视化，输出结论并可选导出 Excel/图表",

@@ -1,9 +1,0 @@
-# 中文学术论文风格docx（academic-paper-style-docx）—— Python 依赖
-# 仅 scripts/ 下的解包/打包/校验/批注脚本需要
-#
-# 版本要求：Python >= 3.10
-#   （office/validators、pack.py、validate.py 使用了 3.10+ 的 match 语法 / `X | None` 注解）
-#
-# 说明：lxml 由 lite-work 主程序内置提供（属「已捆绑的包」），此处不重复声明，
-#       避免覆盖宿主版本；独立使用本技能时请自行 `pip install lxml`。
-defusedxml>=0.7.1
