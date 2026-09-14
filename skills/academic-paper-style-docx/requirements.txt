@@ -1,4 +1,4 @@
-# 中文学术论文风格docx（chinese-academic-paper-style-docx）—— Python 依赖
+# 中文学术论文风格docx（academic-paper-style-docx）—— Python 依赖
 # 仅 scripts/ 下的解包/打包/校验/批注脚本需要
 #
 # 版本要求：Python >= 3.10

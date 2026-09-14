@@ -22,7 +22,7 @@ lite-work-plugins/
 │   └── example-greeting/    #   示例插件（演示编写格式）
 │       └── plugin.py
 └── skills/                  # 技能（SKILL.md 指令文档）
-    ├── chinese-academic-paper-style-docx/   #   中文学术论文风格docx（Node 脚本：md→docx / XML 编辑）
+    ├── academic-paper-style-docx/   #   中文学术论文风格docx（Node 脚本：md→docx / XML 编辑）
     ├── data-analysis/
     ├── diagram-to-office/
     ├── document-styling/
