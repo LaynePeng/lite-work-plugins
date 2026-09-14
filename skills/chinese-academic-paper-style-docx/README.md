@@ -1,7 +1,7 @@
-# 📄 docx-editor-cn（lite-work 社区技能）
+# 📄 中文学术论文风格docx（chinese-academic-paper-style-docx）
 
 > 本目录是 [lite-work](https://github.com/LaynePeng/lite-work) 社区技能仓库中的
-> **中文学术论文 Word 排版**技能，移植自
+> **中文学术论文风格docx** 技能，移植自
 > [Gostyan/docx-skill-4-cn-paper](https://github.com/Gostyan/docx-skill-4-cn-paper)
 > 的 `docx-editor-cn`（MIT License，Copyright (c) 2025-2026 Gostyan）。
 >
@@ -314,7 +314,7 @@ new Paragraph({ style: 'MyCustomStyle', children: [new TextRun('内容')] })
 ## 📁 文件结构
 
 ```
-📂 docx-editor-cn/
+📂 chinese-academic-paper-style-docx/
 ├── 📖 README.md            ← 本文件
 ├── 📚 SKILL.md             ← 完整技术文档
 ├── 📜 LICENSE.txt
