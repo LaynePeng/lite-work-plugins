@@ -123,6 +123,18 @@
   ],
   "skills": [
     {
+      "name": "academic-paper-composer",
+      "version": "1.0.0",
+      "description": "英文论文写作：按优化大纲逐章撰写哲学/交叉学科论文（章节质量门槛 + 全文 7 维度终评 + 投稿前检查）",
+      "path": "skills/academic-paper-composer"
+    },
+    {
+      "name": "academic-paper-strategist",
+      "version": "1.0.0",
+      "description": "英文论文选题规划：平台与风格调研、文献检索与研究缺口论证、原创性评估、大纲优化（7 维度评审自评）",
+      "path": "skills/academic-paper-strategist"
+    },
+    {
       "name": "academic-paper-style-docx",
       "version": "1.0.1",
       "description": "中文学术论文风格docx：Markdown 论文（LaTeX 公式/三线表/图/[n] 引用）转规范 .docx，亦可解包/编辑/重打包已有 Word",

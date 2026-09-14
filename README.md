@@ -22,6 +22,8 @@ lite-work-plugins/
 │   └── example-greeting/    #   示例插件（演示编写格式）
 │       └── plugin.py
 └── skills/                  # 技能（SKILL.md 指令文档）
+    ├── academic-paper-composer/     #   英文论文写作（按大纲逐章写作 + 质量门槛）
+    ├── academic-paper-strategist/   #   英文论文选题规划（文献/缺口/大纲 + 评审自评）
     ├── academic-paper-style-docx/   #   中文学术论文风格docx（Node 脚本：md→docx / XML 编辑）
     ├── data-analysis/
     ├── diagram-to-office/
