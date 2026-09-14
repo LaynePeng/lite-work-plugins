@@ -20,9 +20,10 @@
      ```
 2. **版本号**：插件类 `version` 与 `manifest.json` 同步 bump（semver）；
    与主程序内置版同源的插件（office / ocr / webfetch），版本号跟随主程序起点后独立演进
-3. **同步生成的插件勿手改**：`office-plugin` / `ocr-plugin` / `webfetch-plugin`
-   由主仓库脚本生成（`litework/tools/{office,ocr,web}.py` → 社区分发包装），
-   改动请去主仓库改源文件后重新同步——手改会在下次同步时被覆盖
+3. **`office-plugin` / `ocr-plugin` / `webfetch-plugin` 以本仓库为源**：
+   直接在这三个插件里开发改动（本仓库是上游事实源）；需要进主程序内置时，
+   再**按需同步回** lite-work 的 `litework/tools/{office,ocr,web}.py`。
+   不要反向操作（不要改主仓库后往回同步）。
 4. **manifest.json**：新增插件必须登记（name / version / description / path / tools），
    工具名列表保持与实际 `get_tools()` 一致
 

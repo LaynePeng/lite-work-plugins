@@ -11,8 +11,9 @@ v1.4.0 新增：pdf_create 中文字体嵌入与 CJK 断行、Markdown 表格渲
 所有依赖包已包含在主依赖中（pyproject.toml dependencies），
 `pip install -e .` 时自动安装。
 """
-# 同步自 lite-work 主仓库 litework/tools/office.py（社区独立分发版）
-# v1.2.0+ 含社区版独有功能（格式化/查找替换），主仓库同步时需保留
+# 本仓库（lite-work-plugins）为该工具集的源：直接在此开发；需要作为
+# lite-work 内置时按需同步回 litework/tools/office.py。
+# v1.2.0+ 含社区版独有功能（格式化/查找替换），同步回主仓库时需保留。
 from __future__ import annotations
 
 import io
@@ -2864,9 +2865,10 @@ class OfficeTools:
         return resolved
 
 # ---------------------------------------------------------------- 社区分发包装
-# 由 litework 主仓库同步生成；安装到 ~/.lite-work/plugins/ 后覆盖内置同名
-# 插件，卸载自动回退内置版。无参构造（插件加载器约定），workspace 在
-# install 时从 kernel 的 app 服务捕获（项目热切换后新 kernel 重新 install）。
+# 本仓库（lite-work-plugins）为源；需要作为 lite-work 内置时按需同步回
+# litework/tools/office.py。安装到 ~/.lite-work/plugins/ 后覆盖内置同名插件，
+# 卸载自动回退内置版。无参构造（插件加载器约定），workspace 在 install 时
+# 从 kernel 的 app 服务捕获（项目热切换后新 kernel 重新 install）。
 
 from litework.tools.plugin import ToolPlugin
 

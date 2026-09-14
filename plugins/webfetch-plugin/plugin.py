@@ -11,7 +11,8 @@
   Chrome TLS 握手（对抗 JA3 指纹检测）终极兜底。仍被拦截说明站点需要
   执行 JS 质询（Cloudflare 严格模式），返回可操作提示引导换源/用浏览器
 """
-# 同步自 lite-work 主仓库 litework/tools/web.py（社区独立分发版）
+# 本仓库（lite-work-plugins）为源；需要作为 lite-work 内置时按需同步回
+# litework/tools/web.py（社区独立分发版）。
 from __future__ import annotations
 
 import asyncio

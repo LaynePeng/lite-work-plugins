@@ -8,7 +8,8 @@
 OCR 引擎：rapidocr-onnxruntime（纯 pip 安装、离线可用、内置中英文模型，
 无需系统级 Tesseract/poppler）。依赖缺失时返回可操作提示。
 """
-# 同步自 lite-work 主仓库 litework/tools/ocr.py（社区独立分发版）
+# 本仓库（lite-work-plugins）为源；需要作为 lite-work 内置时按需同步回
+# litework/tools/ocr.py（社区独立分发版）。
 from __future__ import annotations
 
 import logging
@@ -343,9 +344,10 @@ def _ocr_pixmap(pix) -> str:
 
 
 # ---------------------------------------------------------------- 社区分发包装
-# 由 litework 主仓库同步生成；安装到 ~/.lite-work/plugins/ 后覆盖内置同名
-# 插件，卸载自动回退内置版。无参构造（插件加载器约定），workspace 在
-# install 时从 kernel 的 app 服务捕获（项目热切换后新 kernel 重新 install）。
+# 本仓库（lite-work-plugins）为源；需要作为 lite-work 内置时按需同步回
+# litework/tools/ocr.py。安装到 ~/.lite-work/plugins/ 后覆盖内置同名插件，
+# 卸载自动回退内置版。无参构造（插件加载器约定），workspace 在 install 时
+# 从 kernel 的 app 服务捕获（项目热切换后新 kernel 重新 install）。
 
 from litework.tools.plugin import ToolPlugin
 
