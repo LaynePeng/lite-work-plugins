@@ -30,6 +30,9 @@ triggers: 调研,调研报告,行业分析,竞品分析,查资料,research
 
 5. **生成交付物**：默认 docx_create 生成 Word；用户要求不可编辑时用 pdf_create；
    数据对比多时附 xlsx_create 表格。
+   - **美化排版**：交付成品前用 document-styling 技能套主题
+     （`apply_docx_theme.py <docx> --theme academic-gray`，或
+     `md2pdf.py <md> --theme academic-gray`）；调研报告推荐 academic-gray / business-blue。
 
 ## 注意
 

@@ -20,6 +20,8 @@ triggers: 会议纪要,会议记录,meeting notes,整理会议
    - 待办事项：任务 → 负责人 → 截止时间（原文未提及的不要编造）。
 
 3. **生成纪要**：用 docx_create 生成 Word 文件，文件名 `会议纪要_{主题}_{日期}.docx`；
+   交付前用 document-styling 技能套主题美化
+   （`apply_docx_theme.py <产出物/会议纪要_*.docx> --theme business-blue`）；
    默认结构：
    - 会议基本信息（表格：主题/时间/参会人/记录人）
    - 一、议题与讨论
