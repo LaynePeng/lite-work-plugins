@@ -25,8 +25,14 @@ allowed-tools: Read, Write, Edit, Grep, Glob, WebSearch, Bash
 > | 公式 → Word 可编辑公式 | `latex2mathml` | 降级保留 LaTeX 源文本 |
 > | mermaid/附图渲染、CNIPA 公布公告检索 | `playwright` + **系统 Chrome/Edge**（无则 `python -m playwright install chromium`） | 降级：保留 mermaid 源码 / 改用 WebSearch |
 > | 公式 PNG 兜底 | `matplotlib`（主程序已内置，可选） | 降级保留源文本 |
-> | 通俗解读 / 专利地图 / 审查答复 | **Obsidian** 库（外部应用） | 这三个能力受限，其余正常 |
-> | STEP 三维视图 | CadQuery（独立 venv，Python 3.10–3.12，可选） | 跳过该功能 |
+> | 通俗解读 | **Obsidian** 库（外部应用） | 该能力受限，其余正常 |
+> | 专利地图 | **Obsidian** + `fastembed`（列在 `skills/patent-map/tools/requirements.txt`，**未内置，需手动装**） | 语义地图生成受限 |
+> | 审查答复 | **Obsidian** + `sentence-transformers`、`sqlite-vec`（列在 `skills/patent-oa/tools/requirements-oa.txt`，**未内置**） | RAG 检索受限 |
+> | STEP 三维视图 | `cadquery`、`cairosvg`（`skills/patent-disclosure/tools/requirements-step.txt`，装在独立 venv，Python 3.10–3.12） | 跳过该功能 |
+>
+> 说明：lite-work 只会自动安装**顶层** `requirements.txt`；上面标「未内置」的是**可选功能的子清单**，
+> 用到对应能力时需按清单手动 `pip install`。`skills/patent-disclosure/tools/package.json`
+> 是**遗留的可选 Node 依赖（不需要）** —— mermaid 出图已改用 Playwright + `tools/vendor/mermaid.min.js`。
 >
 > 建议动手前先自检：`python3 skills/patent-disclosure/tools/browser.py --probe`（浏览器）、
 > `python3 skills/patent-reader/tools/vault/check_obsidian_env.py`（Obsidian）。
