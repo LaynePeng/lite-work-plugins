@@ -2,7 +2,7 @@
 name: diagram-to-office
 description: 图表转 Office：把 PlantUML / Mermaid 源码渲染成 PNG/SVG 图片，再嵌入 Word/PPT 文档
 triggers: plantuml,PlantUML,mermaid,Mermaid,uml,UML,图表转图片,图转word,图转ppt,图转office,时序图,流程图,类图
-version: "1.0.0"
+version: "1.0.1"
 ---
 
 # 图表转 Office 技能（diagram-to-office）
@@ -10,6 +10,11 @@ version: "1.0.0"
 用户文档中大量使用 PlantUML / Mermaid 图表；Office 文档（Word/PPT）无法直接
 渲染这些 DSL，必须先把图表**渲染成图片**（PNG 或 SVG），再**嵌入** docx/pptx。
 本技能定义完整流程。
+
+> **分工**：本技能只负责「PlantUML/Mermaid → 图片 → 嵌入 Word/PPT」这条 Office
+> 链路。**论文 / LaTeX 工程的科研配图（TikZ 架构图、神经网络图、算法流程图等）
+> 走 `academic-diagram`**；**专利说明书附图（黑白线框）走 patent 技能自带的
+> 黑白引擎**，都不在本技能范围内。
 
 ## 一、识别图表源码
 

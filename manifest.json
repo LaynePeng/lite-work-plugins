@@ -123,6 +123,12 @@
   ],
   "skills": [
     {
+      "name": "academic-diagram",
+      "version": "0.1.0",
+      "description": "学术论文配图（OpenTikZ 库）：系统架构框图、神经网络结构、训练/推理 pipeline、算法流程图的 TikZ 生成——73 个可复制图标 + 8 个参数化模板（edit_contract 安全编辑）+ 品牌图标，LaTeX 编译验证，内容 CC0（专利附图和 Office 图分别走 patent / diagram-to-office）",
+      "path": "skills/academic-diagram"
+    },
+    {
       "name": "academic-paper-composer",
       "version": "1.0.0",
       "description": "英文论文写作：按优化大纲逐章撰写哲学/交叉学科论文（章节质量门槛 + 全文 7 维度终评 + 投稿前检查）",
@@ -130,7 +136,7 @@
     },
     {
       "name": "academic-paper-engineering",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "学术论文工程化排版：把 DOCX/PDF/Markdown/LaTeX 转成可编译的期刊模板 LaTeX 工程（8+1 套模板、图表公式参考文献处理、无 TeX 时降级交付工程）",
       "path": "skills/academic-paper-engineering"
     },
@@ -148,7 +154,7 @@
     },
     {
       "name": "diagram-to-office",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "图表转 Office：把 PlantUML / Mermaid 源码渲染成 PNG/SVG 图片，再嵌入 Word/PPT 文档",
       "path": "skills/diagram-to-office"
     },
@@ -169,12 +175,6 @@
       "version": "1.1.0",
       "description": "会议纪要整理：根据会议记录/录音转写文本生成结构化会议纪要 Word 文档",
       "path": "skills/meeting-notes"
-    },
-    {
-      "name": "opentikz",
-      "version": "0.1.0",
-      "description": "学术论文图绘制（OpenTikZ）：系统架构框图、神经网络结构、训练/推理 pipeline、算法流程图的 TikZ 生成——73 个可复制图标 + 8 个参数化模板（edit_contract 安全编辑）+ 品牌图标，LaTeX 编译验证，内容 CC0",
-      "path": "skills/opentikz"
     },
     {
       "name": "patent-disclosure-skill",

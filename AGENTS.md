@@ -82,19 +82,21 @@
 - 触发词分工：裸词 PPT/ppt/幻灯片/演示文稿 归 ppt-master；
   `presentation` 只保留 PPT初稿/快速PPT 等意图词（避免双注入冲突）
 
-### opentikz（上游同步型技能，特殊规则）
+### academic-diagram（上游同步型技能，特殊规则）
 
 - 事实源是上游 `opentikz/opentikz`（Code MIT / 内容 CC0）；上游技能在
   仓库 `skills/using-opentikz/`、库资源在仓库根，本仓库**合并为
-  `skills/opentikz/` 自包含单目录**收录。**禁止手改其内容**——升级只走：
-  `python scripts/sync_opentikz.py [--ref <tag|main>]`
-- SKILL.md overlay（name=opentikz + 顶层 version/triggers、OTROOT 自包含
-  定位规则、无 LaTeX 降级交付）的权威副本在 `scripts/opentikz_assets/`
-  （含 upstream-SKILL.md 漂移检测基准）；改 overlay 必须改那里再重放
+  `skills/academic-diagram/` 自包含单目录**收录（v0.1.0 时从 opentikz 更名为
+  academic-diagram，定位学术论文配图）。**禁止手改其内容**——升级只走：
+  `python scripts/sync_academic_diagram.py [--ref <tag|main>]`
+- SKILL.md overlay（name=academic-diagram + 顶层 version/triggers、OTROOT 自包含
+  定位规则、无 LaTeX 降级交付）的权威副本在 `scripts/academic_diagram_assets/`
+  （含 upstream-SKILL.md 漂移检测基准）；改 overlay 必须改那里再重放；
 - 不带 requirements.txt（出图零 Python 依赖）；编译验证依赖本机 LaTeX
-- 触发词分工：tikz/架构图/算法图/论文配图/科研绘图/框图 归 opentikz；
+- 触发词分工：tikz/架构图/算法图/论文配图/科研绘图/框图 归 academic-diagram；
   `diagram-to-office` 保留 plantuml/mermaid/时序图/流程图/类图（转
-  Office 图片场景），避免双注入冲突
+  Office 图片场景），避免双注入冲突；**专利附图由 patent-disclosure-skill
+  自带黑白引擎负责**，不走 academic-diagram
 
 ## 提交规范
 

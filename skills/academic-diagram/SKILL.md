@@ -1,11 +1,17 @@
 ---
-name: opentikz
-description: Use when a user wants a TikZ figure for a paper — an icon, an editable architecture/pipeline/flow template, or an example — and wants you to find, edit, and verify it. The single skill for working with the OpenTikZ library.
+name: academic-diagram
+description: Use when a user wants a TikZ figure for an academic paper — an icon, an editable architecture/pipeline/flow template, or an example — and wants you to find, edit, and verify it. The skill for paper figures, powered by the OpenTikZ library. For Office documents (PlantUML/Mermaid embedded into Word/PPT) use diagram-to-office instead; for patent application drawings use the patent skill's own black-and-white engine.
 version: "0.1.0"
 triggers: tikz,TikZ,opentikz,论文配图,论文图,学术图,科研绘图,科研图,架构图,算法图,算法流程图,框图,论文插图,paper figure,architecture diagram,algorithm figure
 ---
 
 # Using OpenTikZ
+
+> **Scope: academic papers.** This skill draws paper figures (editable, colored
+> TikZ). Do **not** use it for: Office deliverables that need PlantUML/Mermaid
+> rendered and embedded into Word/PPT (use `diagram-to-office`), or patent
+> application drawings, which are black-and-white line art produced by the
+> patent skill's own engine (`render_invention_figures.py`) — not by TikZ.
 
 OpenTikZ is a library of copyable TikZ **icons**, editable **templates** (neural
 nets, encoder-decoder, training pipelines, system block diagrams, flowcharts),
@@ -32,7 +38,7 @@ Do not look for per-template `skill.md` files; they no longer exist.
    a Claude Code plugin: `OTROOT = ${CLAUDE_PLUGIN_ROOT}`.
 2. If the directory containing this `SKILL.md` directly contains `catalog.json`
    (self-contained skill install — the lite-work distribution copies the whole
-   library into one skill directory, e.g. `~/.agents/skills/opentikz/`), then
+   library into one skill directory, e.g. `~/.agents/skills/academic-diagram/`), then
    `OTROOT` is that directory.
 3. Otherwise (cloned repo / another agent), `OTROOT` is the OpenTikZ repo root — the
    directory two levels above this `SKILL.md` (`skills/using-opentikz/SKILL.md` →

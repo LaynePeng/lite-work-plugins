@@ -4,11 +4,13 @@
 上游事实源：https://github.com/opentikz/opentikz （Code MIT / 内容 CC0）。
 上游的技能位于仓库 skills/using-opentikz/SKILL.md，库资源（icons/templates/
 examples/reference/catalog.json）在仓库根——lite-work 技能必须自包含单目录，
-因此本仓库把两者合并为 skills/opentikz/ 单目录收录。
+因此本仓库把两者合并为 skills/academic-diagram/ 单目录收录
+（技能对外名 academic-diagram，定位论文配图；上游库品牌仍叫 OpenTikZ）。
 
-受控差异（overlay 权威副本在 scripts/opentikz_assets/）：
-- SKILL.md 基于 skills/using-opentikz/SKILL.md 打三处补丁：
-  ① frontmatter：name 改 opentikz + 追加顶层 version/triggers
+受控差异（overlay 权威副本在 scripts/academic_diagram_assets/）：
+- SKILL.md 基于 skills/using-opentikz/SKILL.md 打补丁：
+  ① frontmatter：name 改 academic-diagram + 追加顶层 version/triggers
+     + 论文定位与负向路由（Office → diagram-to-office；专利 → 黑白引擎）
   ② §0 OTROOT 定位：新增「SKILL.md 同级目录含 catalog.json → 该目录即库根」
   ③ §2 第 5 步：无本地 LaTeX 工具链时的降级交付
 - 排除上游的 tools/ .github/ assets/ skills-demos/ .claude-plugin/ 等
@@ -17,9 +19,9 @@ examples/reference/catalog.json）在仓库根——lite-work 技能必须自包
   仓库校验工具所需）
 
 用法：
-    python scripts/sync_opentikz.py [--ref main] [--version 0.1.0]
+    python scripts/sync_academic_diagram.py [--ref main] [--version 0.1.0]
 版本取上游最新 tag（去 v 前缀）；--ref 可钉 tag 或分支。上游 SKILL.md 与
-scripts/opentikz_assets/upstream-SKILL.md 不一致时会提示人工核对 overlay。
+scripts/academic_diagram_assets/upstream-SKILL.md 不一致时会提示人工核对 overlay。
 退出码：0 成功 / 1 失败
 """
 from __future__ import annotations
@@ -34,8 +36,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SKILL = ROOT / "skills" / "opentikz"
-ASSETS = ROOT / "scripts" / "opentikz_assets"
+SKILL = ROOT / "skills" / "academic-diagram"
+ASSETS = ROOT / "scripts" / "academic_diagram_assets"
 MANIFEST = ROOT / "manifest.json"
 UPSTREAM_URL = "https://github.com/opentikz/opentikz"
 
@@ -65,13 +67,13 @@ def _latest_tag() -> str:
 def _update_manifest(version: str) -> None:
     data = json.loads(MANIFEST.read_text(encoding="utf-8"))
     for skill in data.get("skills", []):
-        if skill.get("name") == "opentikz":
+        if skill.get("name") == "academic-diagram":
             skill["version"] = version
             MANIFEST.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8")
             return
-    print("manifest.json 中未找到 opentikz 条目，请手动登记", file=sys.stderr)
+    print("manifest.json 中未找到 academic-diagram 条目，请手动登记", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -87,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     version = args.version or _latest_tag()
     print(f"同步 ref={args.ref} version={version}")
 
-    tmp = Path(tempfile.mkdtemp(prefix="opentikz-sync-"))
+    tmp = Path(tempfile.mkdtemp(prefix="academic-diagram-sync-"))
     try:
         _run(["git", "clone", "--depth", "1", "--branch", args.ref,
               UPSTREAM_URL, str(tmp / "repo")])
@@ -97,9 +99,9 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8")
         recorded = (ASSETS / "upstream-SKILL.md").read_text(encoding="utf-8")
         if upstream_skill != recorded:
-            print("警告：上游 SKILL.md 与已记录版本不一致，三处 overlay 补丁"
+            print("警告：上游 SKILL.md 与已记录版本不一致，overlay 补丁"
                   "（frontmatter / §0 OTROOT / §2 编译降级）需人工核对后更新"
-                  " scripts/opentikz_assets/ 下的两个副本", file=sys.stderr)
+                  " scripts/academic_diagram_assets/ 下的两个副本", file=sys.stderr)
 
         for name in INCLUDE_DIRS:
             if not (src / name).is_dir():

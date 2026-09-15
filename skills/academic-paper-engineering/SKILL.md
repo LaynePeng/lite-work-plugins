@@ -2,10 +2,14 @@
 name: academic-paper-engineering
 description: 将 DOCX/PDF/Markdown/LaTeX 论文转化为完整可编译的 LaTeX 工程，支持中英学术翻译（可选）、8种期刊模板适配与迁移、自定义模板上传、图表公式参考文献处理、自动编译与12项质量审查。当用户需要论文排版、格式转换、模板迁移、学术翻译、图表公式提取或参考文献管理时调用。
 triggers: 论文排版,期刊模板,LaTeX,latex排版,论文格式转换,模板迁移,学术翻译,论文工程化,编译PDF,参考文献管理,图表公式,投稿模板,论文转latex,journal template,latex project,docx to latex,overleaf
-version: "1.0.0"
+version: "1.0.1"
 ---
 
 # 科研论文智能排版与工程化 Skill
+
+> **分工**：本技能处理既有图表的提取、匹配与 LaTeX 排版；**若需要新绘制论文配图
+> （TikZ 架构图/神经网络图/算法流程图等），转 `academic-diagram` 技能**，不要在本
+> 技能里临时手搓绘图命令。
 
 
 > **技能目录（`${SKILL_DIR}` 同义）**：本文件所在目录。`load_skill` 会在返回内容首行注入它的绝对路径。
