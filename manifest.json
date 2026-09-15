@@ -177,9 +177,15 @@
       "path": "skills/patent-disclosure-skill"
     },
     {
+      "name": "ppt-master",
+      "version": "6.4.0",
+      "description": "PPT 大师：专业级演示文稿工作流——SVG 授权生成可编辑原生 PPTX（生成/美化/图转PPT/模板创建/原生编辑，含图标库与品牌模板；AI 生图风格图、视频音效等可选资源可用 scripts/fetch_optional_assets.py 从上游 Releases 按需补全）",
+      "path": "skills/ppt-master"
+    },
+    {
       "name": "presentation",
-      "version": "1.0.0",
-      "description": "演示文稿制作：把主题/大纲/文档内容转成 PPT 初稿（python-pptx 生成 .pptx）",
+      "version": "1.0.1",
+      "description": "演示文稿快速初稿：把主题/大纲/文档内容转成 PPT 初稿（零额外依赖；专业版设计与美化用 ppt-master）",
       "path": "skills/presentation"
     },
     {

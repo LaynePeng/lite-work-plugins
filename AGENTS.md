@@ -66,6 +66,22 @@
   Python / npm 子进程执行，不受 frozen 限制；导入时会自动 pip/npm 安装）
 - 新技能登记进 `manifest.json` 的 `skills` 段
 
+### ppt-master（上游同步型技能，特殊规则）
+
+- 事实源是上游 `hugohe3/ppt-master` 的 `skills/ppt-master/`；本仓库是
+  **精简收录 + overlay 增量**，**禁止手改 `skills/ppt-master/` 内容**——
+  下次同步会全部覆盖。升级只走：
+  `python scripts/sync_ppt_master.py --tag v<版本>`
+- 精简排除清单（ai-image-comparison / sounds wav / tests）与 overlay
+  （SKILL.md 顶层 version+triggers、精简 requirements.txt、
+  fetch_optional_assets.py）的权威副本在 `scripts/ppt_master_assets/`，
+  改 overlay 必须改那里再重放，不要直接改技能目录
+- 技能自带 `attribution_guard.py` 防篡改门（嵌套 metadata / LICENSE /
+  SPONSORS / gate 脚本动一个就拒绝运行）；任何改动后必须
+  `python3 skills/ppt-master/scripts/attribution_guard.py` 验证 exit 0
+- 触发词分工：裸词 PPT/ppt/幻灯片/演示文稿 归 ppt-master；
+  `presentation` 只保留 PPT初稿/快速PPT 等意图词（避免双注入冲突）
+
 ## 提交规范
 
 - commit message 用中文，格式 `<类型>: <摘要>`（feat / fix / docs / sync）

@@ -31,7 +31,8 @@ lite-work-plugins/
     ├── document-writing/
     ├── meeting-notes/
     ├── patent-disclosure-skill/     #   中国专利技能（交底书/申请文件/检索/解读/地图/审查答复）
-    ├── presentation/
+    ├── ppt-master/                  #   PPT 大师（上游同步型：专业级 PPT 工作流，精简收录）
+    ├── presentation/                #   演示文稿快速初稿（轻量零依赖；专业版用 ppt-master）
     ├── research-report/
     └── weekly-report/
 ```
@@ -159,6 +160,28 @@ triggers: 关键词1,关键词2
 
 （工作流程、规则、示例——Agent 加载后按此执行）
 ```
+
+## 上游同步型技能（ppt-master）
+
+`skills/ppt-master` 源自上游 [hugohe3/ppt-master](https://github.com/hugohe3/ppt-master)
+（MIT），是本仓库唯一的上游同步型技能：**禁止手改其内容**，升级只走
+`python scripts/sync_ppt_master.py --tag v<版本>`（克隆 → 精简排除 → 重放
+overlay 补丁 → 完整性校验 → 同步 manifest 版本）。
+
+收录时的受控差异（overlay 权威副本在 `scripts/ppt_master_assets/`）：
+
+- **精简收录**（社区安装是整仓 git clone，控体积）：剔除 AI 生图风格参考图
+  （43MB）、音效库（12MB）、tests；保留全部 12000+ 图标与核心链路。
+  需要被剔资源时：`python3 scripts/fetch_optional_assets.py`
+  （从上游 Releases 按需补全；国内网络可先手动下载 zip 再 `--zip` 离线补）
+- **SKILL.md frontmatter** 追加顶层 `version` + `triggers`（lite-work 社区
+  更新检查读顶层 version；上游嵌套 metadata 块受防篡改门保护，原样保留）
+- **requirements.txt** 为精简核心版（SVG→PPTX 主链路依赖随导入自动安装；
+  PDF 转源 / AI 生图 / 视频旁白等可选依赖按功能现场 pip install）
+
+技能自带 `scripts/attribution_guard.py` 防篡改门（fail-closed）：改动
+LICENSE / SPONSORS / gate 脚本 / 嵌套 metadata 会使技能立即拒绝运行，
+同步脚本每步都以该校验收尾。
 
 ## 版本策略
 
