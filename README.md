@@ -30,6 +30,7 @@ lite-work-plugins/
     ├── document-styling/
     ├── document-writing/
     ├── meeting-notes/
+    ├── opentikz/                     #   学术论文图（上游同步型：TikZ 架构/算法图，OpenTikZ 库）
     ├── patent-disclosure-skill/     #   中国专利技能（交底书/申请文件/检索/解读/地图/审查答复）
     ├── ppt-master/                  #   PPT 大师（上游同步型：专业级 PPT 工作流，精简收录）
     ├── presentation/                #   演示文稿快速初稿（轻量零依赖；专业版用 ppt-master）
@@ -161,7 +162,9 @@ triggers: 关键词1,关键词2
 （工作流程、规则、示例——Agent 加载后按此执行）
 ```
 
-## 上游同步型技能（ppt-master）
+## 上游同步型技能
+
+### ppt-master
 
 `skills/ppt-master` 源自上游 [hugohe3/ppt-master](https://github.com/hugohe3/ppt-master)
 （MIT），是本仓库唯一的上游同步型技能：**禁止手改其内容**，升级只走
@@ -182,6 +185,25 @@ overlay 补丁 → 完整性校验 → 同步 manifest 版本）。
 技能自带 `scripts/attribution_guard.py` 防篡改门（fail-closed）：改动
 LICENSE / SPONSORS / gate 脚本 / 嵌套 metadata 会使技能立即拒绝运行，
 同步脚本每步都以该校验收尾。
+
+### opentikz
+
+`skills/opentikz` 源自上游 [opentikz/opentikz](https://github.com/opentikz/opentikz)
+（Code MIT / 内容 CC0），为计算机架构图 / 算法流程图等**学术论文配图**而生
+（TikZ 生成：73 个可复制图标 + 8 个参数化模板 + 品牌 logo，模板带
+edit_contract 供 Agent 安全编辑）。**禁止手改其内容**，升级只走
+`python scripts/sync_opentikz.py`（克隆 → 合并上游 skills/ 与库资源为
+自包含单目录 → 重放 SKILL.md overlay → 更新 manifest 版本）。
+
+收录差异（overlay 权威副本在 `scripts/opentikz_assets/`）：
+
+- 上游技能在 `skills/using-opentikz/` 而库资源在仓库根——本仓库把两者
+  合并进 `skills/opentikz/` 单目录（lite-work 技能必须自包含），SKILL.md
+  的 OTROOT 定位规则已相应扩展（同级目录含 catalog.json 即库根）
+- SKILL.md 三处补丁：frontmatter（name/version/triggers）、OTROOT 自包含
+  规则、无本地 LaTeX 时的降级交付（.tex + preview.svg + Overleaf 指引）
+- 不带 requirements.txt（出图零 Python 依赖）；编译验证需本机 LaTeX
+  （latexmk/pdflatex/xelatex/tectonic 任一）
 
 ## 版本策略
 

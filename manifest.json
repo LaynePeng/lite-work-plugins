@@ -171,6 +171,12 @@
       "path": "skills/meeting-notes"
     },
     {
+      "name": "opentikz",
+      "version": "0.1.0",
+      "description": "学术论文图绘制（OpenTikZ）：系统架构框图、神经网络结构、训练/推理 pipeline、算法流程图的 TikZ 生成——73 个可复制图标 + 8 个参数化模板（edit_contract 安全编辑）+ 品牌图标，LaTeX 编译验证，内容 CC0",
+      "path": "skills/opentikz"
+    },
+    {
       "name": "patent-disclosure-skill",
       "version": "4.7.0",
       "description": "中国专利技能：专利点挖掘与交底书（发明/实用/外观）编写、交底改写成申请文件四件套、公布公告著录检索、专利通俗解读、本地专利地图、审查政策简报与审查答复辅助",
