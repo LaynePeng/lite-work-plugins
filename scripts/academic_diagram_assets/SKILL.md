@@ -134,6 +134,35 @@ say the word to change any."*
   two icon+label stacks), also give an explicit inter-column gap (≥0.3 cm) and keep
   each column's widest line clear of the frame. If any text touches the border,
   widen the box or push the columns inward — do **not** shrink the text.
+- **标签不压箭头线** — 把标签放在箭头路径之外，不写在 `\draw` 的
+  `node[...]` 里（那会把标签渲染在箭头中点上）。正确做法：
+  先画箭头 `\draw[arr] (A) -- (B);`，再用独立节点放标签：
+  `\node[lab, anchor=south] at ($(A)!0.5!(B)$) {标签};`
+  anchor 选 `south`（上方）、`north`（下方）或 `west`（右侧），
+  让标签白底遮住的是空白区域而非箭头。
+
+- **禁用正交路由 `-|` / `|-` 连接框** — 这两个操作符会让箭头先走一段
+  与框边**平行的线**再拐弯，视觉上"贴着框边滑行"。
+  短距离连接一律用直线 `(A) -- (B)`；
+  长距离跨行连接用显式坐标绕行（见 §4 "回边走道"）。
+
+- **多条回边走道错开** — 从同一节点出发的多条回边（虚线反馈线），
+  各自走不同的 x 深度（左侧走道错开 ≥ 2cm）：
+  ```latex
+  \coordinate (c1) at (-5.5, y1);  % 回边 1 走 x=-5.5
+  \coordinate (c2) at (-7.5, y1);  % 回边 2 走 x=-7.5
+  \coordinate (c3) at (-9.5, y1);  % 回边 3 走 x=-9.5
+  \draw[darr] (n6.west) -- (c1) -- (c1 |- n5.west) -- (n5.west);
+  ```
+  不写走道坐标的三条回边会在垂直段完全重叠。
+
+- **跨多行的回投走外侧走道** — 回边跨越 3 行以上的节点时，
+  不穿中间的框，走最左或最右侧的空白走道再折回：
+  ```latex
+  \coordinate (corridor) at ($(s12.east)+(2.5,0)$);
+  \draw[darr] (s12.east) -- (corridor)
+    -- (corridor |- s5.east) -- (s5.east);
+  ```
 
 ## 4. Common cross-template operations
 
@@ -162,12 +191,21 @@ test a target in the standalone file give an explicit width
 `\resizebox` scales text too — if the figure is far wider than the column, first
 reduce content/spacing (the template's spacing parameters) and resize the rest.
 
+**回边走道（feedback loop routing）.** 画从下游指回上游的虚线回边时：
+1. 在框的左侧或右侧定义一个走道坐标（`\coordinate`）
+2. 路径：源框边缘 → 水平走到走道 → 垂直走到目标行 → 水平折入目标框边缘
+3. 走道与最近框边缘的距离 ≥ 1cm
+4. 多条回边各用不同深度的走道，间距 ≥ 2cm
+5. 标签放在走道旁边（`anchor=east` 或 `anchor=west`），竖排可用 `rotate=90`
+
 ## 5. Reference material
 
 - `reference/color-palettes/` — the canonical five-color Okabe-Ito palette (light
   + dark blocks), the single source of truth for colors.
 - `reference/annotations/` — how to add callouts, braces, and highlight labels.
 - `reference/layout/` — positioning, alignment, and spacing patterns.
+  (Covers in-box placement only; **arrow routing avoidance rules live in §3**
+  — labels vs lines, flush ports, staggered lanes, outer-lane returns.)
 - `docs/DESIGN_GUIDE.md` — global conventions (line width, node naming, metadata).
 
 ## 6. Mode B procedure — contributing back (editing the repo itself)
