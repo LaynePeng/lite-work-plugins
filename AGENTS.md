@@ -26,6 +26,10 @@
    不要反向操作（不要改主仓库后往回同步）。
 4. **manifest.json**：新增插件必须登记（name / version / description / path / tools），
    工具名列表保持与实际 `get_tools()` 一致
+5. **禁止提交 0 字节隐藏文件**（`.gitkeep` 类占位）：仓库不接受 0 字节的隐藏文件
+   （CI `.github/workflows/hidden-file-check.yml` 会强制检查）；上游同步型技能的
+   同步脚本已自动清理（见 `sync_academic_diagram.py` 的 `.gitkeep` 清理），
+   手改时也不要引入这类占位
 
 ## 主程序已捆绑的包（禁止打进 wheels）
 

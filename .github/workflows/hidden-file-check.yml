@@ -1,0 +1,27 @@
+name: Hidden File Audit
+
+on: [push, pull_request]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 禁止 0 字节隐藏文件（.gitkeep 类占位文件）
+        run: |
+          FAIL=0
+          while IFS= read -r f; do
+            case "$f" in
+              .github/*|*/.github/*) continue ;;
+            esac
+            if [ -s "$f" ]; then
+              continue
+            fi
+            echo "ERROR: 0 字节隐藏文件被提交: $f"
+            FAIL=1
+          done < <(git ls-files | grep -E '(^|/)\.' || true)
+          if [ "$FAIL" -ne 0 ]; then
+            echo "仓库不允许存在 0 字节隐藏文件（如 .gitkeep），请删除或改用非空文件占位。"
+            exit 1
+          fi
+          echo "OK: 无 0 字节隐藏文件"

@@ -115,6 +115,10 @@ def main(argv: list[str] | None = None) -> int:
             (SKILL / dst_rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src / src_rel, SKILL / dst_rel)
 
+        # 清理上游可能克隆下来的 0 字节隐藏文件（.gitkeep 等）
+        for p in SKILL.rglob(".gitkeep"):
+            p.unlink(missing_ok=True)
+
         (ASSETS / "upstream-SKILL.md").write_text(upstream_skill, encoding="utf-8")
         overlay = (ASSETS / "SKILL.md").read_text(encoding="utf-8")
         overlay = re.sub(r'(?m)^version: ".*"$', f'version: "{version}"', overlay)
