@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "min_app_version": "0.5.0",
   "plugins": [
     {
@@ -131,7 +131,7 @@
   "skills": [
     {
       "name": "academic-diagram",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "学术论文配图（OpenTikZ 库）：系统架构框图、神经网络结构、训练/推理 pipeline、算法流程图的 TikZ 生成——73 个可复制图标 + 8 个参数化模板（edit_contract 安全编辑）+ 品牌图标，LaTeX 编译验证，内容 CC0（专利附图和 Office 图分别走 patent / diagram-to-office）",
       "path": "skills/academic-diagram"
     },
@@ -143,7 +143,7 @@
     },
     {
       "name": "academic-paper-engineering",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "description": "学术论文工程化排版：把 DOCX/PDF/Markdown/LaTeX 转成可编译的期刊模板 LaTeX 工程（8+1 套模板、图表公式参考文献处理、无 TeX 时降级交付工程）",
       "path": "skills/academic-paper-engineering"
     },
