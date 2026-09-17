@@ -24,8 +24,10 @@
    直接在这三个插件里开发改动（本仓库是上游事实源）；需要进主程序内置时，
    再**按需同步回** lite-work 的 `litework/tools/{office,ocr,web}.py`。
    不要反向操作（不要改主仓库后往回同步）。
-4. **manifest.json**：新增插件必须登记（name / version / description / path / tools），
-   工具名列表保持与实际 `get_tools()` 一致
+4. **manifest.json**：新增插件必须登记（name / version / description / path）；
+   **工具型插件**（`kind` 缺省或 `tool`）另需登记 `tools`，且与实际 `get_tools()` 一致；
+   **模式型插件**（`kind: collab`）与无工具的数据源插件（如 `pricing-plugin` 的
+   `get_tools()` 返回空）不需要 `tools`，登记空数组亦可
 5. **禁止提交 0 字节隐藏文件**（`.gitkeep` 类占位）：仓库不接受 0 字节的隐藏文件
    （CI `.github/workflows/hidden-file-check.yml` 会强制检查）；上游同步型技能的
    同步脚本已自动清理（见 `sync_academic_diagram.py` 的 `.gitkeep` 清理），
@@ -76,10 +78,11 @@
   **精简收录 + overlay 增量**，**禁止手改 `skills/ppt-master/` 内容**——
   下次同步会全部覆盖。升级只走：
   `python scripts/sync_ppt_master.py --tag v<版本>`
-- 精简排除清单（ai-image-comparison / sounds wav / tests）与 overlay
-  （SKILL.md 顶层 version+triggers、精简 requirements.txt、
-  fetch_optional_assets.py）的权威副本在 `scripts/ppt_master_assets/`，
-  改 overlay 必须改那里再重放，不要直接改技能目录
+- 精简排除清单在 `scripts/sync_ppt_master.py` 的 `RSYNC_EXCLUDES`；文件类
+  overlay（精简 `requirements.txt`、`fetch_optional_assets.py`）的权威副本在
+  `scripts/ppt_master_assets/`；SKILL.md 的顶层 `version`/`triggers` **不是文件**，
+  由同步脚本从上游 `metadata.version` + 脚本内 `TRIGGERS` 常量注入。
+  三类要改都在上述位置改完再重放，不要直接改技能目录
 - 技能自带 `attribution_guard.py` 防篡改门（嵌套 metadata / LICENSE /
   SPONSORS / gate 脚本动一个就拒绝运行）；任何改动后必须
   `python3 skills/ppt-master/scripts/attribution_guard.py` 验证 exit 0

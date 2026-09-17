@@ -190,8 +190,8 @@ LICENSE / SPONSORS / gate 脚本 / 嵌套 metadata 会使技能立即拒绝运�
 
 `skills/academic-diagram`（原名 `opentikz`，v0.1.0 时改名）源自上游
 [opentikz/opentikz](https://github.com/opentikz/opentikz)（Code MIT / 内容 CC0），
-专门为**学术论文配图**而生（TikZ 生成：73 个可复制图标 + 8 个参数化模板 +
-品牌 logo，模板带 edit_contract 供 Agent 安全编辑）。
+专门为**学术论文配图**而生（TikZ 生成：61 个可复制图标（含 41 个品牌 logo）+
+9 个参数化模板 + 3 个整图示例，模板带 edit_contract 供 Agent 安全编辑）。
 **禁止手改其内容**，升级只走 `python scripts/sync_academic_diagram.py`（克隆 →
 合并上游 skills/ 与库资源为自包含单目录 → 重放 SKILL.md overlay →
 更新 manifest 版本）。

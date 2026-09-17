@@ -132,7 +132,7 @@
     {
       "name": "academic-diagram",
       "version": "0.1.1",
-      "description": "学术论文配图（OpenTikZ 库）：系统架构框图、神经网络结构、训练/推理 pipeline、算法流程图的 TikZ 生成——73 个可复制图标 + 8 个参数化模板（edit_contract 安全编辑）+ 品牌图标，LaTeX 编译验证，内容 CC0（专利附图和 Office 图分别走 patent / diagram-to-office）",
+      "description": "学术论文配图（OpenTikZ 库）：系统架构框图、神经网络结构、训练/推理 pipeline、算法流程图的 TikZ 生成——61 个可复制图标（含 41 个品牌图标）+ 9 个参数化模板（edit_contract 安全编辑）+ 3 个整图示例（catalog 共 73 条目），LaTeX 编译验证，内容 CC0（专利附图和 Office 图分别走 patent / diagram-to-office）",
       "path": "skills/academic-diagram"
     },
     {
