@@ -143,7 +143,7 @@
     },
     {
       "name": "academic-paper-engineering",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "description": "学术论文工程化排版：把 DOCX/PDF/Markdown/LaTeX 转成可编译的期刊模板 LaTeX 工程（8+1 套模板、图表公式参考文献处理、无 TeX 时降级交付工程）",
       "path": "skills/academic-paper-engineering"
     },
