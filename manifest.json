@@ -48,6 +48,13 @@
       ]
     },
     {
+      "name": "pricing-plugin",
+      "version": "1.0.0",
+      "description": "官方定价数据源：DeepSeek 分时价（高峰/空闲半价）与 Kimi 国际站价，按模型指纹计费（自定义中转也能认出）。价格表在 pricing.json，手动同步、不自动联网。",
+      "path": "plugins/pricing-plugin",
+      "tools": []
+    },
+    {
       "name": "example-greeting",
       "version": "1.0.0",
       "description": "示例插件：文本统计工具（演示社区插件编写格式）",
