@@ -1,7 +1,7 @@
 ---
 name: academic-diagram
 description: Use when a user wants a TikZ figure for an academic paper — an icon, an editable architecture/pipeline/flow template, or an example — and wants you to find, edit, and verify it. The skill for paper figures, powered by the OpenTikZ library. For Office documents (PlantUML/Mermaid embedded into Word/PPT) use diagram-to-office instead; for patent application drawings use the patent skill's own black-and-white engine.
-version: "0.1.0"
+version: "0.1.1"
 triggers: tikz,TikZ,opentikz,论文配图,论文图,学术图,科研绘图,科研图,架构图,算法图,算法流程图,框图,论文插图,paper figure,architecture diagram,algorithm figure
 ---
 
@@ -208,14 +208,20 @@ reduce content/spacing (the template's spacing parameters) and resize the rest.
   — labels vs lines, flush ports, staggered lanes, outer-lane returns.)
 - `docs/DESIGN_GUIDE.md` — global conventions (line width, node naming, metadata).
 
-## 6. Mode B procedure — contributing back (editing the repo itself)
+## 6. Mode B procedure — editing library content in this copy
 
 If the user is adding/changing library content (not just producing a figure for
-their paper), the repo tooling applies:
+their paper), verify each edit with the LaTeX toolchain directly — the upstream
+repo tooling (`tools/build_catalog.py`, `render_preview.py`, `validate.py`) is
+**not shipped in this skill** (excluded during sync):
 
-- regenerate the preview: `python3 tools/render_preview.py <file>.tex -o <dir>/preview.svg`
-- regenerate the catalog: `python3 tools/build_catalog.py`
-- validate: `python3 tools/validate.py --strict`
+- compile check: `latexmk -pdf <file>.tex` (or `pdflatex`); if no engine is
+  installed, report that instead of guessing — see §2 for the delivery fallback
+- regenerate the preview SVG: `dvisvgm --pdf --bbox=preview --no-fonts <file>.pdf -o preview.svg`
+  (keep the committed `preview.svg` in sync with its `.tex`)
 - a new/edited template needs an `edit_contract` in its `meta.json` (see §4 of
-  `docs/DESIGN_GUIDE.md`); `validate.py` checks its parameters/styles exist in the
-  `.tex`.
+  `docs/DESIGN_GUIDE.md`): every `parameters[].name` and style it declares must
+  actually exist in the `.tex` — verify by inspection, since `validate.py` is not
+  available here
+- `catalog.json` is a snapshot shipped with the library; do not rebuild it inside
+  this skill — to regenerate it, go to the upstream OpenTikZ repository
