@@ -99,6 +99,9 @@
 - SKILL.md overlay（name=academic-diagram + 顶层 version/triggers、OTROOT 自包含
   定位规则、无 LaTeX 降级交付）的权威副本在 `scripts/academic_diagram_assets/`
   （含 upstream-SKILL.md 漂移检测基准）；改 overlay 必须改那里再重放；
+- **漂移基准取自上游 `main` 快照，不是 tag**：上游 tag 可能落后（品牌图标在
+  v0.1.0 之后才并入 main），钉旧 tag 会被误报基线漂移且会拉到较旧内容。
+  升级用 `python scripts/sync_academic_diagram.py --ref main`（默认即 main）；
 - 不带 requirements.txt（出图零 Python 依赖）；编译验证依赖本机 LaTeX
 - 触发词分工：tikz/架构图/算法图/论文配图/科研绘图/框图 归 academic-diagram；
   `diagram-to-office` 保留 plantuml/mermaid/时序图/流程图/类图（转

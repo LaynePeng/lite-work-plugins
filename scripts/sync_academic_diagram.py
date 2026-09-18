@@ -22,6 +22,11 @@ examples/reference/catalog.json）在仓库根——lite-work 技能必须自包
     python scripts/sync_academic_diagram.py [--ref main] [--version 0.1.0]
 版本取上游最新 tag（去 v 前缀）；--ref 可钉 tag 或分支。上游 SKILL.md 与
 scripts/academic_diagram_assets/upstream-SKILL.md 不一致时会提示人工核对 overlay。
+
+**注意 ref 的选择**：本仓库的漂移检测基线（upstream-SKILL.md）取自上游 **main**
+快照——上游的 tag 可能落后于 main（例如品牌图标是在 v0.1.0 之后才并入 main 的），
+钉旧 tag 会被误报为「基线漂移」，且会拉到较旧的库内容（不含品牌图标）。
+升级请用 `--ref main`（或确知不落后的新 tag），默认 ref 即 main。
 退出码：0 成功 / 1 失败
 """
 from __future__ import annotations
@@ -101,7 +106,9 @@ def main(argv: list[str] | None = None) -> int:
         if upstream_skill != recorded:
             print("警告：上游 SKILL.md 与已记录版本不一致，overlay 补丁"
                   "（frontmatter / §0 OTROOT / §2 编译降级）需人工核对后更新"
-                  " scripts/academic_diagram_assets/ 下的两个副本", file=sys.stderr)
+                  " scripts/academic_diagram_assets/ 下的两个副本。"
+                  "（若 --ref 指向早于基线快照的 tag，此告警为预期：本仓库基线取自"
+                  "上游 main，tag 可能落后，升级请用 --ref main）", file=sys.stderr)
 
         for name in INCLUDE_DIRS:
             if not (src / name).is_dir():
