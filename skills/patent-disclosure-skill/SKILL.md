@@ -1,7 +1,7 @@
 ---
 name: patent-disclosure-skill
 description: "中国专利技能：挖掘专利点与编写交底书（发明/实用/外观），把已有交底改写成申请文件四件套，也可按材料交底申请一起做，按著录字段检索公布公告，通俗解读专利，基于已读库打开专利地图，对照审查口径出政策简报，辅助审查答复。| China patents skill: mine patent points and draft disclosures, rewrite an existing disclosure into application documents, or chain disclosure-then-application from inventor materials in one pass (ask when facts are missing; at most three issue-list rounds), search CNIPA bibliographic records, explain patents, open a local patent map from interpreted notes, brief examination-policy changes, and assist office-action responses."
-version: "4.7.0"
+version: "4.8.0"
 triggers: 专利,交底书,专利交底,申请文件,权利要求,说明书,专利检索,著录检索,专利解读,专利地图,审查答复,审查意见,政策简报,实用新型,外观设计,专利申请,专利查新,知识产权,CNIPA,patent,patent disclosure,patent search,patent map,office action
 user-invocable: true
 argument-hint: "[可选：项目路径 / 交底书 / 申请底稿 / 交底申请一起做 / 专利检索 / 专利号或 PDF / 专利地图 / 政策简报 / 审查答复]"
@@ -76,6 +76,7 @@ skills/patent-exam-policy/        # 政策简报（技能进化为旁路）
 ## 环境与约定
 
 - **默认语言**：面向用户的检索清单、交底书、申请文件、案卷 TRACKER、解读和审查答复用简体中文；脚本机读前缀与 JSON 字段名保持稳定。
+- **技术语言（硬性）**：交底书、申请文件等一切交付文档，技术特征**尽量使用本领域通用技术术语**（「连接」「固定」「夹持」「检测」「处理单元」「通信接口」这类常规词），**禁止随意生造词汇**（把「夹持」写成「环抱式定位握持」、把「连接器」写成「插拔耦合组件」即属造词）。确需表述新概念时，用通用词组合表达，并在首次出现处给出定义，而不是发明一个没见过的名词。与子技能里的「话题错位检测」是两条并列要求：换领域词不等于造新词，两者都要守。
 - **脚本判读（尤其 Windows）**：stderr 有字 **不等于** 失败。以 **退出码 0** 和机读前缀为准：`EPUB_HITS_JSON:` / `EPUB_SEARCH_MD:` / `EPUB_SEARCH_JSON:` / `EPUB_CLASS_HINT:`、`PROBE:` / `BROWSER:`、`MERMAID:` / `DOCX:`、`APPLICATION_GATE:` / `APPLICATION_CLAIMS:` / `APPLICATION_NUMERALS:`、`DOCKET_DIR:` / `DOCKET_YAML:` / `DOCKET_OK:` / `DOCKET_ERROR:`、`MAP_URL:` / `MAP_PORT:` / `MAP_VAULT:` / `MAP_SOURCE:` / `MAP_CACHE:`。PowerShell 可能把 stderr 标成 `NativeCommandError`；**禁止**因此重跑安装或把查新降级 WebSearch。
 - **专利类型**：未显式指定时交底**默认发明**。
 - **脚本路径**：相对本技能仓库根（本文件所在目录）。整仓：`python skills/patent-disclosure/tools/…`。当前工作区不是本仓库时，把技能安装目录接到命令前面。单独拷走某一子包时，该包内用 `python tools/…`。不要写厂商环境变量。
