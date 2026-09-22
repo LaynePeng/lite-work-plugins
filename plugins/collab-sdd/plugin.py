@@ -11,7 +11,7 @@ from litework.orchestration.collab_policy import CollabModePlugin
 
 class SDDCollabMode(CollabModePlugin):
     name = "collab-sdd"
-    version = "1.0.0"
+    version = "1.0.1"
     description = "协作模式：规格驱动开发（SDD）——spec→plan→tasks→implement 四件套工件落盘 specs/，critic 评审规格与方案，实现与测试以 EARS 需求为验收标准（配套 sdd-plugin 工具集）"
     mode_name = "sdd"
     display_name = "规格驱动开发（SDD）"

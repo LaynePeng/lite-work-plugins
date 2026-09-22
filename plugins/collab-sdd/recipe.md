@@ -5,6 +5,14 @@ implement（实现与验证）**。工件落盘在 `specs/<feature>/`，统一�
 工具集管理（sdd_init / sdd_spec_save / sdd_plan_save / sdd_tasks_save /
 sdd_check / sdd_status）——工具自带阶段门禁与需求-任务追溯校验，跨会话可续接。
 
+## 工具缺失时的降级
+
+若 sdd-plugin 工具集不可用（工具列表中没有 sdd_* 工具）：先提示用户安装
+sdd-plugin（推荐，可获得门禁校验与追溯矩阵）；用户坚持继续时，降级为手动
+维护 `specs/<feature>/`——文件名与格式须与工具约定完全一致
+（spec.md 需求编号 R<n> + EARS 句式 / plan.md / tasks.md 任务行
+`- [ ] T<x.y> [R…] 描述`），以便事后安装工具时无缝接管校验与状态统计。
+
 ## 阶段 0：澄清（clarify）
 
 1. 与用户确认特性名 feature（短横线命名，如 user-auth）与一句话描述
