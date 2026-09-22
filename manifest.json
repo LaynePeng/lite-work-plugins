@@ -1,5 +1,5 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.2",
   "min_app_version": "0.5.0",
   "plugins": [
     {
@@ -53,6 +53,20 @@
       "description": "官方定价数据源：DeepSeek 分时价（高峰/空闲半价）与 Kimi 国际站价，按模型指纹计费（自定义中转也能认出）。价格表在 pricing.json，手动同步、不自动联网。",
       "path": "plugins/pricing-plugin",
       "tools": []
+    },
+    {
+      "name": "sdd-plugin",
+      "version": "1.0.0",
+      "description": "SDD 规格驱动开发：spec→plan→tasks→implement 四件套工件落盘 specs/<feature>/，EARS 需求格式、需求-任务追溯矩阵与阶段门禁校验，跨会话可续接",
+      "path": "plugins/sdd-plugin",
+      "tools": [
+        "sdd_init",
+        "sdd_spec_save",
+        "sdd_plan_save",
+        "sdd_tasks_save",
+        "sdd_check",
+        "sdd_status"
+      ]
     },
     {
       "name": "example-greeting",
@@ -126,6 +140,14 @@
       "path": "plugins/collab-roleplay",
       "kind": "collab",
       "icon": "plugins/collab-roleplay/icon.svg"
+    },
+    {
+      "name": "collab-sdd",
+      "version": "1.0.0",
+      "description": "协作模式：规格驱动开发（SDD）——spec→plan→tasks→implement 四件套工件落盘 specs/，critic 评审规格与方案，实现与测试以 EARS 需求为验收标准（配套 sdd-plugin 工具集）",
+      "path": "plugins/collab-sdd",
+      "kind": "collab",
+      "icon": "plugins/collab-sdd/icon.svg"
     }
   ],
   "skills": [
