@@ -76,6 +76,17 @@ GATED_TOOLS = frozenset({
 #: 观测计数（测试与 UI 都会读）
 STATS: Dict[str, int] = {"judgements": 0, "errors": 0, "blocked": 0, "skipped_untrusted": 0}
 
+#: 最近判断记录（进程内环形缓冲，供右栏「判断」面板展示；不落盘、不外发）
+_RECENT: List[Dict[str, Any]] = []
+_RECENT_MAX = 50
+
+
+def record_judgement(entry: Dict[str, Any]) -> None:
+    """记录一次判断（仅本进程内存态；面板展示用）。"""
+    _RECENT.append(entry)
+    if len(_RECENT) > _RECENT_MAX:
+        del _RECENT[0: len(_RECENT) - _RECENT_MAX]
+
 
 # ---------------------------------------------------------------- 配置
 
@@ -204,7 +215,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.2.1"
+    version = "0.2.2"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -230,7 +241,9 @@ class JevPlugin(ToolPlugin):
             {"key": "auto_gate_enabled", "type": "boolean", "label": "自动门禁（每轮成本）",
              "default": False},
         ],
-        "panels": [],
+        "panels": [
+            {"id": "judgements", "title": "判断", "icon": "🧠"},
+        ],
     }
 
     def __init__(self) -> None:
@@ -385,6 +398,14 @@ class JevPlugin(ToolPlugin):
         if not isinstance(ans, dict):
             return "Jev 返回格式不符合预期，已按未采信处理（fail-closed）。"
 
+        record_judgement({
+            "kind": kind,
+            "confidence": float(ans.get("confidence") or 0.0),
+            "choice": str(ans.get("choice") or ""),
+            "score": ans.get("score"),
+            "point": "tool",
+            "at": time.time(),
+        })
         if kind == "choice":
             probs = ans.get("probabilities") or {}
             probs = {str(k): float(v) for k, v in probs.items()} if isinstance(probs, dict) else {}
@@ -425,6 +446,14 @@ class JevPlugin(ToolPlugin):
             if conf < cfg.threshold:
                 STATS["skipped_untrusted"] += 1     # 未采信：不参与决策
                 return await next(data)
+            record_judgement({
+                "kind": "gate",
+                "confidence": conf,
+                "choice": "拦截" if str(verdict.get("choice")) == "block" else str(verdict.get("choice")),
+                "tool": tool,
+                "point": "gate",
+                "at": time.time(),
+            })
             if str(verdict.get("choice")) == "block":
                 STATS["blocked"] += 1
                 data["cancel"] = True
@@ -435,7 +464,52 @@ class JevPlugin(ToolPlugin):
             # 其余结论一律让行：本插件从**不**放行、也从不把 cancel 置回 False
             return await next(data)
 
-    async def judge(self, cfg: JevConfig, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    # -------------------------------------------------- 右栏「判断」面板
+
+    def panel_content(self, panel_id: str, config: Dict[str, Any]) -> str:
+        """右栏「判断」面板的 Markdown（纯读、不联网）。"""
+        if panel_id != "judgements":
+            return ""
+        raw = dict((config or {}).get(PLUGIN_NAME) or {}) if isinstance(config, dict) else {}
+        cfg = JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
+        out = ["### 🧠 Jev 判断", ""]
+        if cfg.ready:
+            out.append(f"**● 运行中** · 模型 `{cfg.model}` · 阈值 `{cfg.threshold:.2f}` · "
+                       f"自动门禁 {'开' if cfg.auto_gate_enabled else '关'}")
+        else:
+            out.append(f"**⏸ 未启动** —— {cfg.reason}")
+        out.append("")
+        out.append(f"端点：`{cfg.base_url}`")
+        if cfg.headers:
+            out.append(f"自定义请求头：`{', '.join(cfg.headers.keys())}`")
+        out.append("")
+        out.append("| 指标 | 值 |")
+        out.append("| --- | --- |")
+        out.append(f"| 判断次数 | {STATS['judgements']} |")
+        out.append(f"| 门禁拦截 | {STATS['blocked']} |")
+        out.append(f"| 未采信跳过 | {STATS['skipped_untrusted']} |")
+        out.append(f"| 调用失败 | {STATS['errors']} |")
+        out.append("")
+        if not _RECENT:
+            out.append("_暂无判断记录（本进程内）。判断发生后会显示在这里。_")
+            return "\n".join(out)
+        out.append(f"#### 最近 {len(_RECENT)} 次判断（新→旧）")
+        out.append("")
+        out.append("| 来源 | 结论 | 置信 | 阈值 | 采信 |")
+        out.append("| --- | --- | --- | --- | --- |")
+        for item in reversed(_RECENT[-15:]):
+            conf = float(item.get("confidence") or 0.0)
+            accepted = conf >= cfg.threshold
+            verdict = str(item.get("choice") or item.get("score") or "-")
+            point = "门禁" if item.get("point") == "gate" else "工具"
+            tool = f" `{item.get('tool')}`" if item.get("tool") else ""
+            out.append(f"| {point}{tool} | {verdict} | `{conf:.2f}` | `{cfg.threshold:.2f}` | "
+                       f"{'✅' if accepted else '⚪ 未采信'} |")
+        out.append("")
+        out.append("_记录仅存于本进程内存，重启即清空；不写盘、不外发。_")
+        return "\n".join(out)
+
+    def judge(self, cfg: JevConfig, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """对一次工具调用做判断（可被测试 monkeypatch）。"""
         state = _summarize_action(tool, args)
         payload = {
