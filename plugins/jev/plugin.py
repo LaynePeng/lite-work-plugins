@@ -59,7 +59,7 @@ logger = logging.getLogger("litework.plugins.jev")
 
 PLUGIN_NAME = "jev"
 DEFAULT_BASE_URL = "https://api.typesafe.ai/v1/systemone"
-DEFAULT_MODEL = "jev-1.13.0"          # 固定版本，不用会移动的别名
+DEFAULT_MODEL = "jev-1.13"            # 网关实际可用名（官方别名 jev-latest 会移动，不建议）
 DEFAULT_THRESHOLD = 0.60
 DEFAULT_SIZE_GATE_TOKENS = 8192
 DEFAULT_TIMEOUT_MS = 800
@@ -147,11 +147,16 @@ def post_systemone(cfg: JevConfig, payload: Dict[str, Any]) -> Dict[str, Any]:
         return resp.json()
 
 
-def _build_questions(kind: str, instructions: str, criteria: Optional[List[str]]) -> Dict[str, Any]:
-    """构造 questions（字段名以官方契约为准，联调时核对设计文档 §2.2）。"""
+def _build_questions(kind: str, instructions: str, criteria: Any) -> Dict[str, Any]:
+    """构造 questions（以真实网关契约实测为准）。
+
+    - choice：criteria 必须是**映射** {选项: 说明}（传数组会 422）
+    - score ：criteria 是**有序数组** [各级含义]
+    - noul ：无 criteria
+    """
     q: Dict[str, Any] = {"type": kind, "instructions": instructions}
     if criteria:
-        q["criteria"] = list(criteria)
+        q["criteria"] = dict(criteria) if isinstance(criteria, dict) else list(criteria)
     return {"q1": q}
 
 
@@ -199,7 +204,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.2.0"
+    version = "0.2.1"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -298,8 +303,16 @@ class JevPlugin(ToolPlugin):
                         "state": {"type": "string", "description": "要判断的内容（精简摘要）"},
                         "instructions": {"type": "string", "description": "判断指令，例如「这属于哪一类」"},
                         "options": {
-                            "type": "array", "items": {"type": "string"},
-                            "description": "候选选项（不超过 255 项）",
+                            "type": "array",
+                            "items": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {"type": "object", "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": "string"}}},
+                                ]
+                            },
+                            "description": "候选选项（≤255）：字符串，或 {'label','description'}；描述能显著提升判断质量",
                         },
                     },
                     "required": ["state", "instructions", "options"],
@@ -329,10 +342,22 @@ class JevPlugin(ToolPlugin):
             if not criteria:
                 criteria = ["1 无害", "5 中等", "10 破坏性"]
         elif name == "jev_choice":
-            criteria = [str(c) for c in (args.get("options") or []) if str(c).strip()]
             kind = "choice"
+            options = args.get("options") or []
+            criteria = {}
+            for idx, opt in enumerate(options):
+                if isinstance(opt, dict):
+                    label = str(opt.get("label") or opt.get("value") or f"option{idx + 1}")
+                    desc = str(opt.get("description") or "") or label
+                else:
+                    label = str(opt)
+                    desc = label
+                if label:
+                    criteria[label] = desc
             if not criteria:
-                return "参数不全：jev_choice 需要 options（候选选项列表）。"
+                return "参数不全：jev_choice 需要 options（候选选项，字符串或 {label, description}）。"
+            if len(criteria) > 255:
+                return f"选项过多（{len(criteria)} > 255），请先收敛候选。"
         else:
             return f"未知工具：{name}"
 
@@ -353,6 +378,10 @@ class JevPlugin(ToolPlugin):
                 latency_ms: int, instructions: str) -> str:
         answers = data.get("answers") or {}
         ans = answers.get("q1") if isinstance(answers, dict) else None
+        if not isinstance(ans, dict) and isinstance(answers, dict) and answers:
+            # 网关可能按我们给的 key 原样回；取第一个答案对象即可
+            first = next(iter(answers.values()))
+            ans = first if isinstance(first, dict) else None
         if not isinstance(ans, dict):
             return "Jev 返回格式不符合预期，已按未采信处理（fail-closed）。"
 
@@ -415,7 +444,9 @@ class JevPlugin(ToolPlugin):
             "questions": _build_questions(
                 "choice",
                 f"该工具调用（{tool}）应当放行、需人确认，还是拦截？",
-                ["放行", "请人确认", "拦截"],
+                {"放行": "无副作用或完全可逆，风险低",
+                 "请人确认": "有中等风险或不可逆，但可能是合理操作",
+                 "拦截": "不可逆或触及生产数据，风险高"},
             ),
         }
         data = post_systemone(cfg, payload)
