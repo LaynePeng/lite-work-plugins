@@ -35,6 +35,10 @@ auto_gate_enabled       false                自动门禁（每轮成本），�
 许可与治理（AGENTS.md §6）：本文件是**社区插件**源码（目标仓 laynepeng/lite-work-plugins，
 整体 MIT），因此**不添加任何 Apache SPDX 头**，与内置 office.py / ocr.py 同口径。
 
+兼容性：**设置表单**（Base URL / 自定义请求头 / 阈值等）需要 lite-work ≥ 1.10.0 的
+通用插件 UI 协议；在更老的核心上插件依然可用（工具 + 工具执行前升级器），只是设置页
+不会出现配置表单，此时请手改 config.json 顶层的 `jev` 对象。
+
 注意：HTTP 端点与问题字段依据官方文档整理（docs.typesafe.ai），**尚未真机联调**
 （需要 API Key）。首次联调请核对设计文档 §2.2 的 API 契约再改 `_build_questions`。
 """
@@ -78,8 +82,9 @@ STATS: Dict[str, int] = {"judgements": 0, "errors": 0, "blocked": 0, "skipped_un
 class JevConfig:
     """插件配置快照。每次装配/调用都**现读**（app.config 是内存 dict 原地更新）。"""
 
-    __slots__ = ("api_key", "model", "base_url", "threshold", "size_gate_tokens",
-                 "timeout_ms", "tools_enabled", "auto_gate_enabled", "reason")
+    __slots__ = ("api_key", "model", "base_url", "headers", "threshold",
+                 "size_gate_tokens", "timeout_ms", "tools_enabled",
+                 "auto_gate_enabled", "reason")
 
     def __init__(self, raw: Dict[str, Any], env_key: str = "") -> None:
         self.api_key = str(raw.get("api_key") or env_key or "").strip()
@@ -89,6 +94,10 @@ class JevConfig:
         self.threshold = float(raw.get("confidence_threshold") or DEFAULT_THRESHOLD)
         self.size_gate_tokens = int(raw.get("size_gate_tokens") or DEFAULT_SIZE_GATE_TOKENS)
         self.timeout_ms = int(raw.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
+        # 自定义请求头（网关 / 代理常用）：键值都强制为字符串
+        raw_headers = raw.get("headers")
+        self.headers = ({str(k): str(v) for k, v in raw_headers.items()}
+                        if isinstance(raw_headers, dict) else {})
         # 启动门通过之后才受这两个开关控制（成本模型不同，见文档 §12.7）
         self.tools_enabled = bool(raw.get("tools_enabled", True))
         self.auto_gate_enabled = bool(raw.get("auto_gate_enabled", False))
@@ -131,11 +140,9 @@ def post_systemone(cfg: JevConfig, payload: Dict[str, Any]) -> Dict[str, Any]:
     """单次调用 System One。独立函数，便于测试 monkeypatch 与调用计数。"""
     STATS["judgements"] += 1
     with httpx.Client(timeout=cfg.timeout_s) as client:
-        resp = client.post(
-            cfg.base_url,
-            json=payload,
-            headers={"Authorization": f"Bearer {cfg.api_key}"},
-        )
+        headers = {"Authorization": f"Bearer {cfg.api_key}"}
+        headers.update(cfg.headers)      # 自定义头可覆盖默认 Authorization
+        resp = client.post(cfg.base_url, json=payload, headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -192,8 +199,34 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.1.0"
+    version = "0.2.0"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
+
+    #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
+    contributes = {
+        "settings": [
+            {"key": "base_url", "type": "str", "label": "Base URL",
+             "default": DEFAULT_BASE_URL,
+             "hint": "System One 兼容端点；可指向自建网关 / 代理"},
+            {"key": "headers", "type": "map", "label": "自定义请求头",
+             "hint": 'JSON 对象，例如 {"x-api-key":"...","X-Api-Version":"1"}；与默认 Authorization 合并（同名覆盖）'},
+            {"key": "api_key", "type": "secret", "label": "API Key",
+             "hint": "默认用于 Authorization: Bearer；若网关要求别的头，请把 key 放进自定义请求头"},
+            {"key": "model", "type": "str", "label": "模型版本", "default": DEFAULT_MODEL,
+             "hint": "建议固定版本 ID，别名会移动"},
+            {"key": "confidence_threshold", "type": "number", "label": "置信度阈值",
+             "default": DEFAULT_THRESHOLD},
+            {"key": "size_gate_tokens", "type": "number", "label": "size-gate（token）",
+             "default": DEFAULT_SIZE_GATE_TOKENS},
+            {"key": "timeout_ms", "type": "number", "label": "超时（毫秒）",
+             "default": DEFAULT_TIMEOUT_MS},
+            {"key": "tools_enabled", "type": "boolean", "label": "暴露 jev_* 工具",
+             "default": True},
+            {"key": "auto_gate_enabled", "type": "boolean", "label": "自动门禁（每轮成本）",
+             "default": False},
+        ],
+        "panels": [],
+    }
 
     def __init__(self) -> None:
         self._kernel: Optional[Kernel] = None
@@ -222,6 +255,14 @@ class JevPlugin(ToolPlugin):
         self.status_reason = ""
         logger.info("[jev] 已启动（tools=%s, auto_gate=%s, model=%s）",
                     cfg.tools_enabled, cfg.auto_gate_enabled, cfg.model)
+
+    def status_from_config(self, config):
+        """设置页显示「运行中 / 未启动 + 原因」（纯读：不发网络、不写盘）。"""
+        raw = dict(config.get(PLUGIN_NAME) or {}) if isinstance(config, dict) else {}
+        cfg = JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
+        if not cfg.ready:
+            return {"state": "not_started", "reason": cfg.reason}
+        return {"state": "running", "reason": ""}
 
     # -------------------------------------------------- 工具
     def get_tools(self) -> List[ToolDefinition]:
