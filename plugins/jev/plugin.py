@@ -352,7 +352,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.6.2"
+    version = "0.6.3"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -633,10 +633,13 @@ class JevPlugin(ToolPlugin):
         ans = answers.get("q1") if isinstance(answers, dict) else None
         if not isinstance(ans, dict):
             return ""
-        # noul 类型没有 confidence 字段（真机实测确认）——用 noul 值本身作为置信度
-        # choice/score 有 confidence 字段，直接用
+        # noul 的语义是"陈述为真的概率"，不是置信度：
+        #   noul=0.95 → 高置信"是"；noul=0.05 → 高置信"否"；noul≈0.5 → 抛硬币（低置信）。
+        # 正确校准：置信 = |noul - 0.5| * 2（离抛硬币的距离）。
         if kind == "noul":
-            conf = float(ans.get("noul") or 0.0)
+            noul_val = float(ans.get("noul") or 0.0)
+            conf = abs(noul_val - 0.5) * 2.0
+            ans["choice"] = "是" if noul_val >= 0.5 else "否"
         else:
             conf = float(ans.get("confidence") or 0.0)
         if conf < cfg.direct_answer_confidence:
@@ -853,7 +856,8 @@ def _parse_direct_command(text: str) -> Optional[Dict[str, Any]]:
         if not statement:
             return None
         return {"kind": "noul", "state": statement,
-                "instructions": "该陈述是否成立？", "criteria": None}
+                "instructions": "该情况/陈述是否属实或成立？请基于常识直接判断",
+                "criteria": None}
     if rest.startswith("打分"):
         content = rest[2:].strip()
         if not content:
