@@ -100,6 +100,8 @@ class JevConfig:
                  "auto_gate_enabled", "has_header_credential",
                  "direct_answer", "direct_answer_confidence",
                  "skill_recommend", "screen", "verify", "verify_threshold",
+                 "compact_decider", "compact_decider_threshold",
+                 "compact_decider_batch", "compact_decider_min_keep_ratio",
                  "reason")
 
     def __init__(self, raw: Dict[str, Any], env_key: str = "") -> None:
@@ -131,6 +133,20 @@ class JevConfig:
         self.screen = bool(raw.get("screen_enabled", False))
         self.verify = bool(raw.get("verify_enabled", False))
         self.verify_threshold = float(raw.get("verify_threshold") or 0.5)
+        # #1 Jev 压缩判定器（opt-in，默认关）：核心 compact_session 调用
+        self.compact_decider = bool(raw.get("compact_decider_enabled", False))
+        try:
+            self.compact_decider_threshold = float(raw.get("compact_decider_threshold") or 0.6)
+        except (TypeError, ValueError):
+            self.compact_decider_threshold = 0.6
+        try:
+            self.compact_decider_batch = max(1, int(raw.get("compact_decider_batch") or 20))
+        except (TypeError, ValueError):
+            self.compact_decider_batch = 20
+        try:
+            self.compact_decider_min_keep_ratio = float(raw.get("compact_decider_min_keep_ratio") or 0.33)
+        except (TypeError, ValueError):
+            self.compact_decider_min_keep_ratio = 0.33
 
         # 凭证来源：API Key 字段，或自定义请求头里带的凭证（网关常用 x-api-key / token）
         _CRED_HEADS = {"authorization", "x-api-key", "api-key", "apikey", "token", "x-token"}
@@ -387,7 +403,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.7.0"
+    version = "0.7.1"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -431,6 +447,17 @@ class JevPlugin(ToolPlugin):
             {"key": "verify_threshold", "type": "number",
              "label": "Verify 通过阈值", "default": 0.5,
              "hint": "证据支撑度低于此值判定为假完成"},
+            {"key": "compact_decider_enabled", "type": "boolean",
+             "label": "Jev 压缩判定器", "default": False,
+             "hint": "压缩时用 Jev 批量判定旧工具记录去留（保留的原样、无损）；关 = 用原有 LLM 摘要"},
+            {"key": "compact_decider_threshold", "type": "number",
+             "label": "保留阈值", "default": 0.6,
+             "hint": "noul 低于此值的记录会被丢弃"},
+            {"key": "compact_decider_batch", "type": "number",
+             "label": "每批判定条数", "default": 20},
+            {"key": "compact_decider_min_keep_ratio", "type": "number",
+             "label": "最少保留比例", "default": 0.33,
+             "hint": "防止判太激进全丢（硬性下限，保最近的记录）"},
         ],
         "panels": [
             {"id": "judgements", "title": "判断"},
@@ -472,6 +499,14 @@ class JevPlugin(ToolPlugin):
             self._install_screen(kernel)
         if cfg.verify:
             self._install_verify(kernel)
+        # #1 Jev 压缩判定器：注册到 app 服务（核心 compact_session 查询）
+        # D0：功能关 → 注销，压缩走默认 LLM 摘要（零残留）
+        app = kernel.get_service("app") if kernel.has_service("app") else None
+        if app is not None:
+            if cfg.compact_decider:
+                app.compaction_decider = self._make_compaction_decider()
+            else:
+                app.compaction_decider = None
 
         self.status = "running"
         self.status_reason = ""
@@ -967,6 +1002,91 @@ class JevPlugin(ToolPlugin):
                             f"（支撑度 {noul_v:.2f}）。请补充实际执行的证明（测试输出、文件 diff 等）后再结束。")
                         break
             return await next(data)
+
+    # -------------------------------------------------- #1 Jev 压缩判定器
+
+    @staticmethod
+    def _block_fingerprint(block: List[Any]) -> str:
+        """把一轮消息压成 <=200 字符的指纹（Jev 判定用）。"""
+        parts: List[str] = []
+        for m in block[:8]:
+            role = str(getattr(m, "role", ""))
+            content = str(getattr(m, "content", "") or "").replace("\n", " ").strip()
+            if role == "tool":
+                parts.append("tool: " + content[:80])
+            elif role == "assistant":
+                parts.append("asst: " + content[:60])
+            elif role == "user":
+                parts.append("user: " + content[:60])
+        fp = " | ".join(parts)
+        return fp[:200]
+
+    def _make_compaction_decider(self):
+        """返回核心 `app.compaction_decider` 调用的异步函数。
+
+        签名：async (head: List[Message], system: Optional[Message]) -> Optional[List[Message]]
+        返回保留后的消息列表；**任何退化都返回 None**（核心回退原有 LLM 摘要）。
+        """
+        async def _decider(head, system):
+            kernel = getattr(self, "_kernel", None)
+            if kernel is None:
+                return None
+            cfg = read_config(kernel)
+            if not cfg.ready or not cfg.compact_decider:
+                return None                              # D0 / D1
+            body = [m for m in head if str(getattr(m, "role", "")) != "system"]
+            has_tool = any(str(getattr(m, "role", "")) == "tool" for m in head)
+            if not has_tool:
+                return None                              # D5 纯对话 → LLM 摘要
+            from litework.core.context_manager import ContextManager
+            try:
+                ranges = ContextManager._turn_ranges(body)
+            except Exception:                            # noqa: BLE001
+                return None                              # D2 解析失败
+            if len(ranges) < 2:
+                return None
+            blocks = [body[r[0]:r[1]] for r in ranges]
+            fps = [self._block_fingerprint(b) for b in blocks]
+            kept: set = set(range(len(blocks)))
+            batch = cfg.compact_decider_batch
+            for start in range(0, len(fps), batch):
+                chunk = fps[start:start + batch]
+                questions: Dict[str, Any] = {}
+                for i in range(len(chunk)):
+                    questions[f"keep_{i}"] = {
+                        "type": "noul",
+                        "instructions": f"记录 {i} 对后续任务是否仍有保留价值？（工具执行记录 / 中间结论 / 已过期步骤）",
+                    }
+                payload = {"state": "\n".join(f"{i}: {fp}" for i, fp in enumerate(chunk)),
+                           "model": cfg.model, "questions": questions}
+                try:
+                    resp = await asyncio.to_thread(post_systemone, cfg, payload)
+                    answers = resp.get("answers") or {}
+                except Exception:                        # noqa: BLE001
+                    return None                          # D2 调用失败 → 回退
+                for i in range(len(chunk)):
+                    a = answers.get(f"keep_{i}") or {}
+                    try:
+                        noul_v = float(a.get("noul") or 0.5)
+                    except (TypeError, ValueError):
+                        noul_v = 0.5                     # D7 异常值按中性
+                    if noul_v < cfg.compact_decider_threshold:
+                        kept.discard(start + i)
+            # D4 硬性下限：至少保留 min_keep_ratio（默认 1/3，取最近）
+            min_keep = max(1, int(len(blocks) * cfg.compact_decider_min_keep_ratio))
+            if len(kept) < min_keep:
+                kept = set(range(len(blocks) - min_keep, len(blocks)))
+            # D3 一条没丢 → 无意义
+            if len(kept) == len(blocks):
+                return None
+            # D8 释放不足 20% → 压了没省
+            if (len(blocks) - len(kept)) / len(blocks) < 0.2:
+                return None
+            kept_msgs: List[Any] = []
+            for i in sorted(kept):
+                kept_msgs.extend(blocks[i])
+            return kept_msgs
+        return _decider
 
     # -------------------------------------------------- 右栏「判断」面板
 
