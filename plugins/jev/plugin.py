@@ -44,6 +44,7 @@ auto_gate_enabled       false                自动门禁（每轮成本），�
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -351,7 +352,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.6.1"
+    version = "0.6.2"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -529,7 +530,7 @@ class JevPlugin(ToolPlugin):
                    "questions": _build_questions(kind, instructions, criteria)}
         started = time.time()
         try:
-            data = post_systemone(cfg, payload)
+            data = await asyncio.to_thread(post_systemone, cfg, payload)
         except Exception as exc:  # noqa: BLE001 - 一律降级为可读错误
             STATS["errors"] += 1
             logger.warning("[jev] 调用失败：%s", exc)
@@ -626,7 +627,7 @@ class JevPlugin(ToolPlugin):
                    "questions": _build_questions(kind, parsed["instructions"],
                                                  parsed["criteria"])}
         started = time.time()
-        data = post_systemone(cfg, payload)
+        data = await asyncio.to_thread(post_systemone, cfg, payload)
         latency_ms = int((time.time() - started) * 1000)
         answers = data.get("answers") or {}
         ans = answers.get("q1") if isinstance(answers, dict) else None
@@ -803,7 +804,7 @@ class JevPlugin(ToolPlugin):
                 "trees": trees, "total": len(_RECENT)}
         return json.dumps(data, ensure_ascii=False)
 
-    def judge(self, cfg: JevConfig, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def judge(self, cfg: JevConfig, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """对一次工具调用做判断（可被测试 monkeypatch）。"""
         state = _summarize_action(tool, args)
         payload = {
@@ -817,7 +818,7 @@ class JevPlugin(ToolPlugin):
                  "拦截": "不可逆或触及生产数据，风险高"},
             ),
         }
-        data = post_systemone(cfg, payload)
+        data = await asyncio.to_thread(post_systemone, cfg, payload)
         ans = (data.get("answers") or {}).get("q1") or {}
         raw_probs = ans.get("probabilities") or {}
         probs = ({str(k): round(float(v), 4) for k, v in raw_probs.items()}

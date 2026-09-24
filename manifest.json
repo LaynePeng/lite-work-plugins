@@ -1,5 +1,5 @@
 {
-  "version": "1.0.25",
+  "version": "1.0.26",
   "min_app_version": "0.5.0",
   "plugins": [
     {
@@ -79,7 +79,7 @@
     },
     {
       "name": "jev",
-      "version": "0.6.1",
+      "version": "0.6.2",
       "description": "Jev 判定层（TypeSafe System One）：结构化判断工具 jev_score / jev_choice，外加工具执行前的单向风险升级器（只升级、不放行，fail-closed）。配置缺失 = 未启动（不注册工具、不挂钩子、零网络）；需在 config.json 顶层 jev 填 api_key（或用环境变量 TYPESAFE_API_KEY），自动门禁默认关闭。详见 plugin.py 文件头配置表。；设置页可直接配置 Base URL 与自定义请求头（需 lite-work ≥ 1.10.0）；右栏「判断」面板展示最近判断记录",
       "path": "plugins/jev",
       "tools": [
