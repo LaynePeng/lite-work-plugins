@@ -270,17 +270,45 @@ def read_config(kernel: Kernel) -> JevConfig:
 # ---------------------------------------------------------------- HTTP（可 mock）
 
 def post_systemone(cfg: JevConfig, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """单次调用 System One。独立函数，便于测试 monkeypatch 与调用计数。"""
+    """调用 System One，**对瞬时错误重试**（最多 3 次：1 次 + 2 次重试）。
+
+    实测：opencode 网关偶发 TLS 断开（UNEXPECTED_EOF，走代理时尤其明显）。
+    瞬时错误（连接/读/超时/429/5xx）重试可吸收抖动；判定失败仍是 fail-closed。
+    独立函数，便于测试 monkeypatch 与调用计数。
+    """
     STATS["judgements"] += 1
-    with httpx.Client(timeout=cfg.timeout_s) as client:
-        headers = dict(cfg.headers)      # 自定义头优先（网关常用 x-api-key）
-        if cfg.api_key:
-            headers.setdefault("Authorization", f"Bearer {cfg.api_key}")
-        if not headers:
-            raise RuntimeError("未配置任何凭证（api_key 或自定义请求头）")
-        resp = client.post(cfg.base_url, json=payload, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+    headers = dict(cfg.headers)          # 自定义头优先（网关常用 x-api-key）
+    if cfg.api_key:
+        headers.setdefault("Authorization", f"Bearer {cfg.api_key}")
+    if not headers:
+        raise RuntimeError("未配置任何凭证（api_key 或自定义请求头）")
+
+    transient = (
+        httpx.ConnectError, httpx.ConnectTimeout,
+        httpx.ReadError, httpx.ReadTimeout,
+    )
+    last_exc: Optional[BaseException] = None
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=cfg.timeout_s) as client:
+                resp = client.post(cfg.base_url, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except transient as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))     # 0.4s / 0.8s 退避
+                continue
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code in (429, 500, 502, 503, 529):
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+            raise
+    STATS["errors"] += 1
+    assert last_exc is not None
+    raise last_exc
 
 
 def _build_questions(kind: str, instructions: str, criteria: Any) -> Dict[str, Any]:
@@ -352,7 +380,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.6.4"
+    version = "0.6.5"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
