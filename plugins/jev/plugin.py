@@ -583,6 +583,10 @@ class JevPlugin(ToolPlugin):
             "confidence": float(ans.get("confidence") or 0.0),
             "choice": str(ans.get("choice") or ""),
             "score": ans.get("score"),
+            "noul": ans.get("noul"),
+            "probabilities": ans.get("probabilities") if isinstance(ans.get("probabilities"), dict) else {},
+            "question": instructions,
+            "context": f"Agent 调用 jev_{kind}",
             "point": "tool",
             "at": time.time(),
         })
@@ -678,6 +682,10 @@ class JevPlugin(ToolPlugin):
             return ""                              # 未达直答阈值 → 交回主模型
         record_judgement({"kind": kind, "confidence": conf,
                           "choice": str(ans.get("choice") or ""), "score": ans.get("score"),
+                          "noul": ans.get("noul"),
+                          "probabilities": ans.get("probabilities") if isinstance(ans.get("probabilities"), dict) else {},
+                          "question": parsed["instructions"],
+                          "context": f"用户直问 /jev {parsed['kind']}",
                           "point": "direct", "at": time.time()})
         head = ""   # 标识由 render_card(direct=True) 输出
         if kind == "choice":
@@ -743,6 +751,9 @@ class JevPlugin(ToolPlugin):
                 "confidence": conf,
                 "choice": choice,
                 "tool": tool,
+                "probabilities": verdict.get("probabilities") if isinstance(verdict.get("probabilities"), dict) else {},
+                "question": f"该工具调用（{tool}）应当放行、需人确认，还是拦截？",
+                "context": f"工具执行前 {tool}",
                 "point": "gate",
                 "at": time.time(),
             })
@@ -798,41 +809,47 @@ class JevPlugin(ToolPlugin):
         for item in reversed(_RECENT[-8:]):
             conf = float(item.get("confidence") or 0.0)
             accepted = conf >= cfg.threshold
-            point = item.get("point", "")
-            tool = str(item.get("tool") or "")
+            point = str(item.get("point", ""))
+            kind = str(item.get("kind", ""))
             choice = str(item.get("choice") or "")
             score = item.get("score")
+            noul = item.get("noul")
+            probs = item.get("probabilities") or {}
+            probs = {str(k): float(v) for k, v in probs.items()} if isinstance(probs, dict) else {}
 
-            # 决策树的节点
-            trigger = ("工具执行前" if point == "gate"
-                       else "用户直问" if point == "direct" else "Agent 调用")
-            if tool:
-                trigger += f" {tool}"
+            title = {"gate": "门禁判定", "direct": "直答判定", "tool": "工具判定"}.get(point, "判定")
+            context = str(item.get("context") or "")
+            question = str(item.get("question") or "")
 
-            nodes = [
-                {"label": trigger, "type": "trigger"},
-                {"label": str(item.get("kind", "")), "type": "kind"},
-                {"label": f"{choice or score or '—'}", "type": "verdict"},
-                {"label": f"{conf:.2f}", "type": "confidence",
-                 "value": conf, "threshold": cfg.threshold,
-                 "bar": int(conf * 10)},
-                {"label": ("已采信" if accepted else "未采信"), "type": "accepted",
-                 "pass": accepted},
-            ]
+            # 决策树的选项分支：标签 / 概率 / 语义色 / 是否选中
+            opts: List[Dict[str, Any]] = []
+            if kind == "choice" and probs:
+                for k, v in sorted(probs.items(), key=lambda kv: -kv[1]):
+                    opts.append({"label": str(k), "prob": round(float(v), 4),
+                                 "tone": _prob_tone(str(k)), "chosen": (str(k) == choice)})
+            elif kind == "score" and probs:
+                try:
+                    chosen_idx = int(round(float(score or 0)))
+                except (TypeError, ValueError):
+                    chosen_idx = 0
+                for k, v in sorted(probs.items(), key=lambda kv: -float(kv[1])):
+                    idx = int(float(k))
+                    opts.append({"label": f"档位 {idx + 1}", "prob": round(float(v), 4),
+                                 "tone": "alt" if idx == chosen_idx else "",
+                                 "chosen": (idx == chosen_idx)})
+            elif kind == "noul" and noul is not None:
+                noul_v = float(noul)
+                opts = [{"label": "是", "prob": round(noul_v, 4), "tone": "ok", "chosen": noul_v >= 0.5},
+                        {"label": "否", "prob": round(1.0 - noul_v, 4), "tone": "",
+                         "chosen": noul_v < 0.5}]
+            if not opts:
+                opts = [{"label": choice or str(score or "—"), "prob": round(conf, 4),
+                         "tone": "alt", "chosen": True}]
 
-            if accepted:
-                if point == "gate" and choice == "拦截":
-                    nodes.append({"label": "拦截", "type": "action", "action": "block"})
-                elif point == "gate" and choice == "放行":
-                    nodes.append({"label": "放行", "type": "action", "action": "allow"})
-                elif point == "direct":
-                    nodes.append({"label": "直接回答", "type": "action", "action": "answer"})
-                else:
-                    nodes.append({"label": "结果生效", "type": "action", "action": "apply"})
-            else:
-                nodes.append({"label": "交回基础规则", "type": "action", "action": "fallback"});
-
-            trees.append({"nodes": nodes})
+            trees.append({"title": title, "context": context, "question": question,
+                          "kind": kind, "options": opts,
+                          "confidence": round(conf, 4), "threshold": cfg.threshold,
+                          "accepted": accepted})
 
         data = {"type": "lite-tree", "status": status,
                 "trees": trees, "total": len(_RECENT)}
@@ -911,6 +928,17 @@ def _parse_direct_command(text: str) -> Optional[Dict[str, Any]]:
                 "instructions": "在这些选项中选最合适的一个",
                 "criteria": {o: o for o in options}}
     return None
+
+
+def _prob_tone(key: str) -> str:
+    """选项语义 → 语义色（danger/ok/warn/空=中性）。"""
+    if any(x in key for x in ("拦截", "否", "高", "危险")):
+        return "danger"
+    if any(x in key for x in ("放行", "是", "低", "安全")):
+        return "ok"
+    if any(x in key for x in ("确认", "中")):
+        return "warn"
+    return ""
 
 
 def _approx_tokens(text: str) -> int:
