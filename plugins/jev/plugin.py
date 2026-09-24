@@ -44,6 +44,7 @@ auto_gate_enabled       false                自动门禁（每轮成本），�
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -62,7 +63,7 @@ DEFAULT_BASE_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-1.13"            # 网关实际可用名（官方别名 jev-latest 会移动，不建议）
 DEFAULT_THRESHOLD = 0.60
 DEFAULT_SIZE_GATE_TOKENS = 8192
-DEFAULT_TIMEOUT_MS = 800
+DEFAULT_TIMEOUT_MS = 3000        # 真机实测单次约 1.3s（800ms 会频繁超时）
 
 #: 只对"有副作用"的工具做门禁评估；其余工具直接让行（零成本、零延迟）
 GATED_TOOLS = frozenset({
@@ -95,7 +96,8 @@ class JevConfig:
 
     __slots__ = ("api_key", "model", "base_url", "headers", "threshold",
                  "size_gate_tokens", "timeout_ms", "tools_enabled",
-                 "auto_gate_enabled", "reason")
+                 "auto_gate_enabled", "has_header_credential",
+                 "direct_answer", "direct_answer_confidence", "reason")
 
     def __init__(self, raw: Dict[str, Any], env_key: str = "") -> None:
         self.api_key = str(raw.get("api_key") or env_key or "").strip()
@@ -107,16 +109,31 @@ class JevConfig:
         self.timeout_ms = int(raw.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
         # 自定义请求头（网关 / 代理常用）：键值都强制为字符串
         raw_headers = raw.get("headers")
+        if isinstance(raw_headers, str):        # 容错：被存成了 JSON 字符串
+            try:
+                raw_headers = json.loads(raw_headers)
+            except Exception:  # noqa: BLE001
+                raw_headers = None
         self.headers = ({str(k): str(v) for k, v in raw_headers.items()}
                         if isinstance(raw_headers, dict) else {})
+        # 用户直问短路（opt-in，默认关）：命中 /jev 语法时由 Jev 直接作答、跳过 LLM
+        self.direct_answer = bool(raw.get("direct_answer_enabled", False))
+        self.direct_answer_confidence = float(
+            raw.get("direct_answer_confidence") or 0.85)
         # 启动门通过之后才受这两个开关控制（成本模型不同，见文档 §12.7）
         self.tools_enabled = bool(raw.get("tools_enabled", True))
         self.auto_gate_enabled = bool(raw.get("auto_gate_enabled", False))
 
-        if not self.api_key:
-            self.reason = "缺少 API Key（设置 → System One，或环境变量 TYPESAFE_API_KEY）"
+        # 凭证来源：API Key 字段，或自定义请求头里带的凭证（网关常用 x-api-key / token）
+        _CRED_HEADS = {"authorization", "x-api-key", "api-key", "apikey", "token", "x-token"}
+        self.has_header_credential = any(
+            str(k).strip().lower() in _CRED_HEADS and str(v).strip()
+            for k, v in self.headers.items()
+        )
+        if not self.api_key and not self.has_header_credential:
+            self.reason = ("缺少凭证（在「API Key」填 key，或在「自定义请求头」里带 x-api-key / token 等）")
         elif not self.model:
-            self.reason = "模型未设置（设置 → System One → 模型版本）"
+            self.reason = "模型未设置（填固定版本，如 jev-1.13）"
         else:
             self.reason = ""
 
@@ -129,19 +146,123 @@ class JevConfig:
         return max(0.05, self.timeout_ms / 1000.0)
 
 
-def read_config(kernel: Kernel) -> JevConfig:
-    """从 app 服务读 `config.jev`；无 app 服务时退化为只看环境变量。
+#: 磁盘 jev 段缓存（path+mtime → 内容），避免每次 hook 都读盘
+_DISK_CACHE: Dict[str, Any] = {"path": "", "mtime": 0.0, "data": {}}
 
-    密钥优先级：`config.jev.api_key` > 环境变量 `TYPESAFE_API_KEY`。
+
+_PRIVATE_NAME = "config.local.json"
+def _private_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), _PRIVATE_NAME)
+
+
+def _read_private() -> Dict[str, Any]:
+    """读插件私有配置（首配置成功后镜像下来的凭证快照）。"""
+    try:
+        with open(_private_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_private(data: Dict[str, Any]) -> None:
+    """写插件私有配置（0600；原子替换）。"""
+    path = _private_path()
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        logger.debug("[jev] 写私有配置失败", exc_info=True)
+
+
+_CRED_KEYS = ("api_key", "base_url", "headers", "model", "direct_answer_enabled")
+
+
+def _self_heal(app: Any, raw: Dict[str, Any]) -> None:
+    """把有效凭证镜像到私有文件；若主 config 被抹过，顺手修回来。"""
+    if app is None or not getattr(app, "config_dir", None):
+        return          # 没有 config_dir = 非真 app（测试替身）→ 不镜像，避免污染
+    snapshot = {k: raw[k] for k in _CRED_KEYS if raw.get(k)}
+    if not snapshot:
+        return
+    priv = _read_private()
+    if any(priv.get(k) != snapshot[k] for k in snapshot):
+        _write_private({**priv, **snapshot})
+    # 主 config 缺 api_key 而我们有 → 修回（让设置页也正常）
+    # 自限：修回成功后 cur 就有 api_key，下次不再进入，不会形成写盘循环
+    if app is None or not snapshot.get("api_key"):
+        return
+    try:
+        cur = dict(getattr(app, "config", {}).get(PLUGIN_NAME) or {})
+        if not cur.get("api_key"):
+            app.save_config({PLUGIN_NAME: {**cur, **snapshot}})
+            logger.info("[jev] 已用私有快照修复被抹掉的配置")
+    except Exception:  # noqa: BLE001
+        logger.debug("[jev] 自愈写回失败", exc_info=True)
+
+
+def _read_disk_jev(config_dir: str) -> Dict[str, Any]:
+    """读 `<config_dir>/config.json` 里的 `jev` 段（按 mtime 缓存）。"""
+    path = os.path.join(config_dir, "config.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _DISK_CACHE["path"] == path and _DISK_CACHE["mtime"] == mtime:
+        return _DISK_CACHE["data"]
+    data: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict) and isinstance(cfg.get(PLUGIN_NAME), dict):
+            data = dict(cfg[PLUGIN_NAME])
+    except Exception:  # noqa: BLE001 - 读不到就当没有
+        data = {}
+    _DISK_CACHE.update({"path": path, "mtime": mtime, "data": data})
+    return data
+
+
+def read_config(kernel: Kernel) -> JevConfig:
+    """读配置：内存 `app.config["jev"]` 为主，**磁盘 config.json 兜底**，环境变量再兜底。
+
+    为什么要有磁盘/环境兜底：app 的配置只在启动时读一次，内存是一份可能过期的快照；
+    实测事故：用户配好的凭证被其他保存动作从内存抹掉后，插件一直报「缺少凭证」。
+    这里对**内存缺失的键**用磁盘补齐（内存有值仍以内存为准），环境变量则永远有效。
     """
     raw: Dict[str, Any] = {}
+    app = None
     if kernel.has_service("app"):
         try:
             app = kernel.get_service("app")
-            raw = (app.config.get("jev") or {}) if getattr(app, "config", None) else {}
-        except Exception:  # noqa: BLE001 - 配置读取失败不应影响内核
+            cfg = getattr(app, "config", None)
+            if isinstance(cfg, dict):
+                raw = dict(cfg.get(PLUGIN_NAME) or {})
+        except Exception:  # noqa: BLE001
             logger.debug("[jev] 读取 app.config 失败", exc_info=True)
             raw = {}
+    if app is not None:
+        cfg_dir = getattr(app, "config_dir", None)
+        if cfg_dir:
+            for k, v in _read_disk_jev(str(cfg_dir)).items():
+                if k not in raw or raw.get(k) in (None, "", {}, []):
+                    raw[k] = v
+    # 环境变量兜底：配置被抹也不受影响
+    if os.environ.get("JEV_BASE_URL") and not raw.get("base_url"):
+        raw["base_url"] = os.environ["JEV_BASE_URL"]
+    if os.environ.get("JEV_MODEL") and not raw.get("model"):
+        raw["model"] = os.environ["JEV_MODEL"]
+    if os.environ.get("JEV_HEADERS") and not raw.get("headers"):
+        raw["headers"] = os.environ["JEV_HEADERS"]
+    # 私有文件兜底（首配置成功后的镜像）：比内存/主 config 都更能扛"被抹"
+    priv = _read_private()
+    for k, v in priv.items():
+        if k not in raw or raw.get(k) in (None, "", {}, []):
+            raw[k] = v
+    # 自愈：镜像当前有效凭证 + 必要时修回主 config
+    _self_heal(app, raw)
     return JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
 
 
@@ -151,8 +272,11 @@ def post_systemone(cfg: JevConfig, payload: Dict[str, Any]) -> Dict[str, Any]:
     """单次调用 System One。独立函数，便于测试 monkeypatch 与调用计数。"""
     STATS["judgements"] += 1
     with httpx.Client(timeout=cfg.timeout_s) as client:
-        headers = {"Authorization": f"Bearer {cfg.api_key}"}
-        headers.update(cfg.headers)      # 自定义头可覆盖默认 Authorization
+        headers = dict(cfg.headers)      # 自定义头优先（网关常用 x-api-key）
+        if cfg.api_key:
+            headers.setdefault("Authorization", f"Bearer {cfg.api_key}")
+        if not headers:
+            raise RuntimeError("未配置任何凭证（api_key 或自定义请求头）")
         resp = client.post(cfg.base_url, json=payload, headers=headers)
         resp.raise_for_status()
         return resp.json()
@@ -175,24 +299,34 @@ def _build_questions(kind: str, instructions: str, criteria: Any) -> Dict[str, A
 
 def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
                 threshold: float, score: Optional[int] = None, legend: str = "",
+                scale_total: Optional[int] = None,
                 probabilities: Optional[Dict[str, float]] = None, questions: Optional[List[str]] = None,
-                evidence: str = "", accepted: Optional[bool] = None) -> str:
-    """Markdown 降级版判断卡（零核心改动即可用；设计文档 §7.6）。
+                evidence: str = "", accepted: Optional[bool] = None,
+                direct: bool = False, note: str = "") -> str:
+    """Markdown 判断卡（纯文本）。
 
-    只使用纯文本 + 表格 + emoji + 字符条：lite-work 的 Markdown 渲染器未开
-    rehype-raw，内联 HTML 与样式不生效，因此**不要**输出颜色块或内联样式。
+    为什么不用富组件：实测富卡片在会话流里的观感**不如纯 Markdown 列表**（用户结论），
+    故回滚。只使用纯文本 + 列表 + 行内 code + ASCII 条形图——ChatView 的 Markdown
+    渲染未开 rehype-raw，内联 HTML / 样式一律无效。
     """
     if accepted is None:
         accepted = confidence >= threshold
-    mark = {"allow": "🟢 放行", "confirm": "🟡 需确认", "block": "🔴 拦截"}.get(verdict, verdict)
+    mark = {"allow": "放行", "confirm": "需确认", "block": "拦截"}.get(verdict, verdict)
+    head = "**Jev 直答（未使用 LLM）**\n\n" if direct else ""
     lines = [
-        f"🧠 **Jev 判断** · {model} · {latency_ms}ms",
+        f"{head}**Jev 判断** · {model} · {latency_ms}ms",
         "",
         f"- 结论：{mark}",
         f"- 置信：`{confidence:.2f}` / 阈值 `{threshold:.2f}` → "
         + ("**已采信**" if accepted else "**未采信**（交回基础规则）"),
     ]
-    if score is not None:
+    if score is not None and scale_total:
+        # 真机事实：score 是 criteria 的**档位下标**（0 基，可为小数），legend 是 {下标: 标签}
+        pos = max(0, min(int(scale_total) - 1, int(round(float(score)))))
+        bars = "█" * (pos + 1) + "░" * (int(scale_total) - pos - 1)
+        lines.append(f"- 档位：`{pos + 1}/{int(scale_total)}` {bars}"
+                     + (f"　**{legend}**" if legend else ""))
+    elif score is not None:
         filled = max(0, min(10, int(score)))
         lines.append(f"- 风险：`{filled}/10` {'█' * filled}{'░' * (10 - filled)}"
                      + (f"　{legend}" if legend else ""))
@@ -202,10 +336,12 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
             lines.append(f"  - {name}：`{p * 100:.0f}%` {'█' * int(round(p * 20))}")
     if questions:
         lines.append("- 问了什么：")
-        for i, q in enumerate(questions, 1):
-            lines.append(f"  {i}. {q}")
+        for n, q in enumerate(questions, 1):
+            lines.append(f"  {n}. {q}")
     if evidence:
         lines.append(f"- 依据：{evidence}")
+    if note:
+        lines.append(f"- 提示：{note}")
     lines.append("")
     lines.append("_判断结果可被用户覆盖；Jev 只做建议，不替代基础安全规则。_")
     return "\n".join(lines)
@@ -215,7 +351,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.2.2"
+    version = "0.6.1"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -224,10 +360,11 @@ class JevPlugin(ToolPlugin):
             {"key": "base_url", "type": "str", "label": "Base URL",
              "default": DEFAULT_BASE_URL,
              "hint": "System One 兼容端点；可指向自建网关 / 代理"},
-            {"key": "headers", "type": "map", "label": "自定义请求头",
-             "hint": 'JSON 对象，例如 {"x-api-key":"...","X-Api-Version":"1"}；与默认 Authorization 合并（同名覆盖）'},
+            {"key": "headers", "type": "map", "label": "自定义 Header（每行一个，可留空）",
+             "hint": "格式 Key: Value 或 Key=Value（按第一个分隔符切分，值可含冒号）；"
+                     "# 开头忽略；可覆盖默认 Authorization；这里带凭证也算已配置"},
             {"key": "api_key", "type": "secret", "label": "API Key",
-             "hint": "默认用于 Authorization: Bearer；若网关要求别的头，请把 key 放进自定义请求头"},
+             "hint": "默认用于 Authorization: Bearer；也可留空、改把 key 放进自定义请求头"},
             {"key": "model", "type": "str", "label": "模型版本", "default": DEFAULT_MODEL,
              "hint": "建议固定版本 ID，别名会移动"},
             {"key": "confidence_threshold", "type": "number", "label": "置信度阈值",
@@ -240,9 +377,20 @@ class JevPlugin(ToolPlugin):
              "default": True},
             {"key": "auto_gate_enabled", "type": "boolean", "label": "自动门禁（每轮成本）",
              "default": False},
+            {"key": "direct_answer_enabled", "type": "boolean",
+             "label": "用户直问短路（跳过 LLM）", "default": False,
+             "hint": "开启后：消息以 /jev 是否|打分|选 开头时，由 Jev 直接作答、不调用主模型"},
+            {"key": "direct_answer_confidence", "type": "number",
+             "label": "直答置信阈值", "default": 0.85,
+             "hint": "低于此值不直答，改为正常交给主模型（避免误抢答）"},
         ],
         "panels": [
-            {"id": "judgements", "title": "判断", "icon": "🧠"},
+            {"id": "judgements", "title": "判断"},
+        ],
+        "commands": [
+            {"name": "jev",
+             "description": "Jev 直答：跳过主模型，由 System One 直接判断",
+             "argsHint": "是否 <陈述> · 打分 <内容> · 选 A|B|C | <内容>"},
         ],
     }
 
@@ -268,6 +416,8 @@ class JevPlugin(ToolPlugin):
             super().install(kernel)          # 注册 jev_score / jev_choice
         if cfg.auto_gate_enabled:
             self._install_gate(kernel)
+        if cfg.direct_answer:
+            self._install_direct_answer(kernel)
 
         self.status = "running"
         self.status_reason = ""
@@ -288,8 +438,9 @@ class JevPlugin(ToolPlugin):
             ToolDefinition(
                 name="jev_score",
                 description=(
-                    "用 Jev（System One 判定模型）对一段内容按有序量表打分，返回分数与校准置信度。"
-                    "适合：风险分级、质量评估、严重度判定。不返回自然语言解释。"
+                    "用 Jev（System One 判定模型）把一段内容归入给定的**有序档位**，"
+                    "返回选中的档位（含标签）与校准置信度。适合：风险分级、质量评估、严重度判定。"
+                    "不返回自然语言解释。"
                 ),
                 parameters={
                     "type": "object",
@@ -298,7 +449,7 @@ class JevPlugin(ToolPlugin):
                         "instructions": {"type": "string", "description": "判断指令，例如「这段改动有多危险」"},
                         "criteria": {
                             "type": "array", "items": {"type": "string"},
-                            "description": "量表各级含义，从低到高（2–10 级）",
+                            "description": "有序档位标签，从低到高（越靠后档位越高）；Jev 返回档位下标",
                         },
                     },
                     "required": ["state", "instructions"],
@@ -416,18 +567,123 @@ class JevPlugin(ToolPlugin):
                                verdict=verdict, confidence=conf, threshold=cfg.threshold,
                                probabilities=probs, questions=[instructions],
                                evidence=f"state 摘要 {len(instructions)} 字")
-        score = ans.get("score")
+        raw_score = ans.get("score")
         conf = float(ans.get("confidence") or 0.0)
+        legend_map = ans.get("legend") if isinstance(ans.get("legend"), dict) else {}
+        total = len(legend_map) or None
+        pos = None
+        if raw_score is not None:
+            try:
+                pos = int(round(float(raw_score)))
+            except (TypeError, ValueError):
+                pos = None
+        label = ""
+        if legend_map and pos is not None:
+            label = str(legend_map.get(str(pos), legend_map.get(pos, "")))
         return render_card(model=str(data.get("model") or cfg.model), latency_ms=latency_ms,
                            verdict="confirm", confidence=conf, threshold=cfg.threshold,
-                           score=int(score) if score is not None else None,
-                           legend=str(ans.get("legend") or ""), questions=[instructions],
+                           score=pos, legend=label, scale_total=total,
+                           questions=[instructions],
                            evidence=f"state 摘要 {len(instructions)} 字")
+
+    # -------------------------------------------------- 用户直问短路（跳过 LLM）
+
+    def _install_direct_answer(self, kernel: Kernel) -> None:
+        """挂 LLM 调用前钩子：命中 /jev 语法且置信达标 → 直接作答、跳过主模型。
+
+        与内核约定：答案放进 `ctx.metadata["final_answer"]`（AgentLoop 取用后即收尾）。
+        异常/低置信一律**让行**（正常交给 LLM），绝不阻断、绝不臆造答案。
+        """
+        @kernel.before_llm.use
+        async def _jev_direct(ctx, data, next):
+            cfg = read_config(kernel)
+            if not cfg.ready or not cfg.direct_answer:
+                return await next(data)
+            if ctx.metadata.get("final_answer"):
+                return await next(data)          # 已被别的插件抢占
+            turns = data if isinstance(data, list) else None
+            if not turns:
+                return await next(data)
+            if str(getattr(turns[-1], "role", "")) != "user":
+                return await next(data)          # 只在"最后一条是用户消息"时尝试
+            parsed = _parse_direct_command(str(getattr(turns[-1], "content", "") or ""))
+            if not parsed:
+                return await next(data)
+            try:
+                answer = await self._answer_direct(cfg, parsed)
+            except Exception:  # noqa: BLE001 - fail-closed：照常走 LLM
+                STATS["errors"] += 1
+                logger.warning("[jev] 直答失败，交回 LLM", exc_info=True)
+                return await next(data)
+            if answer:
+                ctx.metadata["final_answer"] = {"content": answer, "source": "jev"}
+            return await next(data)
+
+    async def _answer_direct(self, cfg: JevConfig, parsed: Dict[str, Any]) -> str:
+        """用 Jev 直接回答一条显式命令（Markdown）；低置信返回空串 → 交回 LLM。"""
+        kind = parsed["kind"]
+        payload = {"state": parsed["state"], "model": cfg.model,
+                   "questions": _build_questions(kind, parsed["instructions"],
+                                                 parsed["criteria"])}
+        started = time.time()
+        data = post_systemone(cfg, payload)
+        latency_ms = int((time.time() - started) * 1000)
+        answers = data.get("answers") or {}
+        ans = answers.get("q1") if isinstance(answers, dict) else None
+        if not isinstance(ans, dict):
+            return ""
+        # noul 类型没有 confidence 字段（真机实测确认）——用 noul 值本身作为置信度
+        # choice/score 有 confidence 字段，直接用
+        if kind == "noul":
+            conf = float(ans.get("noul") or 0.0)
+        else:
+            conf = float(ans.get("confidence") or 0.0)
+        if conf < cfg.direct_answer_confidence:
+            STATS["skipped_untrusted"] += 1
+            return ""                              # 未达直答阈值 → 交回主模型
+        record_judgement({"kind": kind, "confidence": conf,
+                          "choice": str(ans.get("choice") or ""), "score": ans.get("score"),
+                          "point": "direct", "at": time.time()})
+        head = ""   # 标识由 render_card(direct=True) 输出
+        if kind == "choice":
+            raw_probs = ans.get("probabilities") or {}
+            probs = {str(k): float(v) for k, v in raw_probs.items()} \
+                if isinstance(raw_probs, dict) else {}
+            return head + render_card(
+                model=str(data.get("model") or cfg.model), latency_ms=latency_ms,
+                verdict=str(ans.get("choice") or ""), confidence=conf,
+                threshold=cfg.direct_answer_confidence, probabilities=probs,
+                questions=[parsed["instructions"]], evidence="来自消息内 /jev 命令",
+                direct=True)
+        legend_map = ans.get("legend") if isinstance(ans.get("legend"), dict) else {}
+        total = len(legend_map) or None
+        pos = None
+        if ans.get("score") is not None:
+            try:
+                pos = int(round(float(ans["score"])))
+            except (TypeError, ValueError):
+                pos = None
+        label = ""
+        if legend_map and pos is not None:
+            label = str(legend_map.get(str(pos), legend_map.get(pos, "")))
+        return head + render_card(
+            model=str(data.get("model") or cfg.model), latency_ms=latency_ms,
+            verdict="noul" if kind == "noul" else "score", confidence=conf,
+            threshold=cfg.direct_answer_confidence,
+            score=pos, legend=label, scale_total=total,
+            questions=[parsed["instructions"]], evidence="来自消息内 /jev 命令",
+            direct=True)
 
     # -------------------------------------------------- 门禁（单向升级器）
     def _install_gate(self, kernel: Kernel) -> None:
         @kernel.before_tool.use
         async def _jev_gate(ctx, data, next):
+            """门禁：**不拦截**，只附加风险意见到 data["jev_risk"]。
+
+            拦截权始终在 SecurityPlugin / 用户手里。Jev 的角色是"安全顾问"——
+            在审批卡弹出之前，多给用户一条 AI 风险判断，辅助决策。
+            唯一例外：Jev 判定「拦截」且置信度极高（≥ 0.95）时才 cancel（防灾难性操作）。
+            """
             cfg = read_config(kernel)
             if not cfg.ready or not cfg.auto_gate_enabled:
                 return await next(data)
@@ -443,71 +699,109 @@ class JevPlugin(ToolPlugin):
                 return await next(data)
 
             conf = float(verdict.get("confidence") or 0.0)
+            choice = str(verdict.get("choice") or "")
             if conf < cfg.threshold:
                 STATS["skipped_untrusted"] += 1     # 未采信：不参与决策
                 return await next(data)
             record_judgement({
                 "kind": "gate",
                 "confidence": conf,
-                "choice": "拦截" if str(verdict.get("choice")) == "block" else str(verdict.get("choice")),
+                "choice": choice,
                 "tool": tool,
                 "point": "gate",
                 "at": time.time(),
             })
-            if str(verdict.get("choice")) == "block":
+            # 附加**结构化**风险意见：SecurityPlugin 会把它带进审批事件，
+            # 前端在审批卡上渲染成"AI 风险意见"面板（只给建议，不代替用户决策）
+            risk_label = {"allow": "低风险", "confirm": "中风险", "block": "高风险"}.get(choice, choice)
+            data["judge_opinion"] = {
+                "source": "Jev",
+                "level": risk_label,
+                "choice": choice,
+                "confidence": round(conf, 2),
+                "threshold": cfg.threshold,
+                "why": str(verdict.get("why") or ""),
+                "probabilities": verdict.get("probabilities") or {},
+                "model": cfg.model,
+            }
+            # 唯一拦截条件：极高置信的「拦截」判定（≥ 0.95）
+            if choice == "block" and conf >= 0.95:
                 STATS["blocked"] += 1
                 data["cancel"] = True
                 data["reason"] = (
-                    f"[Jev] 判定该操作风险高（置信 {conf:.2f}）：{verdict.get('why') or '不可逆或触及生产数据'}。"
-                    "此调用不会执行。若认为误判，请让用户确认后再执行（或调整 Jev 阈值）。"
+                    f"[Jev] 判定该操作风险极高（置信 {conf:.2f}）："
+                    f"{verdict.get('why') or '不可逆或触及生产数据'}。"
+                    "此调用已被 AI 安全判定阻断。"
                 )
-            # 其余结论一律让行：本插件从**不**放行、也从不把 cancel 置回 False
+            # 其余结论一律让行：审批卡照常弹出，用户最终决定
             return await next(data)
 
     # -------------------------------------------------- 右栏「判断」面板
 
     def panel_content(self, panel_id: str, config: Dict[str, Any]) -> str:
-        """右栏「判断」面板的 Markdown（纯读、不联网）。"""
+        """右栏「判断」面板：返回 JSON（前端渲染成 SVG 决策树）。"""
         if panel_id != "judgements":
             return ""
         raw = dict((config or {}).get(PLUGIN_NAME) or {}) if isinstance(config, dict) else {}
         cfg = JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
-        out = ["### 🧠 Jev 判断", ""]
+
+        status: Dict[str, Any] = {}
         if cfg.ready:
-            out.append(f"**● 运行中** · 模型 `{cfg.model}` · 阈值 `{cfg.threshold:.2f}` · "
-                       f"自动门禁 {'开' if cfg.auto_gate_enabled else '关'}")
+            chips = []
+            if cfg.tools_enabled:
+                chips.append("工具")
+            if cfg.auto_gate_enabled:
+                chips.append("门禁")
+            if cfg.direct_answer:
+                chips.append("直答")
+            status = {"text": "运行中", "tone": "ok",
+                      "meta": [cfg.model, f"阈值 {cfg.threshold:.2f}"], "chips": chips}
         else:
-            out.append(f"**⏸ 未启动** —— {cfg.reason}")
-        out.append("")
-        out.append(f"端点：`{cfg.base_url}`")
-        if cfg.headers:
-            out.append(f"自定义请求头：`{', '.join(cfg.headers.keys())}`")
-        out.append("")
-        out.append("| 指标 | 值 |")
-        out.append("| --- | --- |")
-        out.append(f"| 判断次数 | {STATS['judgements']} |")
-        out.append(f"| 门禁拦截 | {STATS['blocked']} |")
-        out.append(f"| 未采信跳过 | {STATS['skipped_untrusted']} |")
-        out.append(f"| 调用失败 | {STATS['errors']} |")
-        out.append("")
-        if not _RECENT:
-            out.append("_暂无判断记录（本进程内）。判断发生后会显示在这里。_")
-            return "\n".join(out)
-        out.append(f"#### 最近 {len(_RECENT)} 次判断（新→旧）")
-        out.append("")
-        out.append("| 来源 | 结论 | 置信 | 阈值 | 采信 |")
-        out.append("| --- | --- | --- | --- | --- |")
-        for item in reversed(_RECENT[-15:]):
+            status = {"text": "未启动", "tone": "warn", "reason": cfg.reason}
+
+        trees = []
+        for item in reversed(_RECENT[-8:]):
             conf = float(item.get("confidence") or 0.0)
             accepted = conf >= cfg.threshold
-            verdict = str(item.get("choice") or item.get("score") or "-")
-            point = "门禁" if item.get("point") == "gate" else "工具"
-            tool = f" `{item.get('tool')}`" if item.get("tool") else ""
-            out.append(f"| {point}{tool} | {verdict} | `{conf:.2f}` | `{cfg.threshold:.2f}` | "
-                       f"{'✅' if accepted else '⚪ 未采信'} |")
-        out.append("")
-        out.append("_记录仅存于本进程内存，重启即清空；不写盘、不外发。_")
-        return "\n".join(out)
+            point = item.get("point", "")
+            tool = str(item.get("tool") or "")
+            choice = str(item.get("choice") or "")
+            score = item.get("score")
+
+            # 决策树的节点
+            trigger = ("工具执行前" if point == "gate"
+                       else "用户直问" if point == "direct" else "Agent 调用")
+            if tool:
+                trigger += f" {tool}"
+
+            nodes = [
+                {"label": trigger, "type": "trigger"},
+                {"label": str(item.get("kind", "")), "type": "kind"},
+                {"label": f"{choice or score or '—'}", "type": "verdict"},
+                {"label": f"{conf:.2f}", "type": "confidence",
+                 "value": conf, "threshold": cfg.threshold,
+                 "bar": int(conf * 10)},
+                {"label": ("已采信" if accepted else "未采信"), "type": "accepted",
+                 "pass": accepted},
+            ]
+
+            if accepted:
+                if point == "gate" and choice == "拦截":
+                    nodes.append({"label": "拦截", "type": "action", "action": "block"})
+                elif point == "gate" and choice == "放行":
+                    nodes.append({"label": "放行", "type": "action", "action": "allow"})
+                elif point == "direct":
+                    nodes.append({"label": "直接回答", "type": "action", "action": "answer"})
+                else:
+                    nodes.append({"label": "结果生效", "type": "action", "action": "apply"})
+            else:
+                nodes.append({"label": "交回基础规则", "type": "action", "action": "fallback"});
+
+            trees.append({"nodes": nodes})
+
+        data = {"type": "lite-tree", "status": status,
+                "trees": trees, "total": len(_RECENT)}
+        return json.dumps(data, ensure_ascii=False)
 
     def judge(self, cfg: JevConfig, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """对一次工具调用做判断（可被测试 monkeypatch）。"""
@@ -525,15 +819,63 @@ class JevPlugin(ToolPlugin):
         }
         data = post_systemone(cfg, payload)
         ans = (data.get("answers") or {}).get("q1") or {}
+        raw_probs = ans.get("probabilities") or {}
+        probs = ({str(k): round(float(v), 4) for k, v in raw_probs.items()}
+                 if isinstance(raw_probs, dict) else {})
         return {
             "choice": {"放行": "allow", "请人确认": "confirm", "拦截": "block"}.get(
                 str(ans.get("choice") or ""), "confirm"),
             "confidence": float(ans.get("confidence") or 0.0),
             "why": str(ans.get("why") or ""),
+            # 概率分布：供审批卡展示"拦截 88% / 放行 9% / 请人确认 3%"
+            "probabilities": probs,
         }
 
 
 # ---------------------------------------------------------------- 小工具
+
+def _parse_direct_command(text: str) -> Optional[Dict[str, Any]]:
+    """解析显式直答命令（不命中返回 None → 正常交给 LLM）。
+
+    /jev 是否 <判断语句>       → noul
+    /jev 打分 <内容>           → score（1–10）
+    /jev 选 A|B|C | <内容>     → choice
+    """
+    body = (text or "").strip()
+    if not body.startswith("/jev"):
+        return None
+    rest = body[4:].strip()
+    if not rest:
+        return None
+    if rest.startswith("是否"):
+        statement = rest[2:].strip()
+        if not statement:
+            return None
+        return {"kind": "noul", "state": statement,
+                "instructions": "该陈述是否成立？", "criteria": None}
+    if rest.startswith("打分"):
+        content = rest[2:].strip()
+        if not content:
+            return None
+        return {"kind": "score", "state": content,
+                "instructions": "按下面档位评估该内容的整体质量",
+                "criteria": ["很差", "较差", "一般", "较好", "很好"]}
+    if rest.startswith("选"):
+        rest2 = rest[1:].strip()
+        # 选项之间用 |，选项与内容之间用 " | "（空格竖线空格）分隔 ——
+        # 必须按【最后一个】" | " 切分，否则 "A|B|C | 内容" 会被切坏。
+        if " | " not in rest2:
+            return None
+        head_opts, _, tail = rest2.rpartition(" | ")
+        options = [o.strip() for o in head_opts.split("|") if o.strip()]
+        state = tail.strip()
+        if len(options) < 2 or not state:
+            return None
+        return {"kind": "choice", "state": state,
+                "instructions": "在这些选项中选最合适的一个",
+                "criteria": {o: o for o in options}}
+    return None
+
 
 def _approx_tokens(text: str) -> int:
     """粗估 token（不引 tokenizer，够用于 size-gate）。"""
