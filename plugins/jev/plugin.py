@@ -352,7 +352,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.6.3"
+    version = "0.6.4"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -637,7 +637,10 @@ class JevPlugin(ToolPlugin):
         #   noul=0.95 → 高置信"是"；noul=0.05 → 高置信"否"；noul≈0.5 → 抛硬币（低置信）。
         # 正确校准：置信 = |noul - 0.5| * 2（离抛硬币的距离）。
         if kind == "noul":
-            noul_val = float(ans.get("noul") or 0.0)
+            noul_raw = ans.get("noul")
+            if noul_raw is None:
+                return ""          # 缺 noul 字段 = 无效响应 → 让行（不能当 0.0 → 假高置信"否"）
+            noul_val = float(noul_raw)
             conf = abs(noul_val - 0.5) * 2.0
             ans["choice"] = "是" if noul_val >= 0.5 else "否"
         else:
