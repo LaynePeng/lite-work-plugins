@@ -75,6 +75,17 @@ GATED_TOOLS = frozenset({
     "apply_unified_diff",
 })
 
+#: 「声称完成」话术（Verify 的 before_llm 路径与 Stop 钩子共用）
+DONE_MARKERS = ("完成了", "已完成", "测试通过", "全部通过", "已修复",
+                "done", "all tests pass", "fixed")
+
+
+def claims_done(text: str) -> bool:
+    """这段文本是否在声称"已经完成"（大小写不敏感）。"""
+    lowered = (text or "").lower()
+    return any(h in lowered for h in DONE_MARKERS)
+
+
 #: 观测计数（测试与 UI 都会读）
 STATS: Dict[str, int] = {"judgements": 0, "errors": 0, "blocked": 0, "skipped_untrusted": 0}
 
@@ -100,6 +111,7 @@ class JevConfig:
                  "auto_gate_enabled", "has_header_credential",
                  "direct_answer", "direct_answer_confidence",
                  "skill_recommend", "screen", "verify", "verify_threshold",
+                 "verify_finish_enforce",
                  "compact_decider", "compact_decider_threshold",
                  "compact_decider_batch", "compact_decider_min_keep_ratio",
                  "reason")
@@ -133,6 +145,8 @@ class JevConfig:
         self.screen = bool(raw.get("screen_enabled", False))
         self.verify = bool(raw.get("verify_enabled", False))
         self.verify_threshold = float(raw.get("verify_threshold") or 0.5)
+        # 0.8.0：Stop 钩子是否允许阻断收尾（默认 False = 只做顾问、只加信息）
+        self.verify_finish_enforce = bool(raw.get("verify_finish_enforce", False))
         # #1 Jev 压缩判定器（opt-in，默认关）：核心 compact_session 调用
         self.compact_decider = bool(raw.get("compact_decider_enabled", False))
         try:
@@ -403,7 +417,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.7.1"
+    version = "0.8.1"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -443,10 +457,15 @@ class JevPlugin(ToolPlugin):
              "hint": "抓取结果 / 用户消息进上下文前判一次是否有提示注入；命中则隔离或短路（每轮多一次 Jev 调用）"},
             {"key": "verify_enabled", "type": "boolean",
              "label": "Verify 核验（防假完成）", "default": False,
-             "hint": "当对话出现「已完成/测试通过」时核验上下文证据，不足则注入提醒（非完整 Stop 钩子）"},
+             "hint": "出现「已完成/测试通过」时核验证据：既有轮次提醒（before_llm），"
+                     "也在 Agent 收尾那一刻核验（Stop 钩子，core.before_finish），结论进「判断」面板"},
             {"key": "verify_threshold", "type": "number",
              "label": "Verify 通过阈值", "default": 0.5,
              "hint": "证据支撑度低于此值判定为假完成"},
+            {"key": "verify_finish_enforce", "type": "boolean",
+             "label": "Verify 阻断收尾（Stop 钩子强制）", "default": False,
+             "hint": "开启后：收尾时证据不足会要求再给一轮补证据（最多一次）；"
+                     "默认关闭——Jev 只做顾问，不替用户决定"},
             {"key": "compact_decider_enabled", "type": "boolean",
              "label": "Jev 压缩判定器", "default": False,
              "hint": "压缩时用 Jev 批量判定旧工具记录去留（保留的原样、无损）；关 = 用原有 LLM 摘要"},
@@ -499,6 +518,15 @@ class JevPlugin(ToolPlugin):
             self._install_screen(kernel)
         if cfg.verify:
             self._install_verify(kernel)
+            # 兼容守卫：Stop 钩子需要 core ≥ 1.10.3（kernel.before_finish）。
+            # 老核心上**只停用这一项能力**，绝不抛错——否则插件 install 失败会
+            # 让整次工具装配失败（/api/tools 与任务启动都受影响）。
+            if hasattr(kernel, "before_finish"):
+                self._install_finish(kernel)
+            else:
+                logger.warning(
+                    "[jev] 当前核心没有 before_finish（Stop 钩子）——"
+                    "收尾核验不可用，其余能力照常；升级 lite-work ≥ 1.10.3 后自动生效")
         # #1 Jev 压缩判定器：注册到 app 服务（核心 compact_session 查询）
         # D0：功能关 → 注销，压缩走默认 LLM 摘要（零残留）
         app = kernel.get_service("app") if kernel.has_service("app") else None
@@ -975,9 +1003,7 @@ class JevPlugin(ToolPlugin):
             if target is None:
                 return await next(data)
             text = str(getattr(target, "content", "") or "")
-            if not any(h in text.lower() for h in
-                       ("完成了", "已完成", "测试通过", "全部通过", "已修复",
-                        "done", "all tests pass", "fixed")):
+            if not claims_done(text):
                 return await next(data)
             # 声称完成 → 核验最近证据
             evidence = "\n---\n".join(
@@ -1001,6 +1027,93 @@ class JevPlugin(ToolPlugin):
                             f"\n\n[verify-warning] 上一条声称完成，但 Jev 核验认为证据不足"
                             f"（支撑度 {noul_v:.2f}）。请补充实际执行的证明（测试输出、文件 diff 等）后再结束。")
                         break
+            return await next(data)
+
+    # -------------------------------------------------- Stop 钩子（0.8.0）
+
+    def _install_finish(self, kernel: Kernel) -> None:
+        """Stop 钩子：Agent 声称完成的**那一刻**核验证据，并记入「判断」面板。
+
+        与此前 #3 Verify 的差别：Verify 挂在 `before_llm`，抓不到"无工具地声称完成
+        并直接结束"的那一轮（当时 core 没有 Stop 钩子，见旧注释）。core 现已提供
+        `kernel.before_finish`，本钩子在收尾前做同一件核验：
+
+        - `record_judgement(point="finish")` → 结果出现在右栏「判断」面板（与其它
+          判定同构，可复用同一决策树渲染）；
+        - 把结论作为 `opinion` 交给核心（随 `gate:result` 事件给前端）；
+        - 仅当 `verify_finish_enforce=True` 且证据不足时要求再给一轮（最多一次）——
+          默认关闭：Jev 只做顾问，拦截权始终在用户/安全层手里。
+        """
+        @kernel.before_finish.use
+        async def _jev_finish(ctx, data, next):
+            cfg = read_config(kernel)
+            if not cfg.ready or not cfg.verify:
+                return await next(data)
+            content = str((data or {}).get("content") or "")
+            if not claims_done(content):
+                return await next(data)
+            # 证据：本会话最近几条消息（工具结果/文件变更/测试输出都在里面）
+            messages = list(getattr(ctx, "messages", []) or [])
+            evidence = "\n---\n".join(
+                str(getattr(m, "content", ""))[:400] for m in messages[-6:])[:3000]
+            try:
+                q = _build_questions(
+                    "noul", "该任务声称完成，但上下文证据（工具结果/文件变更/测试输出）"
+                            "是否真的支撑这个结论？", None)
+                resp = await asyncio.to_thread(
+                    post_systemone, cfg,
+                    {"state": evidence, "model": cfg.model, "questions": q})
+                ans = (resp.get("answers") or {}).get("q1") or {}
+                noul_v = float(ans.get("noul") or 0.5)
+                why = str(ans.get("why") or "")
+            except Exception:  # noqa: BLE001 - fail-closed：判不了就放行
+                STATS["errors"] += 1
+                logger.warning("[jev] Stop 钩子核验失败，交回核心", exc_info=True)
+                return await next(data)
+
+            enough = noul_v >= cfg.verify_threshold
+            record_judgement({
+                "kind": "verify",
+                "point": "finish",
+                "confidence": round(1.0 - noul_v, 2),
+                "choice": "accept" if enough else "reject",
+                "question": "这次「完成」声称是否有证据支撑？",
+                "context": (content[:200] or "（无正文）"),
+                "noul": noul_v,
+                "why": why,
+                "threshold": cfg.verify_threshold,
+                "accepted": enough,
+                "at": time.time(),
+            })
+            gate = (data or {}).get("gate")
+            if isinstance(gate, dict) and gate.get("verdict"):
+                record_judgement({
+                    "kind": "gate",
+                    "point": "finish-gate",
+                    "confidence": 1.0,          # 机械聚合：确定性结论
+                    "choice": str(gate.get("verdict")),
+                    "question": "完成门禁（机械核验：改动文件 / 验证命令退出码）结论？",
+                    "context": "；".join(
+                        f"{c.get('id')}={c.get('status')}"
+                        for c in (gate.get("checks") or []) if isinstance(c, dict)),
+                    "accepted": True,
+                    "at": time.time(),
+                })
+            data["opinion"] = {
+                "source": "Jev",
+                "level": "证据充分" if enough else "证据不足",
+                "choice": "accept" if enough else "reject",
+                "confidence": round(1.0 - noul_v, 2),
+                "threshold": cfg.verify_threshold,
+                "why": why,
+                "model": cfg.model,
+            }
+            if cfg.verify_finish_enforce and not enough and int((data or {}).get("retries") or 0) < 1:
+                data["block_finish"] = True
+                data["reminder"] = (
+                    f"[Jev] 核验认为证据不足（支撑度 {noul_v:.2f}）。"
+                    "请补充实际执行的证明（测试输出、文件 diff 等）后再结束；"
+                    "未验证的部分请明确标注。")
             return await next(data)
 
     # -------------------------------------------------- #1 Jev 压缩判定器
