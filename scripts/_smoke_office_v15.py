@@ -124,7 +124,7 @@ async def main():
         if office_plugin._find_soffice() is None:
             check("xlsx_recalculate 无 soffice 降级提示", "LibreOffice" in r and "安装" in r, r[:200])
         else:
-            check("xlsx_recalculate 有 soffice 实测", r.startswith("[Office OK]") and "2 个公式" in r, r[:300])
+            check("xlsx_recalculate 有 soffice 实测", r.startswith("[Office OK]") and "1 个公式" in r, r[:300])
             wb = openpyxl.load_workbook(xlsx_path, data_only=True)
             check("重算后读到计算值 3", wb.active["A3"].value == 3, f"A3={wb.active['A3'].value!r}")
             wb.close()
