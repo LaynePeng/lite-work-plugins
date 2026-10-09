@@ -4,8 +4,8 @@
   "plugins": [
     {
       "name": "office-plugin",
-      "version": "1.4.1",
-      "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、PDF 中文排版（主题/表格/页码）、格式化编辑与查找替换、数据分析、图表（产出物写入工作区「产出物/」可见目录）",
+      "version": "1.5.0",
+      "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、PDF 中文排版（主题/表格/页码）、格式化编辑与查找替换、数据分析、图表（产出物写入工作区「产出物/」可见目录）；v1.5.0 LibreOffice 可选增强：Office/旧格式→PDF 转换、页面 PNG 渲染预览、Excel 公式重算（需本机 soffice，缺失时优雅降级）",
       "path": "plugins/office-plugin",
       "tools": [
         "docx_create",
@@ -23,7 +23,10 @@
         "docx_read",
         "xlsx_read",
         "pptx_read",
-        "pdf_read"
+        "pdf_read",
+        "office_convert",
+        "office_render",
+        "xlsx_recalculate"
       ]
     },
     {

@@ -1,0 +1,31 @@
+name: Office Plugin Smoke
+
+# office-plugin v1.5.0 LibreOffice 增强层冒烟：
+# Linux runner 安装 libreoffice 后跑真实转换/渲染/重算路径；
+# 同一脚本在无 soffice 机器上自动只验证降级提示与 pdf→png 路径。
+on:
+  push:
+    paths: ["plugins/office-plugin/**", "scripts/_smoke_office_v15.py", ".github/workflows/office-smoke.yml"]
+  pull_request:
+    paths: ["plugins/office-plugin/**", "scripts/_smoke_office_v15.py", ".github/workflows/office-smoke.yml"]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖（全部为主程序已捆绑包，仅冒烟用）
+        run: pip install reportlab openpyxl pymupdf matplotlib pandas
+      - name: 安装 LibreOffice（可选增强层的外部引擎）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-impress libreoffice-calc libreoffice-writer
+          soffice --version
+      - name: 冒烟测试（soffice 路径 + 降级路径）
+        env:
+          MPLBACKEND: Agg
+        run: python scripts/_smoke_office_v15.py

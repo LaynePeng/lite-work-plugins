@@ -54,6 +54,48 @@ https://github.com/laynepeng/lite-work-plugins/tree/main/plugins/ocr-plugin
 
 安装位置：插件 `~/.lite-work/plugins/`，技能 `~/.agents/skills/`。
 
+## 手动安装插件（不依赖 GUI）
+
+适合离线机器、内网环境，或想跟踪本仓库开发版（含未发布到
+manifest 的改动）的场景。
+
+1. **复制插件目录**：把 `plugins/<插件名>/` 整个目录复制到
+   `~/.lite-work/plugins/<插件名>/`（只需 `plugin.py`，`__pycache__`
+   不用带）：
+
+   ```bash
+   git clone https://github.com/laynepeng/lite-work-plugins.git
+   cp -r lite-work-plugins/plugins/office-plugin ~/.lite-work/plugins/
+   ```
+
+   本地开发同理：直接从本仓库工作区复制，或做软链
+   `ln -s ~/codes/lite-work-plugins/plugins/office-plugin ~/.lite-work/plugins/office-plugin`
+   （软链方式改代码即时生效，注意别把 `__pycache__` 带进加载路径）。
+
+2. **登记 `installed.json`**：编辑 `~/.lite-work/plugins/installed.json`，
+   按插件名加一条记录（`source` 写 `local-dev` 或来源 URL，重启
+   lite-work 后生效）：
+
+   ```json
+   {
+     "office-plugin": {
+       "version": "1.5.0",
+       "source": "local-dev",
+       "installed_at": "2026-10-09T12:00:00"
+     }
+   }
+   ```
+
+3. **重启 lite-work**：插件在启动时加载，安装的同名插件会覆盖主程序
+   内置版本，卸载（删除目录 + 移除登记）自动回退内置版。
+
+> 提示：GUI 的「检查社区更新」读取的是 `manifest.json` 的 `version`，
+> 与 `installed.json` 比对后提示更新；手动装的开发版如果版本号相同，
+> 更新提示不会出现，属正常现象。
+>
+> 插件如带 `wheels/`（第三方依赖），复制目录时一并带上，运行时会
+> 自动解压生效，无需额外操作。
+
 ## 编写插件
 
 一个插件 = 一个 `ToolPlugin` 子类，放在 `plugins/<插件名>/plugin.py`：
