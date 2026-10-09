@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安装依赖（全部为主程序已捆绑包，仅冒烟用）
-        run: pip install reportlab openpyxl pymupdf matplotlib pandas
+        run: pip install reportlab openpyxl pymupdf matplotlib pandas python-docx
       - name: 安装 LibreOffice（可选增强层的外部引擎）
         run: |
           sudo apt-get update

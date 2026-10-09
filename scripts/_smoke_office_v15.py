@@ -20,11 +20,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 try:
     import litework.core.types  # noqa: F401
+    from litework.tools.plugin import ToolPlugin as _RealToolPlugin  # noqa: F401
 except ImportError:
-    # CI / 无主程序环境：注入最小 stub（插件只用到 name/description/parameters）
+    # CI / 无主程序环境：注入最小 stub（插件只用到 name/description/parameters
+    # 与 ToolPlugin 基类；_gcd_import 对已注册的全限定名直接命中 sys.modules，
+    # 因此无需构造真实包结构）
     litework_pkg = type(sys)("litework")
     core_pkg = type(sys)("litework.core")
     types_pkg = type(sys)("litework.core.types")
+    tools_pkg = type(sys)("litework.tools")
+    plugin_pkg = type(sys)("litework.tools.plugin")
 
     @dataclass
     class ToolDefinition:  # type: ignore[no-redef]
@@ -32,12 +37,20 @@ except ImportError:
         description: str = ""
         parameters: Dict[str, Any] = None  # type: ignore[assignment]
 
+    class ToolPlugin:  # type: ignore[no-redef]
+        """最小基类 stub：plugin.py 末尾的 OfficePlugin 只继承、不调用基类逻辑。"""
+
     types_pkg.ToolDefinition = ToolDefinition
+    plugin_pkg.ToolPlugin = ToolPlugin
     litework_pkg.core = core_pkg
+    litework_pkg.tools = tools_pkg
+    tools_pkg.plugin = plugin_pkg
     core_pkg.types = types_pkg
     sys.modules["litework"] = litework_pkg
     sys.modules["litework.core"] = core_pkg
     sys.modules["litework.core.types"] = types_pkg
+    sys.modules["litework.tools"] = tools_pkg
+    sys.modules["litework.tools.plugin"] = plugin_pkg
 
 import plugin as office_plugin  # noqa: E402
 
