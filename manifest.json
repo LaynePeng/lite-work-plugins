@@ -27,7 +27,15 @@
         "office_convert",
         "office_render",
         "xlsx_recalculate"
-      ]
+      ],
+      "permissions": {
+        "fs_write": [
+          "产出物/**"
+        ],
+        "office": [
+          "*"
+        ]
+      }
     },
     {
       "name": "ocr-plugin",
@@ -38,7 +46,12 @@
         "ocr_image",
         "ocr_document",
         "ocr_pptx"
-      ]
+      ],
+      "permissions": {
+        "office": [
+          "*"
+        ]
+      }
     },
     {
       "name": "webfetch-plugin",
@@ -48,14 +61,20 @@
       "tools": [
         "webfetch",
         "webfetch_batch"
-      ]
+      ],
+      "permissions": {
+        "network": [
+          "*"
+        ]
+      }
     },
     {
       "name": "pricing-plugin",
       "version": "1.0.0",
       "description": "官方定价数据源：DeepSeek 分时价（高峰/空闲半价）与 Kimi 国际站价，按模型指纹计费（自定义中转也能认出）。价格表在 pricing.json，手动同步、不自动联网。",
       "path": "plugins/pricing-plugin",
-      "tools": []
+      "tools": [],
+      "permissions": {}
     },
     {
       "name": "sdd-plugin",
@@ -69,7 +88,12 @@
         "sdd_tasks_save",
         "sdd_check",
         "sdd_status"
-      ]
+      ],
+      "permissions": {
+        "fs_write": [
+          "specs/**"
+        ]
+      }
     },
     {
       "name": "example-greeting",
@@ -78,7 +102,8 @@
       "path": "plugins/example-greeting",
       "tools": [
         "text_stats"
-      ]
+      ],
+      "permissions": {}
     },
     {
       "name": "jev",
@@ -88,7 +113,15 @@
       "tools": [
         "jev_choice",
         "jev_score"
-      ]
+      ],
+      "permissions": {
+        "network": [
+          "api.typesafe.ai"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-orchestrate",
@@ -96,7 +129,15 @@
       "description": "协作模式：并行派发互不依赖的子任务，主 Agent 继续关键路径工作，结果完成后自动送达",
       "path": "plugins/collab-orchestrate",
       "kind": "collab",
-      "icon": "plugins/collab-orchestrate/icon.svg"
+      "icon": "plugins/collab-orchestrate/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-pipeline",
@@ -104,7 +145,15 @@
       "description": "协作模式：顺序依赖的分工协作：每阶段一个 agent，前序产出交接给后续 agent 消费",
       "path": "plugins/collab-pipeline",
       "kind": "collab",
-      "icon": "plugins/collab-pipeline/icon.svg"
+      "icon": "plugins/collab-pipeline/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-brainstorm",
@@ -112,7 +161,15 @@
       "description": "协作模式：多 Agent 不同视角并行提案、交叉批判后综合出最优方案",
       "path": "plugins/collab-brainstorm",
       "kind": "collab",
-      "icon": "plugins/collab-brainstorm/icon.svg"
+      "icon": "plugins/collab-brainstorm/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-critic",
@@ -120,7 +177,15 @@
       "description": "协作模式：spawn role=critic 批判者审查方案或代码，产出按严重度排序的问题清单",
       "path": "plugins/collab-critic",
       "kind": "collab",
-      "icon": "plugins/collab-critic/icon.svg"
+      "icon": "plugins/collab-critic/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-debate",
@@ -128,7 +193,15 @@
       "description": "协作模式：提案者与批判者多轮对抗审查，迭代修订至方案收敛（红蓝对抗）",
       "path": "plugins/collab-debate",
       "kind": "collab",
-      "icon": "plugins/collab-debate/icon.svg"
+      "icon": "plugins/collab-debate/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-meeting",
@@ -136,7 +209,15 @@
       "description": "协作模式：多 Agent 围绕议题轮流发言、互相看到彼此观点，多轮后收敛共识",
       "path": "plugins/collab-meeting",
       "kind": "collab",
-      "icon": "plugins/collab-meeting/icon.svg"
+      "icon": "plugins/collab-meeting/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-code-sprint",
@@ -144,7 +225,15 @@
       "description": "协作模式：实现与测试 agent 配对循环、按模块领地并行（allowed_dirs 硬隔离）",
       "path": "plugins/collab-code-sprint",
       "kind": "collab",
-      "icon": "plugins/collab-code-sprint/icon.svg"
+      "icon": "plugins/collab-code-sprint/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-roleplay",
@@ -152,7 +241,15 @@
       "description": "协作模式：多 Agent 扮演不同利益相关者角色，从各自立场审视方案，产出多角色风险清单与综合评审",
       "path": "plugins/collab-roleplay",
       "kind": "collab",
-      "icon": "plugins/collab-roleplay/icon.svg"
+      "icon": "plugins/collab-roleplay/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     },
     {
       "name": "collab-sdd",
@@ -160,7 +257,15 @@
       "description": "协作模式：规格驱动开发（SDD）——spec→plan→tasks→implement 四件套工件落盘 specs/，critic 评审规格与方案，实现与测试以 EARS 需求为验收标准（配套 sdd-plugin 工具集）",
       "path": "plugins/collab-sdd",
       "kind": "collab",
-      "icon": "plugins/collab-sdd/icon.svg"
+      "icon": "plugins/collab-sdd/icon.svg",
+      "permissions": {
+        "spawn": [
+          "*"
+        ],
+        "skills": [
+          "load_skill"
+        ]
+      }
     }
   ],
   "skills": [
