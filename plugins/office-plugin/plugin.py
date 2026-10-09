@@ -13,6 +13,9 @@ v1.5.0 新增：LibreOffice 可选增强层——office_convert（Office/旧格�
 soffice 缺失时返回安装指引并优雅降级（设计参考 dsh-libreoffice-kit 的
 进程隔离/超时/串行纪律与本仓库 academic-paper-engineering 的实践），
 其余 15 个纯 Python 工具不受影响。
+v1.6.0 变更：输出目录约定与 lite-work 新项目结构对齐——交付物默认直接写
+工作区根目录（不再套 产出物/ 目录），中间产物（文档内嵌图表、渲染预览）
+写 中间产物/ 顶层目录；存量项目的 产出物/ 目录保留原地不迁移。
 
 所有依赖包已包含在主依赖中（pyproject.toml dependencies），
 `pip install -e .` 时自动安装。
@@ -117,20 +120,29 @@ def _missing_dep_msg(pkg: str, tools: str) -> str:
 # ---------------------------------------------------------------- 工具函数
 
 
-# 产出物/素材目录名（1.3.0 起为工作区内**可见**目录——交付物要在
-# Finder/IDE 里直接可见，不再藏进 .outputs 隐藏目录；历史 .outputs/.uploads
-# 保留原地不动，不迁移）。
-OUTPUT_DIR_NAME = "产出物"
+# 输出目录约定（v1.6.0 与 lite-work 新项目结构对齐——参考 Muse/dots 的
+# Artifacts 思路：成品平铺直给，过程文件退到幕后）：
+# - 交付物（用户要的成品：docx/xlsx/pptx/pdf/图表/分析导出）默认直接写
+#   工作区根目录，Finder/IDE 打开即见，不再套 产出物/ 目录；
+# - 中间产物（文档内嵌图表、渲染预览 PNG 等非交付文件）写 中间产物/ 顶层目录；
+# - 历史的 产出物/ 与 .outputs/.uploads 保留原地不动，不迁移（存量项目兼容，
+#   旧文件照常可读）。
 UPLOADS_DIR_NAME = "素材"
+WORK_DIR_NAME = "中间产物"
 
 
 def _ensure_output_dir(workspace: str, subdir=None):
-    """确保输出目录存在，返回绝对路径。"""
+    """返回输出目录的绝对路径（v1.6.0 语义）。
+
+    - subdir=None：交付物 → 工作区根目录本身（目录必已存在，仅做兜底）；
+    - subdir 给定（如 diagrams / previews）：中间产物 → 中间产物/<subdir>/，
+      目录不存在时创建。
+    """
     if subdir is None:
-        subdir = OUTPUT_DIR_NAME
-    elif not subdir.startswith(OUTPUT_DIR_NAME):
-        subdir = os.path.join(OUTPUT_DIR_NAME, subdir)
-    out_dir = os.path.join(os.path.abspath(workspace), subdir)
+        out_dir = os.path.abspath(workspace)
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
+    out_dir = os.path.join(os.path.abspath(workspace), WORK_DIR_NAME, subdir)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -475,7 +487,7 @@ class OfficeTools:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "已有 docx 文件路径（相对工作区，如 产出物/方案.docx）",
+                            "description": "已有 docx 文件路径（相对工作区，如 方案.docx）",
                         },
                         "content": {
                             "type": "string",
@@ -511,7 +523,7 @@ class OfficeTools:
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "docx 文件路径（相对工作区，如 产出物/方案.docx）"},
+                        "path": {"type": "string", "description": "docx 文件路径（相对工作区，如 方案.docx）"},
                         "target": {"type": "string", "enum": ["all", "heading", "search"], "description": "格式化目标（默认 all）"},
                         "search_text": {"type": "string", "description": "target=search 时必填：要命中的文字"},
                         "heading_level": {"type": "number", "description": "target=heading 时必填：标题层级 1-6"},
@@ -834,7 +846,7 @@ class OfficeTools:
                     "把 PDF 或 Office 文档的指定页渲染成 PNG 图片，用于预览和视觉"
                     "检查（颜色/排版/图表尽收眼底，与 *_read 的纯文本提取互补）。"
                     "PDF 输入无需任何外部程序；docx/xlsx/pptx 等输入需要本机 "
-                    "LibreOffice。输出到 产出物/previews/，返回图片路径列表。"
+                    "LibreOffice。输出到 中间产物/previews/，返回图片路径列表。"
                 ),
                 parameters={
                     "type": "object",
@@ -878,7 +890,7 @@ class OfficeTools:
                         },
                         "in_place": {
                             "type": "boolean",
-                            "description": "true（默认）直接重算回写原文件；false 则先复制到 产出物/ 再重算副本",
+                            "description": "true（默认）直接重算回写原文件；false 则先复制到工作区根目录再重算副本",
                         },
                         "force": {
                             "type": "boolean",
@@ -904,7 +916,7 @@ class OfficeTools:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "docx 文件路径（相对工作区，如 产出物/方案.docx 或 素材/素材.docx）",
+                            "description": "docx 文件路径（相对工作区，如 方案.docx 或 素材/素材.docx）",
                         },
                     },
                     "required": ["path"],
