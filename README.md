@@ -19,6 +19,8 @@ lite-work-plugins/
 │   │   └── plugin.py
 │   ├── webfetch-plugin/     #   Web 抓取（三级反爬对抗）
 │   │   └── plugin.py
+│   ├── email-plugin/        #   邮件：SMTP 发信（HTML/附件，发送前审批）＋ IMAP 收件箱/搜索/读单封
+│   │   └── plugin.py
 │   └── example-greeting/    #   示例插件（演示编写格式）
 │       └── plugin.py
 └── skills/                  # 技能（SKILL.md 指令文档）

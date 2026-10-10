@@ -266,6 +266,17 @@
           "load_skill"
         ]
       }
+    },
+    {
+      "name": "email-plugin",
+      "version": "1.0.0",
+      "description": "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户审批确认）＋ IMAP 收件箱列表/关键词搜索/读取单封（Hotmail/Outlook 默认配置，账号在设置页「邮件」填写）",
+      "path": "plugins/email-plugin",
+      "tools": [
+        "email_send",
+        "email_list",
+        "email_read"
+      ]
     }
   ],
   "skills": [
