@@ -408,8 +408,12 @@ def _oauth_device_start(conf: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
 
 
 def _oauth_device_poll(conf: Dict[str, Any],
-                       device_code: str) -> Tuple[Optional[Dict[str, Any]], str, bool]:
-    """device code 流程第二步：单次轮询。返回 (payload, 错误, 是否仍待授权)。"""
+                       device_code: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """device code 流程第二步：单次轮询。
+
+    返回 (payload, 错误, 状态)；状态取值 done / pending / slow_down / error。
+    slow_down 由调用方按 RFC 8628 拉长轮询间隔，否则服务端会持续拒绝。
+    """
     data = {"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             "client_id": conf["client_id"], "device_code": device_code}
     if conf["client_secret"]:
@@ -417,10 +421,18 @@ def _oauth_device_poll(conf: Dict[str, Any],
     payload, err = _post_form(conf["token"], data)
     if err:
         low = err.lower()
-        if "authorization_pending" in low or "slow_down" in low:
-            return None, "", True
-        return None, err, False
-    return payload, "", False
+        if "authorization_pending" in low:
+            return None, "", "pending"
+        if "slow_down" in low:
+            return None, "", "slow_down"
+        if "expired_token" in low:
+            return None, "设备码已过期，请重新发起 email_oauth_login 获取新代码。", "error"
+        if "declined" in low or "access_denied" in low:
+            return None, "用户拒绝了授权。", "error"
+        return None, err, "error"
+    if not (payload or {}).get("access_token"):
+        return None, "换票响应缺少 access_token。", "error"
+    return payload, "", "done"
 
 
 def _persist_refresh_token(app, token: str) -> bool:
@@ -849,6 +861,9 @@ class EmailPlugin(ToolPlugin):
         # 授权码流程：用户已拿到 code → 直接换令牌
         code = str(args.get("code") or "").strip()
         if code:
+            if not conf["client_id"] or not conf["token"]:
+                return ("[Error]: 换令牌需要 client_id 与 token 端点，请先在设置页 → "
+                        "插件 → email-plugin 补齐。")
             data = {"grant_type": "authorization_code", "client_id": conf["client_id"],
                     "code": code}
             if conf["redirect_uri"]:
@@ -883,6 +898,9 @@ class EmailPlugin(ToolPlugin):
 
         # device code 流程
         pending = _device_cache.get("pending") or {}
+        if pending and float(pending.get("expires_at") or 0) < time.time():
+            _device_cache.pop("pending", None)   # 过期设备码不能再用
+            pending = {}
         device_code = str(args.get("device_code") or pending.get("device_code") or "")
         if device_code:
             try:
@@ -893,15 +911,15 @@ class EmailPlugin(ToolPlugin):
             interval = max(int(pending.get("interval") or 5), 3)
             deadline = time.time() + timeout
             while time.time() < deadline:
-                payload, err, waiting = await asyncio.to_thread(
+                payload, err, status = await asyncio.to_thread(
                     _oauth_device_poll, conf, device_code)
-                if err:
+                if status == "error":
                     return f"[Error]: 授权失败：{err}"
-                if payload:
+                if status == "done":
                     _device_cache.pop("pending", None)
-                    return self._save_token(payload)
-                if not waiting:
-                    return "[Error]: 授权未完成且无法继续，请重新发起 email_oauth_login。"
+                    return self._save_token(payload or {})
+                if status == "slow_down":
+                    interval = min(interval + 5, 60)   # RFC 8628：退避后再轮询
                 await asyncio.sleep(interval)
             _device_cache["pending"] = dict(pending, device_code=device_code)
             return (f"[Email]: 仍在等待授权（已等待 {timeout}s）。请先在浏览器完成授权，"
@@ -914,14 +932,19 @@ class EmailPlugin(ToolPlugin):
         dc = str(payload.get("device_code") or "")
         if not dc:
             return f"[Error]: 未拿到 device_code：{str(payload)[:200]}"
+        try:
+            expires_in = float(payload.get("expires_in") or 900)
+        except (TypeError, ValueError):
+            expires_in = 900.0
         _device_cache["pending"] = {
             "device_code": dc,
             "interval": payload.get("interval") or 5,
-            "expires_at": time.time() + float(payload.get("expires_in") or 900),
+            "expires_at": time.time() + expires_in,
         }
         msg = str(payload.get("message") or "").strip()
         verify = str(payload.get("verification_uri") or payload.get("verification_url") or "")
-        return (f"[Email]: 请完成 OAuth2 授权——\n"
+        minutes = int(expires_in // 60) or 1
+        return (f"[Email]: 请完成 OAuth2 授权（{minutes} 分钟内有效）——\n"
                 f"1) 浏览器打开：{verify}\n"
                 f"2) 输入代码：{payload.get('user_code')}\n"
                 + (f"3) {msg}\n" if msg else "")

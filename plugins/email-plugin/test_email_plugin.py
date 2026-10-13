@@ -7,6 +7,7 @@ import sys
 import importlib.util
 import os
 import tempfile
+import time
 import unittest
 from email.message import EmailMessage
 from types import SimpleNamespace
@@ -491,6 +492,243 @@ class OauthLoginToolTest(EmailPluginBase):
         self.plugin._app = _App(config={"email-plugin": {"email_user": "u@x.com"}})
         out = self.plugin._save_token({"access_token": "AT"})
         self.assertIn("没有 refresh_token", out)
+
+
+class DeviceFlowTest(EmailPluginBase):
+    """device code 流程：状态机、退避、过期、异常响应。"""
+
+    def setUp(self):
+        super().setUp()
+        emailplugin._device_cache.clear()
+        self.app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "outlook", "email_oauth_client_id": "cid"}})
+        self.plugin._app = self.app
+
+    def tearDown(self):
+        emailplugin._device_cache.clear()
+
+    def _stub(self, poll=None, start=None):
+        self._orig_poll = emailplugin._oauth_device_poll
+        self._orig_start = emailplugin._oauth_device_start
+        if poll is not None:
+            emailplugin._oauth_device_poll = poll
+        if start is not None:
+            emailplugin._oauth_device_start = start
+
+    def _restore(self):
+        emailplugin._oauth_device_poll = self._orig_poll
+        emailplugin._oauth_device_start = self._orig_start
+
+    def _fast_sleep(self):
+        """替换 asyncio.sleep + 推进假时钟：否则轮询按真实时间空转，测试要等满超时。"""
+        self._orig_sleep = asyncio.sleep
+        self._orig_time = emailplugin.time
+        self._slept = []
+        clock = {"t": self._orig_time.time()}
+
+        async def fake_sleep(sec):
+            self._slept.append(sec)
+            clock["t"] += sec
+
+        class _FakeTime:
+            @staticmethod
+            def time():
+                return clock["t"]
+
+        emailplugin.time = _FakeTime
+        asyncio.sleep = fake_sleep
+
+    def _restore_sleep(self):
+        asyncio.sleep = self._orig_sleep
+        emailplugin.time = self._orig_time
+
+    def test_pending_then_authorized(self):
+        calls = {"n": 0}
+
+        def poll(conf, dc):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                return None, "", "pending"
+            return {"access_token": "AT", "refresh_token": "RT"}, "", "done"
+
+        self._fast_sleep()
+        self._stub(poll=poll)
+        try:
+            emailplugin._device_cache["pending"] = {
+                "device_code": "DC", "interval": 3, "expires_at": time.time() + 900}
+            out = asyncio.run(self.plugin._oauth_login({"timeout": 20}))
+        finally:
+            self._restore()
+            self._restore_sleep()
+        self.assertIn("授权成功", out)
+        self.assertEqual(self.app.config["email-plugin"]["email_oauth_refresh_token"], "RT")
+
+    def test_pending_times_out_and_resumes(self):
+        self._fast_sleep()
+        self._stub(poll=lambda conf, dc: (None, "", "pending"))
+        try:
+            emailplugin._device_cache["pending"] = {
+                "device_code": "DC", "interval": 3, "expires_at": time.time() + 900}
+            out = asyncio.run(self.plugin._oauth_login({"timeout": 15}))
+        finally:
+            self._restore()
+            self._restore_sleep()
+        self.assertIn("仍在等待授权", out)
+        self.assertIn("device_code", emailplugin._device_cache.get("pending", {}))
+        self.assertTrue(self._slept, "超时期间应有轮询等待")
+
+    def test_slow_down_backs_off_then_succeeds(self):
+        """RFC 8628：收到 slow_down 要拉长间隔，而不是当成失败退出。"""
+        seq = ["slow_down", "slow_down", "done"]
+
+        def poll(conf, dc):
+            s = seq.pop(0)
+            if s == "done":
+                return {"access_token": "AT", "refresh_token": "RT"}, "", "done"
+            return None, "", s
+
+        self._fast_sleep()
+        self._stub(poll=poll)
+        try:
+            emailplugin._device_cache["pending"] = {
+                "device_code": "DC", "interval": 3, "expires_at": time.time() + 900}
+            out = asyncio.run(self.plugin._oauth_login({"timeout": 60}))
+        finally:
+            self._restore()
+            self._restore_sleep()
+        self.assertIn("授权成功", out)
+        self.assertEqual(self._slept[:2], [8, 13], "slow_down 应逐次退避")
+
+    def test_expired_token_reports_clearly(self):
+        self._stub(poll=lambda conf, dc: (None, "设备码已过期，请重新发起 email_oauth_login 获取新代码。", "error"))
+        try:
+            emailplugin._device_cache["pending"] = {"device_code": "DC", "interval": 3,
+                                                       "expires_at": time.time() + 900}
+            out = asyncio.run(self.plugin._oauth_login({"timeout": 15}))
+        finally:
+            self._restore()
+        self.assertIn("过期", out)
+
+    def test_declined_reports_clearly(self):
+        self._stub(poll=lambda conf, dc: (None, "用户拒绝了授权。", "error"))
+        try:
+            emailplugin._device_cache["pending"] = {"device_code": "DC", "interval": 3,
+                                                       "expires_at": time.time() + 900}
+            out = asyncio.run(self.plugin._oauth_login({"timeout": 15}))
+        finally:
+            self._restore()
+        self.assertIn("拒绝", out)
+
+    def test_expired_pending_is_discarded(self):
+        """过期设备码不能继续用，应重新申请并给出新代码。"""
+        self._stub(
+            start=lambda conf: ({"device_code": "NEW", "user_code": "NEW-CODE",
+                                 "verification_uri": "https://x/devicelogin",
+                                 "expires_in": 900, "interval": 5}, ""))
+        try:
+            emailplugin._device_cache["pending"] = {
+                "device_code": "OLD", "interval": 3, "expires_at": time.time() - 10}
+            out = asyncio.run(self.plugin._oauth_login({"timeout": 15}))
+        finally:
+            self._restore()
+        self.assertIn("NEW-CODE", out)
+        self.assertNotIn("OLD", out)
+
+    def test_start_shows_validity_window(self):
+        self._stub(start=lambda conf: (
+            {"device_code": "DC", "user_code": "UC", "expires_in": 900,
+             "verification_uri": "https://x/devicelogin"}, ""))
+        try:
+            out = asyncio.run(self.plugin._oauth_login({}))
+        finally:
+            self._restore()
+        self.assertIn("15 分钟内有效", out)
+
+
+class DevicePollStatusTest(unittest.TestCase):
+    """轮询状态解析：把各家 OAuth 的 error 码映射成明确状态。"""
+
+    def setUp(self):
+        self.conf = {"token": "https://t", "client_id": "cid", "client_secret": ""}
+        self._orig = emailplugin._post_form
+
+    def tearDown(self):
+        emailplugin._post_form = self._orig
+
+    def _poll(self, response):
+        emailplugin._post_form = lambda url, data: response
+        return emailplugin._oauth_device_poll(self.conf, "DC")
+
+    def test_pending(self):
+        self.assertEqual(self._poll((None, "authorization_pending: x"))[2], "pending")
+
+    def test_slow_down(self):
+        self.assertEqual(self._poll((None, "slow_down: x"))[2], "slow_down")
+
+    def test_expired(self):
+        p, err, st = self._poll((None, "expired_token: x"))
+        self.assertEqual(st, "error")
+        self.assertIn("过期", err)
+
+    def test_declined(self):
+        p, err, st = self._poll((None, "access_denied: x"))
+        self.assertEqual(st, "error")
+        self.assertIn("拒绝", err)
+
+    def test_done_requires_access_token(self):
+        """响应没有 access_token 不能当成成功。"""
+        p, err, st = self._poll(({"refresh_token": "RT"}, ""))
+        self.assertEqual(st, "error")
+        self.assertIn("access_token", err)
+
+    def test_done(self):
+        p, err, st = self._poll(({"access_token": "AT", "refresh_token": "RT"}, ""))
+        self.assertEqual(st, "done")
+        self.assertEqual(p["access_token"], "AT")
+
+
+class AuthCodeFlowTest(EmailPluginBase):
+    """授权码流程：链接生成、code 换票、缺配置时的可读报错。"""
+
+    def setUp(self):
+        super().setUp()
+        self.app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "gmail", "email_oauth_client_id": "cid"}})
+        self.plugin._app = self.app
+
+    def test_generates_authorize_url(self):
+        out = asyncio.run(self.plugin._oauth_login({}))
+        self.assertIn("accounts.google.com", out)
+        self.assertIn("client_id=cid", out)
+        self.assertIn("access_type=offline", out)   # 缺它拿不到 refresh_token
+
+    def test_code_exchange_saves_token(self):
+        orig = emailplugin._post_form
+        emailplugin._post_form = lambda url, data: (
+            {"access_token": "AT", "refresh_token": "RT-G"}, "")
+        try:
+            out = asyncio.run(self.plugin._oauth_login({"code": "AUTH-CODE"}))
+        finally:
+            emailplugin._post_form = orig
+        self.assertIn("授权成功", out)
+        self.assertEqual(self.app.config["email-plugin"]["email_oauth_refresh_token"], "RT-G")
+
+    def test_code_exchange_without_client_id_is_actionable(self):
+        self.plugin._app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "custom"}})
+        out = asyncio.run(self.plugin._oauth_login({"code": "X"}))
+        self.assertIn("client_id", out)
+
+    def test_manual_flow_tells_user_to_use_basic(self):
+        self.plugin._app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "qq", "email_oauth_client_id": "cid"}})
+        out = asyncio.run(self.plugin._oauth_login({}))
+        self.assertIn("basic", out)
+        self.assertIn("授权码", out)
 
 
 class OauthTokenCacheTest(EmailPluginBase):
