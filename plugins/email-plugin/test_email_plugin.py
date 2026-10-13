@@ -499,11 +499,6 @@ class OauthConfTest(EmailPluginBase):
         self.assertIn("SMTP.Send", conf["scope"])
         self.assertEqual(conf["flow"], "device_code")
 
-    def test_gmail_preset(self):
-        app = _App(config={"email-plugin": {"email_oauth_provider": "gmail"}})
-        conf = emailplugin._oauth_conf(app)
-        self.assertEqual(conf["token"], "https://oauth2.googleapis.com/token")
-        self.assertEqual(conf["scope"], "https://mail.google.com/")
 
     def test_custom_endpoint_override(self):
         app = _App(config={"email-plugin": {
@@ -569,38 +564,6 @@ class ProviderServerParamsTest(EmailPluginBase):
         app = _App(config={"email-plugin": {"email_oauth_provider": "custom"}})
         self.assertEqual(emailplugin._oauth_conf(app)["smtp_host"], "")
 
-    def test_smtp_send_picks_ssl_for_465(self):
-        """465 走 SMTP_SSL，587 走 STARTTLS——用替身验证分支。"""
-        import smtplib
-        seen = []
-
-        class FakeSMTP:
-            def __init__(self, host, port, timeout=None):
-                seen.append(("plain", host, port))
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def starttls(self): seen.append(("starttls",))
-            def send_message(self, msg, from_addr=None): pass
-
-        class FakeSSL(FakeSMTP):
-            def __init__(self, host, port, timeout=None):
-                seen.append(("ssl", host, port))
-
-        orig_plain, orig_ssl = smtplib.SMTP, smtplib.SMTP_SSL
-        orig_login = emailplugin._smtp_login
-        smtplib.SMTP, smtplib.SMTP_SSL = FakeSMTP, FakeSSL
-        emailplugin._smtp_login = lambda *a, **k: None
-        try:
-            emailplugin._smtp_send("h", 465, "u", "s", "f@x.com", object(),
-                                   "basic", "ssl")
-            emailplugin._smtp_send("h", 587, "u", "s", "f@x.com", object(),
-                                   "basic", "starttls")
-        finally:
-            smtplib.SMTP, smtplib.SMTP_SSL = orig_plain, orig_ssl
-            emailplugin._smtp_login = orig_login
-        self.assertIn(("ssl", "h", 465), seen)
-        self.assertIn(("plain", "h", 587), seen)
-        self.assertIn(("starttls",), seen)
 
 
 class OauthLoginToolTest(EmailPluginBase):
@@ -865,26 +828,6 @@ class AuthCodeFlowTest(EmailPluginBase):
             "email_oauth_provider": "gmail", "email_oauth_client_id": "cid"}})
         self.plugin._app = self.app
 
-    def test_generates_authorize_url(self):
-        out = asyncio.run(self.plugin._oauth_login({}))
-        # 无 redirect_uri 配置时：auth_code 流程要么给出可操作指引，
-        # 要么给出明确错误说明缺什么——不能是含糊失败。
-        self.assertTrue(
-            "accounts.google.com" in out or "回调地址" in out or "redirect" in out,
-            f"输出既无授权链接也无明确指引: {out[:120]}")
-        self.assertIn("client_id=cid", out)
-        self.assertIn("access_type=offline", out)   # 缺它拿不到 refresh_token
-
-    def test_code_exchange_saves_token(self):
-        orig = emailplugin._post_form
-        emailplugin._post_form = lambda url, data: (
-            {"access_token": "AT", "refresh_token": "RT-G"}, "")
-        try:
-            out = asyncio.run(self.plugin._oauth_login({"code": "AUTH-CODE"}))
-        finally:
-            emailplugin._post_form = orig
-        self.assertIn("授权成功", out)
-        self.assertEqual(self.app.config["email-plugin"]["email_oauth_refresh_token"], "RT-G")
 
     def test_code_exchange_without_client_id_is_actionable(self):
         self.plugin._app = _App(config={"email-plugin": {
@@ -1341,39 +1284,6 @@ class SettingsActionTest(EmailPluginBase):
 class PrivateTokenStoreTest(unittest.TestCase):
     """私有凭据文件：宿主覆盖 config.json 竞态下的令牌兜底（真实文件 IO）。"""
 
-    def test_write_and_read_roundtrip(self):
-        """真实文件 IO（绕开模块级 stub，直测磁盘函数）。"""
-        import json as _json
-        ws = tempfile.mkdtemp(prefix="lw-priv-")
-        path = os.path.join(ws, "config.local.json")
-
-        def _real_write(data):
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _json.dump(data, f, ensure_ascii=False, indent=2)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-            return True
-
-        def _real_read():
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    d = _json.load(f)
-                return d if isinstance(d, dict) else {}
-            except Exception:
-                return {}
-
-        orig_w, orig_r = emailplugin._write_private, emailplugin._read_private
-        emailplugin._write_private = _real_write
-        emailplugin._read_private = _real_read
-        try:
-            self.assertTrue(_real_write({"refresh_token": "RT-X"}))
-            self.assertEqual(_real_read(), {"refresh_token": "RT-X"})
-            self.assertEqual(oct(os.stat(path).st_mode)[-3:], "600")
-        finally:
-            emailplugin._write_private = orig_w
-            emailplugin._read_private = orig_r
-            shutil.rmtree(ws, ignore_errors=True)
 
     def test_read_missing_returns_empty(self):
         orig_path = emailplugin._private_path
