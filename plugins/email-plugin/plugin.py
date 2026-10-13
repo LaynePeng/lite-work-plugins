@@ -971,7 +971,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.1.3"
+    version = "1.1.4"
     description = (
         "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
         "IMAP 收件箱列表 / 关键词搜索 / 读取单封。认证支持 basic（密码/应用密码）"
@@ -1228,9 +1228,16 @@ class EmailPlugin(ToolPlugin):
 
         state = self._ACTION_STATE.get("auth") or {}
         if state.get("running"):
+            # 再次点击不重发设备码（Azure 同一设备码只能轮询，重发会让
+            # 用户拿到的旧码作废），但要**把同一组码再说一遍**：前端是
+            # 覆盖式渲染这条消息，若这里只回「进行中」，用户一旦点第二次
+            # 就再也看不到码，只能干等或反复点。故状态里留着码原样回显。
+            code = str(state.get("user_code") or "")
+            verify = str(state.get("verify") or "")
+            guide = (f"请打开 {verify} 输入代码 {code}" if code
+                     else "请在弹出的浏览器页面完成登录授权")
             return {"ok": True,
-                    "message": "授权进行中——请在弹出的浏览器页面登录并点「同意」，"
-                               "完成后这里会自动更新（也可再点一次查询进度）"}
+                    "message": f"授权进行中——{guide}，点「同意」后这里会自动变成成功"}
         if state.get("done"):
             action_app = _SimpleApp(config)
             token, terr = _access_token(action_app)
@@ -1273,7 +1280,9 @@ class EmailPlugin(ToolPlugin):
             self._ACTION_STATE["auth"] = {"running": False, "done": False,
                                           "error": "设备码已过期，请重新点击「立即授权」"}
 
-        self._ACTION_STATE["auth"] = {"running": True}
+        # 码存进状态：运行中重复点击时原样回显（前端覆盖式渲染，不存就丢）
+        self._ACTION_STATE["auth"] = {"running": True, "user_code": user_code,
+                                      "verify": verify}
         threading.Thread(target=_poll, daemon=True,
                          name="email-oauth-action").start()
         return {"ok": True,

@@ -1191,10 +1191,6 @@ class GeneralizationGuardTest(unittest.TestCase):
                          "\n".join(offenders))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SettingsActionTest(EmailPluginBase):
     """设置页「立即授权」按钮：同步发起 + 后台轮询 + 磁盘落令牌。"""
 
@@ -1250,6 +1246,37 @@ class SettingsActionTest(EmailPluginBase):
         out = self.plugin.settings_action("email_oauth_authorize", self._cfg())
         self.assertTrue(out["ok"])
         self.assertIn("进行中", out["message"])
+
+    def test_running_state_repeats_code(self):
+        """运行中重复点击必须**原样回显同一组码**。
+
+        前端是覆盖式渲染这条消息：若再点时只回「进行中」，用户一旦点第二次
+        就再也看不到码（实测反馈「码只出现一次、要点好几次」）。
+        """
+        self.plugin._ACTION_STATE["auth"] = {
+            "running": True, "user_code": "CODE99",
+            "verify": "https://microsoft.com/link"}
+        out = self.plugin.settings_action("email_oauth_authorize", self._cfg())
+        self.assertTrue(out["ok"])
+        self.assertIn("CODE99", out["message"])
+        self.assertIn("https://microsoft.com/link", out["message"])
+
+    def test_start_records_code_for_later_clicks(self):
+        """首次点击后状态里要留下码，供后续点击回显。"""
+        orig_start, orig_open = emailplugin._oauth_device_start, emailplugin._open_browser
+        emailplugin._oauth_device_start = lambda conf: (
+            {"device_code": "DC", "user_code": "KEEP42", "expires_in": 900,
+             "interval": 30, "verification_uri": "https://x/link"}, "")
+        emailplugin._open_browser = lambda url: True
+        try:
+            first = self.plugin.settings_action("email_oauth_authorize", self._cfg())
+            again = self.plugin.settings_action("email_oauth_authorize", self._cfg())
+        finally:
+            emailplugin._oauth_device_start = orig_start
+            emailplugin._open_browser = orig_open
+            self.plugin._ACTION_STATE.clear()
+        self.assertIn("KEEP42", first["message"])
+        self.assertIn("KEEP42", again["message"], "二次点击必须还能看到同一个码")
 
     def test_done_state_reports_success(self):
         self.plugin._ACTION_STATE["auth"] = {"running": False, "done": True}
