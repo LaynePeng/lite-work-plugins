@@ -195,7 +195,7 @@ PUBLIC_CLIENT_IDS: Dict[str, str] = {
     # 刻意**不用** Azure CLI 的 04b07795…——那是微软第一方应用，个人用户在
     # 同意页会得到 "users are not permitted to consent to first party
     # applications"，授权永远走不完（真实踩坑）。
-    "outlook": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+    "outlook": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
     "gmail": "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
 }
 
@@ -827,7 +827,9 @@ def _smtp_send(smtp_host: str, smtp_port: int, user: str, secret: str,
             smtp.send_message(msg, from_addr=from_addr)
         return
     with smtplib.SMTP(smtp_host, port, timeout=30) as smtp:
+        smtp.ehlo()          # RFC 3207：STARTTLS 前先宣告
         smtp.starttls()
+        smtp.ehlo()          # TLS 重建会话后必须重新 EHLO，否则 AUTH 被静默忽略
         _smtp_login(smtp, user, secret, auth_mode)
         smtp.send_message(msg, from_addr=from_addr)
 
