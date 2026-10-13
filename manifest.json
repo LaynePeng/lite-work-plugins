@@ -269,8 +269,8 @@
     },
     {
       "name": "email-plugin",
-      "version": "1.1.0",
-      "description": "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户审批确认）＋ IMAP 收件箱列表/关键词搜索/读取单封。认证支持 basic（密码/应用密码）与 oauth2（SASL XOAUTH2 通用实现）；预设 Outlook/Gmail/Fastmail/Zoho/QQ/163 并自动带出服务器参数，亦可自定义端点适配任意标准服务",
+      "version": "1.1.1",
+      "description": "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户审批确认）＋ IMAP 收件箱列表/关键词搜索/读取单封。认证支持 basic（密码/应用密码）与 oauth2（SASL XOAUTH2 通用实现）；预设 Outlook/Gmail/Fastmail/Zoho/QQ/163 并自动带出服务器参数，亦可自定义端点适配任意标准服务；v1.1.1 修复 OAuth 配置误填无提示：租户字段说明改为「仅组织账号、不能填邮箱」，个人账号留空即用 consumers；误填邮箱/网址时自动纠正并给出可读提示；Azure 错误码（AADSTS900023/700016 等）翻译成「该改哪个字段」；客户端 ID 非 GUID 时提前拦下。",
       "path": "plugins/email-plugin",
       "tools": [
         "email_send",

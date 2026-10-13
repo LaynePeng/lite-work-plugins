@@ -195,6 +195,115 @@ class PluginUiProtocolTest(EmailPluginBase):
         self.assertIsNone(emailplugin._cfg(None, "email_user"))
 
 
+class OAuthConfigGuardTest(EmailPluginBase):
+    """OAuth 配置误填的防御：用户把邮箱填进「租户」是本项目真实踩过的坑。
+
+    Azure 的回包是 `AADSTS900023: Specified tenant identifier '...' is neither
+    a valid DNS name, nor a valid external domain` —— 完全不提哪个字段错了。
+    这些用例锁住「发请求前就纠正 + 给出可读提示」的行为。
+    """
+
+    def _tenant(self, raw):
+        return emailplugin._normalize_tenant(raw)
+
+    def test_empty_tenant_falls_back_to_consumers(self):
+        tenant, warn = self._tenant("")
+        self.assertEqual(tenant, "consumers")
+        self.assertEqual(warn, "")
+
+    def test_email_as_tenant_is_corrected_with_readable_hint(self):
+        tenant, warn = self._tenant("someone@hotmail.com")
+        self.assertEqual(tenant, "consumers")
+        # 提示要同时说清「错在哪」和「该怎么做」
+        self.assertIn("邮箱", warn)
+        self.assertIn("清空", warn)
+
+    def test_url_as_tenant_is_corrected(self):
+        tenant, warn = self._tenant("https://login.microsoftonline.com/x")
+        self.assertEqual(tenant, "consumers")
+        self.assertIn("网址", warn)
+
+    def test_special_tenants_pass_through_lowercased(self):
+        for val in ("consumers", "common", "organizations", "CONSUMERS"):
+            tenant, warn = self._tenant(val)
+            self.assertEqual(warn, "")
+            self.assertEqual(tenant, val.lower())
+
+    def test_org_domain_and_guid_pass_through(self):
+        for val in ("contoso.onmicrosoft.com",
+                    "72f988bf-86f1-41af-91ab-2d7cd011db47"):
+            tenant, warn = self._tenant(val)
+            self.assertEqual(tenant, val)
+            self.assertEqual(warn, "")
+
+    def test_oauth_conf_exposes_tenant_warning(self):
+        """误填的 tenant 会体现在 _oauth_conf 结果里（供授权流程提前返回）。"""
+        app = SimpleNamespace(config={"email-plugin": {
+            "email_oauth_provider": "outlook",
+            "email_oauth_tenant": "someone@hotmail.com",
+        }})
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["tenant"], "consumers")
+        self.assertIn("邮箱", conf.get("tenant_warn", ""))
+        # 端点里不能再出现邮箱
+        self.assertNotIn("hotmail.com", conf["devicecode"])
+
+    def test_oauth_conf_flags_non_guid_client_id(self):
+        """Azure 的 client_id 必须是 GUID；填成任意字符串要提前拦下。"""
+        app = SimpleNamespace(config={"email-plugin": {
+            "email_oauth_provider": "outlook",
+            "email_oauth_client_id": "lite-work",
+        }})
+        conf = emailplugin._oauth_conf(app)
+        self.assertIn("GUID", conf.get("client_id_warn", ""))
+
+    def test_oauth_conf_accepts_valid_guid_client_id(self):
+        guid = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+        app = SimpleNamespace(config={"email-plugin": {
+            "email_oauth_provider": "outlook",
+            "email_oauth_client_id": guid,
+        }})
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["client_id"], guid)
+        self.assertEqual(conf.get("client_id_warn", ""), "")
+
+    def test_device_start_returns_hint_instead_of_hitting_network(self):
+        """配置层提示优先于网络请求：不拿一句 Azure 天书让用户猜字段。"""
+        conf = emailplugin._oauth_conf(SimpleNamespace(config={"email-plugin": {
+            "email_oauth_provider": "outlook",
+            "email_oauth_tenant": "someone@hotmail.com",
+        }}))
+        payload, err = emailplugin._oauth_device_start(conf)
+        self.assertEqual(payload, {})
+        self.assertIn("邮箱", err)
+
+    def test_azure_errors_are_translated(self):
+        cases = [
+            ("AADSTS900023: Specified tenant identifier 'a@b.com' is neither...", "租户"),
+            ("AADSTS700016: Application with identifier 'x' was not found", "客户端 ID"),
+            ("unauthorized_client: not enabled for consumers", "设备码"),
+        ]
+        for raw, must_contain in cases:
+            msg = emailplugin._readable_oauth_error(raw)
+            self.assertIn(must_contain, msg)
+            # 原始报错保留，便于排查
+            self.assertIn(raw[:20], msg)
+
+    def test_unknown_azure_error_passes_through_with_prefix(self):
+        msg = emailplugin._readable_oauth_error("something weird happened")
+        self.assertIn("something weird happened", msg)
+
+    def test_tenant_field_hint_warns_against_email(self):
+        """表单提示要显式写「不能填邮箱」——本次故障就是提示不够明确。"""
+        settings = self.plugin.contributes["settings"]
+        tenant = next((s for s in settings if s["key"] == "email_oauth_tenant"), None)
+        self.assertIsNotNone(tenant, "outlook 应展示租户字段（组织账号用）")
+        self.assertIn("邮箱", tenant.get("hint", ""))
+        self.assertIn("留空", tenant.get("hint", ""))
+        # 占位符比 hint 更靠近输入框，要能提示「留空即个人账号」
+        self.assertIn("留空", tenant.get("placeholder", ""))
+
+
 class _NoImaplib:
     """上下文管理器：在 with 内屏蔽标准库 imaplib（模拟未捆绑 imaplib 的冻结宿主）。
 

@@ -57,6 +57,65 @@ OAUTH_FLOW_MANUAL = "manual"
 
 DEFAULT_TENANT = "consumers"
 
+#: Azure 官方三个多租户占位符。
+_TENANT_SPECIAL = ("consumers", "common", "organizations")
+
+#: tenant 只接受上述特殊值、租户 GUID、或**已在 Azure 验证过的**域名。
+#: 邮箱地址永远不合法——本次踩的坑就是用户把邮箱填进了「租户」。
+_EMAIL_LIKE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_GUID_LIKE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _normalize_tenant(raw: str) -> Tuple[str, str]:
+    """规范化租户值 → (tenant, 提示)。
+
+    用户在「租户」里填邮箱时，Azure 回的是
+    `AADSTS900023: Specified tenant identifier ... is neither a valid DNS name,
+    nor a valid external domain`——完全不提「哪个字段填错了」，用户只能猜。
+    这里在发请求前纠正明显误填并给出可读提示。
+    """
+    val = (raw or "").strip()
+    if not val:
+        return DEFAULT_TENANT, ""
+    low = val.lower()
+    if low in _TENANT_SPECIAL:
+        return low, ""
+    if _EMAIL_LIKE.match(val):
+        return DEFAULT_TENANT, (
+            f"「租户」填的是邮箱（{val}），已改用 '{DEFAULT_TENANT}'。"
+            f"个人账号（Hotmail/Outlook/Live）请**清空**该字段；"
+            f"组织账号请填租户域名或租户 ID。")
+    if val.startswith(("http://", "https://")) or "/" in val:
+        return DEFAULT_TENANT, (
+            f"「租户」看起来是网址（{val}），应填租户域名或 ID（个人账号留空）。"
+            f"已改用 '{DEFAULT_TENANT}'。")
+    return val, ""
+
+
+def _readable_oauth_error(err: str) -> str:
+    """把 Azure 错误码翻成「该改哪里」——原始报错不指向字段，用户无从下手。"""
+    low = (err or "").lower()
+    hints = (
+        ("aadsts900023",
+         "「租户」不是有效值：个人账号请**清空**该字段；组织账号填租户域名或租户 ID"
+         "（不能填邮箱）。"),
+        ("aadsts700016",
+         "应用（客户端 ID）未在该租户注册：请**清空**「客户端 ID」使用内置默认值，"
+         "或填入自己在 Azure 注册的应用 ID。"),
+        ("aadsts500011", "该 API 资源不存在：请检查 scope 与租户是否匹配。"),
+        ("aadsts65001", "尚未同意使用该应用：请重新点击「立即授权」并在浏览器中确认。"),
+        ("unauthorized_client",
+         "该应用不支持设备码流程：请使用内置默认客户端 ID，或在 Azure 把应用配置为"
+         "「允许公共客户端流」。"),
+    )
+    for code, msg in hints:
+        if code in low:
+            return f"授权失败：{msg}\n（原始报错：{(err or '')[:300]}）"
+    return f"授权失败：{err}"
+
+
+
 #: 邮件服务商预设：同时给出 OAuth2 端点与 SMTP/IMAP 服务器参数，选一处即可全通。
 #: 端点是模板（{tenant} 占位）；scope 为默认值。所有字段都可被设置页显式填写的值覆盖。
 #: smtp_tls：starttls=587 类（明文起、STARTTLS 升级）；ssl=465 类（连接即 TLS）。
@@ -343,7 +402,8 @@ def _oauth_conf(app) -> Dict[str, Any]:
     """汇总配置：服务商预设 + 用户显式填写值（填了就用填的，能覆盖一切预设）。"""
     provider = str(_cfg(app, "email_oauth_provider", DEFAULT_PROVIDER) or "").strip().lower()
     preset = PROVIDERS.get(provider) or PROVIDERS["custom"]
-    tenant = str(_cfg(app, "email_oauth_tenant", DEFAULT_TENANT) or DEFAULT_TENANT).strip()
+    tenant, tenant_warn = _normalize_tenant(
+        str(_cfg(app, "email_oauth_tenant", "") or ""))
 
     def preset_str(key: str) -> str:
         return str(preset.get(key) or "").replace("{tenant}", tenant)
@@ -364,16 +424,25 @@ def _oauth_conf(app) -> Dict[str, Any]:
     if smtp_tls not in (SMTP_TLS_STARTTLS, SMTP_TLS_SSL):
         preset_tls = str(preset.get("smtp_tls") or DEFAULT_SMTP_TLS).lower()
         smtp_tls = preset_tls if preset_tls in (SMTP_TLS_STARTTLS, SMTP_TLS_SSL) else DEFAULT_SMTP_TLS
+    cid = (str(_cfg(app, "email_oauth_client_id", "") or "").strip()
+           or PUBLIC_CLIENT_IDS.get(provider, ""))
+    cid_warn = ""
+    # Azure 的 client_id 必须是应用(客户端)ID（GUID）。填成任意字符串会在申请
+    # 设备码时才失败，且报错不指向该字段；这里提前拦下。
+    if provider == "outlook" and cid and not _GUID_LIKE.match(cid):
+        cid_warn = (f"「客户端 ID」不是有效的应用 ID（{cid}）——Azure 需 GUID 形态。"
+                    f"请**清空**该字段使用内置默认值，或填入自己在 Azure 注册的应用 ID。")
     return {
         "provider": provider,
         "tenant": tenant,
+        "tenant_warn": tenant_warn,
+        "client_id_warn": cid_warn,
         "authorize": pick(preset_str("authorize"), "email_oauth_authorize"),
         "token": pick(preset_str("token"), "email_oauth_token"),
         "devicecode": pick(preset_str("devicecode"), "email_oauth_devicecode"),
         "scope": pick(preset_str("scope"), "email_oauth_scope"),
         "flow": pick(preset.get("flow") or OAUTH_FLOW_DEVICE, "email_oauth_flow"),
-        "client_id": (str(_cfg(app, "email_oauth_client_id", "") or "").strip()
-                     or PUBLIC_CLIENT_IDS.get(provider, "")),
+        "client_id": cid,
         "client_secret": str(_cfg(app, "email_oauth_client_secret", "") or "").strip(),
         "refresh_token": str(_cfg(app, "email_oauth_refresh_token", "") or "").strip(),
         "redirect_uri": str(_cfg(app, "email_oauth_redirect_uri", "") or "").strip(),
@@ -504,6 +573,12 @@ def _access_token(app) -> Tuple[str, str]:
 
 def _oauth_device_start(conf: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     """device code 流程第一步：申请设备码，返回 user_code / verification_uri。"""
+    # 配置层面的可读提示（误填 tenant / client_id）：**先于网络请求**返回。
+    # 否则用户拿一句 Azure 天书（如 AADSTS900023）去猜是哪个字段错了。
+    for key in ("tenant_warn", "client_id_warn"):
+        warn = conf.get(key)
+        if warn:
+            return {}, str(warn)
     if not conf["devicecode"] or not conf["client_id"]:
         return {}, "device code 流程需要 devicecode 端点与 client_id"
     data = {"client_id": conf["client_id"]}
@@ -805,11 +880,28 @@ class EmailPlugin(ToolPlugin):
             if provider not in PUBLIC_CLIENT_IDS:
                 items.append({"key": "email_oauth_client_id", "type": "str",
                               "label": "客户端 ID",
-                              "hint": "该服务商未内置默认值，需填写 OAuth2 应用的 client_id"})
+                              "hint": "该服务商未内置默认值，需填写 OAuth2 应用的 client_id"
+                                      "（Azure 为 GUID 形态）"})
+            else:
+                # 有内置默认值时不暴露该字段：暴露了用户就会手填一个非 GUID 的
+                # 字符串（如应用名），申请设备码时才失败且报错不指向该字段。
+                # 只有用户此前**确实填过**（可能填错）才显示出来供其清空。
+                if str(own.get("email_oauth_client_id") or "").strip():
+                    items.append({"key": "email_oauth_client_id", "type": "str",
+                                  "label": "客户端 ID（覆盖内置默认值）",
+                                  "hint": "当前填的值不是有效的应用 ID 时会授权失败。"
+                                          "**建议清空本字段**以使用内置默认值。"})
             if provider == "outlook":
+                # 个人账号（Hotmail/Outlook/Live）**没有租户**，把它们暴露出来
+                # 只会诱导误填（用户会把邮箱填进去）→ Azure 报 AADSTS900023，
+                # 而那句报错完全不指向字段。这里只在「组织账号」才显示，
+                # 并在提示里明确写「不能填邮箱」。
                 items.append({"key": "email_oauth_tenant", "type": "str",
-                              "label": "租户（Outlook）", "default": DEFAULT_TENANT,
-                              "hint": "consumers＝个人账号，common＝个人+组织"})
+                              "label": "租户（仅组织账号）",
+                              "placeholder": "留空＝个人账号",
+                              "hint": "个人账号（Hotmail/Outlook/Live）**留空即可**。"
+                                      "组织账号填租户域名或租户 ID（如 contoso.onmicrosoft.com），"
+                                      "也可以填 common。注意：**这里不能填邮箱地址**。"})
             if custom:
                 items += [
                     {"key": "email_oauth_authorize", "type": "str", "label": "授权端点"},
