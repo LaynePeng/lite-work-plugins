@@ -186,15 +186,13 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
 DEFAULT_PROVIDER = "outlook"
 
 #: 公共客户端兜底：未注册 Azure 应用的用户零配置开箱即用。
-#: 取 Azure CLI 的公开客户端 ID（微软第一方应用、公共客户端、无需密钥，
-#: 个人账号可直接授权）。用户在服务商后台注册了自己的应用则填值覆盖。
+#: lite-work 在 Azure 注册的多租户公共客户端（All Microsoft account users），
+#: 个人账号可直接设备码授权。用户注册了自己的应用则填值覆盖。
 PUBLIC_CLIENT_IDS: Dict[str, str] = {
-    # Thunderbird 的公开客户端 ID：微软预授权它访问 Outlook 邮件资源
-    # （https://learn.microsoft.com/entra/identity-platform/scenario-desktop-client-assertion）。
-    # 刻意**不用** Azure CLI 的 04b07795…——那是微软第一方应用，个人用户在
-    # 同意页会得到 "users are not permitted to consent to first party
-    # applications"，授权永远走不完（真实踩坑）。
-    "outlook": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+    # 不要用微软第一方应用的 ID（如 Azure CLI 的 04b07795…）：个人用户会得到
+    # "users are not permitted to consent to first party applications"
+    # （invalid_request），授权永远走不完——真实踩坑。
+    "outlook": "bec6c4fa-626d-4382-860f-0e3e4900ffd1",
 }
 
 _HTTP_TIMEOUT = 30
