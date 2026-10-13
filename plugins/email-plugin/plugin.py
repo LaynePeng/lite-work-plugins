@@ -133,11 +133,10 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         "imap_host": "outlook.office365.com", "imap_port": 993,
     },
     "gmail": {
-        "authorize": "https://accounts.google.com/o/oauth2/v2/auth",
-        "token": "https://oauth2.googleapis.com/token",
-        "devicecode": "https://oauth2.googleapis.com/device/code",
-        "scope": "https://mail.google.com/",
-        "flow": "auth_code",
+        # Gmail 暂不支持 OAuth2（Google 对公共客户端限制严，且个人应用
+        # 需通过审核才能用敏感 scope）；basic 模式可用「应用专用密码」。
+        "authorize": "", "token": "", "devicecode": "", "scope": "",
+        "flow": "manual",
         "smtp_host": "smtp.gmail.com", "smtp_port": 465,
         "smtp_tls": SMTP_TLS_SSL,
         "imap_host": "imap.gmail.com", "imap_port": 993,
@@ -196,7 +195,6 @@ PUBLIC_CLIENT_IDS: Dict[str, str] = {
     # 同意页会得到 "users are not permitted to consent to first party
     # applications"，授权永远走不完（真实踩坑）。
     "outlook": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
-    "gmail": "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
 }
 
 _HTTP_TIMEOUT = 30
@@ -804,9 +802,13 @@ def _smtp_login(smtp, user: str, secret: str, auth_mode: str) -> None:
 
 
 def _imap_login(conn, user: str, secret: str, auth_mode: str) -> None:
-    """IMAP 登录：basic 走 LOGIN，oauth2 走 AUTHENTICATE XOAUTH2。"""
+    """IMAP 登录：basic 走 LOGIN，oauth2 走 AUTHENTICATE XOAUTH2。
+
+    XOAUTH2 回调返回 bytes：某些 Python 版本的 imaplib 对含非 ASCII 的
+    str 会走 ascii 编码路径（'ascii' codec can't encode 报错），bytes 直通。
+    """
     if auth_mode == AUTH_MODE_OAUTH2:
-        payload = _xoauth2(user, secret)
+        payload = _xoauth2(user, secret).encode("utf-8")
         conn.authenticate("XOAUTH2", lambda challenge=None: payload)
     else:
         conn.login(user, secret)
@@ -873,6 +875,7 @@ def _imap_fetch(app, mailbox: str, criteria: List[str],
     try:
         import email.parser as _ep
         with imaplib.IMAP4_SSL(host, port, timeout=30) as conn:
+            conn._encoding = "utf-8"   # 中文搜索条件（SUBJECT/FROM）不再撞 ascii
             _imap_login(conn, user, secret, mode)
             conn.select(mailbox or "INBOX")
             typ, data = conn.search(None, *criteria)
@@ -903,7 +906,8 @@ def _imap_fetch(app, mailbox: str, criteria: List[str],
             return [], f"IMAP 认证失败（{host}:{port}）：检查账号密码或 OAuth2 授权。"
         return [], f"IMAP 错误：{err}"
     except Exception as e:
-        return [], f"IMAP 连接失败（{host}:{port}）：{e}"
+        logger.warning("[email] IMAP 列表失败 %s:%s", host, port, exc_info=True)
+        return [], f"IMAP 连接失败（{host}:{port}）：{type(e).__name__}: {e}"
 
 
 def _imap_read(app, mailbox: str, uid: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -920,6 +924,7 @@ def _imap_read(app, mailbox: str, uid: str) -> Tuple[Optional[Dict[str, Any]], s
     try:
         from email.parser import BytesParser
         with imaplib.IMAP4_SSL(host, port, timeout=30) as conn:
+            conn._encoding = "utf-8"
             _imap_login(conn, user, secret, mode)
             conn.select(mailbox or "INBOX")
             typ, d = conn.uid("fetch", uid, "(BODY.PEEK[])")
@@ -966,7 +971,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.1.0"
+    version = "1.1.3"
     description = (
         "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
         "IMAP 收件箱列表 / 关键词搜索 / 读取单封。认证支持 basic（密码/应用密码）"
@@ -1534,15 +1539,25 @@ class EmailPlugin(ToolPlugin):
             raw_max = DEFAULT_LIST_ITEMS
         max_items = max(1, min(raw_max, MAX_LIST_ITEMS))
 
+        # IMAP SEARCH 对非 ASCII 条件（中文主题/发件人）兼容性差：CHARSET 与
+        # UTF-8 原样都会被微软服务器拒为 BAD Command Error。因此非 ASCII 的
+        # 主题/发件人条件不进 IMAP 搜索，改为拉取后在客户端本地过滤。
+        client_subj = ""
         criteria = ["ALL"]
         if args.get("unread"):
             criteria = ["UNSEEN"]
         frm = str(args.get("from") or "").strip()
         if frm:
-            criteria += ["FROM", f'"{frm}"']
+            if frm.isascii():
+                criteria += ["FROM", f'"{frm}"']
+            else:
+                client_subj = frm          # 非 ASCII 发件人：本地过滤兜底
         subj = str(args.get("subject") or "").strip()
         if subj:
-            criteria += ["SUBJECT", f'"{subj}"']
+            if subj.isascii():
+                criteria += ["SUBJECT", f'"{subj}"']
+            else:
+                client_subj = subj         # 中文主题：本地过滤
         try:
             if args.get("since"):
                 criteria += ["SINCE", _imap_date(str(args["since"]).strip())]
@@ -1551,11 +1566,17 @@ class EmailPlugin(ToolPlugin):
         except ValueError:
             return "[Error]: 日期格式应为 YYYY-MM-DD。"
 
-        items, err = await asyncio.to_thread(_imap_fetch, self._app, folder, criteria, max_items)
+        # 中文条件本地过滤时多拉一些，避免目标邮件被 max 截断
+        fetch_max = max_items * 5 if client_subj else max_items
+        items, err = await asyncio.to_thread(
+            _imap_fetch, self._app, folder, criteria, fetch_max)
         if err:
             return f"[Error]: {err}"
+        if client_subj:
+            items = [it for it in items if client_subj in it["subject"]][:max_items]
         if not items:
-            return f"[Email]: {folder} 中没有匹配的邮件（条件：{' '.join(criteria)}）。"
+            return f"[Email]: {folder} 中没有匹配的邮件（条件：{' '.join(criteria)}" \
+                   + (f" / 本地过滤:{client_subj}" if client_subj else "") + "）。"
         lines = [f"[Email]: {folder} 共找到 {len(items)} 封（最新在前，uid 供 email_read 使用）："]
         for it in items:
             lines.append(f"- uid={it['uid']} | {it['date']} | {it['from']} | {it['subject']}")
