@@ -475,6 +475,118 @@ def _resolve_attachment(app, rel: str) -> Optional[str]:
     return target if os.path.isfile(target) else None
 
 
+# ---------------------------------------------------------------- 草稿预览盒
+
+_BOX_FONT = ("font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;"
+             "font-size:14px;color:#1f2933;line-height:1.65")
+_BOX_TH = ("padding:6px 10px;background:#f3f5f8;border:1px solid #dde3ea;"
+           "text-align:left;font-weight:600;white-space:nowrap;width:76px;"
+           "vertical-align:top")
+_BOX_TD = "padding:6px 10px;border:1px solid #dde3ea;vertical-align:top"
+#: contenteditable 是**原生**能力，不依赖脚本。宿主渲染 HTML 围栏时可能禁用
+#: JavaScript，任何「点按钮自动回传」的交互都会静默失效——预览盒的正确姿势
+#: 是让用户就地改、再复制或口头说明，这条路径永远可用。
+_BOX_EDIT = ("contenteditable='true' spellcheck='false' "
+             "style='display:block;outline:none;min-height:18px;"
+             "border-bottom:1px dashed #b8c4d1'")
+
+
+def _preview_box(to: List[str], cc: List[str], bcc: List[str], subject: str,
+                 body: str, html_body: Optional[str],
+                 attached: List[Tuple[str, str]]) -> str:
+    """可修改的邮件草稿预览盒：一段自足 HTML，宿主聊天里直接渲染。
+
+    设计取舍（都是踩过的坑）：
+
+    * **纯文本区可编辑，HTML 区只读**：两份都做成可编辑，用户会分不清改的是
+      哪一份——收件人实际看到的是 HTML。HTML 只作「收件人视角」渲染。
+    * **一律转义**：主题/正文按文本插入，避免正文里的 `<` 打乱版式；只有
+      html_body 是**故意**原样渲染的（它就是预览对象本身）。
+    * **不承诺自动回传**：盒子里写清「改完告知我」，而不是放一个点了没反应的
+      按钮。
+    """
+    def esc(value: Any) -> str:
+        return _html.escape(str(value or ""), quote=False)
+
+    def row(label: str, value: str) -> str:
+        cell = esc(value) if str(value or "").strip() else \
+            "<span style='color:#c0392b;font-weight:600'>(未填写)</span>"
+        return (f"<tr><th style='{_BOX_TH}'>{esc(label)}</th>"
+                f"<td style='{_BOX_TD}'><span {_BOX_EDIT}>{cell}</span></td></tr>")
+
+    rows = row("收件人", ", ".join(to))
+    if cc:
+        rows += row("抄送", ", ".join(cc))
+    if bcc:
+        rows += row("密送", ", ".join(bcc))
+    rows += row("主题", subject)
+    if attached:
+        rows += (f"<tr><th style='{_BOX_TH}'>附件</th>"
+                 f"<td style='{_BOX_TD}'>{esc(', '.join(n for _, n in attached))}"
+                 f"</td></tr>")
+
+    plain = esc(body) if body else \
+        "<span style='color:#c0392b;font-weight:600'>(空)</span>"
+    html_block = ""
+    if html_body:
+        html_block = (
+            "<div style='margin:14px 0 4px;font-weight:600'>HTML 正文预览"
+            "<span style='font-weight:400;color:#7b8794'>"
+            "（收件人看到的效果，只读）</span></div>"
+            "<div style='border:1px dashed #dde3ea;border-radius:6px;"
+            f"padding:12px;background:#fff'>{html_body}</div>")
+
+    return (
+        f"<div style='{_BOX_FONT};max-width:760px;border:1px solid #cfd8e3;"
+        "border-radius:10px;overflow:hidden;background:#fff'>"
+        "<div style='padding:10px 14px;background:#0b5fa5;color:#fff;"
+        "font-weight:600'>📧 邮件草稿预览"
+        "<span style='float:right;background:#f39c12;color:#fff;"
+        "border-radius:10px;padding:1px 10px;font-size:12px'>未发送 · 可修改</span>"
+        "</div>"
+        "<div style='padding:12px 14px'>"
+        "<div style='color:#52606d;font-size:12px;margin-bottom:10px'>"
+        "虚线框内容可直接点进去修改；改完后告诉我改动（或复制回贴），"
+        "确认无误我再真正发送。</div>"
+        f"<table style='border-collapse:collapse;width:100%'>{rows}</table>"
+        "<div style='margin:14px 0 4px;font-weight:600'>纯文本正文"
+        "<span style='font-weight:400;color:#7b8794'>（可编辑）</span></div>"
+        "<div style='border:1px solid #dde3ea;border-radius:6px;padding:10px;"
+        "background:#fbfcfd;white-space:pre-wrap'>"
+        f"<span {_BOX_EDIT}>{plain}</span></div>"
+        f"{html_block}"
+        "</div>"
+        "<div style='padding:8px 14px;background:#f3f5f8;"
+        "border-top:1px solid #dde3ea;color:#7b8794;font-size:12px'>"
+        "dry_run 预览不会发出任何邮件</div>"
+        "</div>")
+
+
+def _dry_run_report(to: List[str], cc: List[str], bcc: List[str], subject: str,
+                    body: str, html_body: Optional[str],
+                    attached: List[Tuple[str, str]]) -> str:
+    """dry_run 的返回值：可读摘要 + 一段可直接渲染的预览盒。
+
+    刻意**不走审批卡、不连 SMTP**：让「确认内容」发生在对话里，由用户看清楚
+    并直接修改，而不是靠一张审批卡事后拦截。
+    """
+    lines = ["[Email Preview]: 草稿已组装，**尚未发送**（dry_run=true）。",
+             f"收件人：{', '.join(to)}"]
+    if cc:
+        lines.append(f"抄送：{', '.join(cc)}")
+    if bcc:
+        lines.append(f"密送：{', '.join(bcc)}")
+    lines.append(f"主题：{subject}")
+    lines.append("附件：" + (", ".join(n for _, n in attached) if attached else "(无)"))
+    lines += ["",
+              "```html",
+              _preview_box(to, cc, bcc, subject, body, html_body, attached),
+              "```",
+              "",
+              "确认或修改后，去掉 dry_run 再调 email_send 即真正发出。"]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- OAuth2 通用实现
 
 _oauth_lock = threading.Lock()
@@ -769,6 +881,20 @@ def _resolve_auth_mode(own: Dict[str, Any]) -> str:
     return DEFAULT_AUTH_MODE
 
 
+def _account_hint(user: str) -> str:
+    """邮箱账号必须是完整地址；不是则给**指向字段**的提示。
+
+    真实故障：用户把「发件人显示名」（如 Layne Peng）填进了「邮箱账号」，
+    SMTP/IMAP 登录双双失败，而服务器只回一句 Login failed——完全不指向字段，
+    排查只能靠猜。这里提前拦下并说清该填哪里。
+    """
+    if "@" in user:
+        return ""
+    return (f"邮箱账号不是有效的邮箱地址（当前值：{user}）。"
+            "请填完整地址（如 someone@outlook.com）；显示名请填到"
+            "「发件人地址」字段（可写 姓名 <邮箱>）。")
+
+
 def _auth_material(app) -> Tuple[str, str, str, str]:
     """统一取认证材料：(用户, 密钥, 模式, 错误)。
 
@@ -778,6 +904,9 @@ def _auth_material(app) -> Tuple[str, str, str, str]:
     user = str(_cfg(app, "email_user", "") or "").strip()
     if not user:
         return "", "", "", "邮箱账号未配置：请在设置页 → 插件 → email-plugin 填写。"
+    bad = _account_hint(user)
+    if bad:
+        return "", "", "", bad
     mode = _resolve_auth_mode(own)
     if mode == AUTH_MODE_OAUTH2:
         token, err = _access_token(app)
@@ -876,7 +1005,12 @@ def _imap_fetch(app, mailbox: str, criteria: List[str],
             conn._encoding = "utf-8"   # 中文搜索条件（SUBJECT/FROM）不再撞 ascii
             _imap_login(conn, user, secret, mode)
             conn.select(mailbox or "INBOX")
-            typ, data = conn.search(None, *criteria)
+            # 必须是 UID SEARCH：SEARCH 返回的是**序列号**（1..EXISTS，随删信漂移），
+            # 而下面取信走的是 UID FETCH。Exchange/Outlook 上两者完全不同（本账号
+            # EXISTS=18634 而 UID 已到 101716），拿序列号当 UID 会收到
+            # "OK FETCH completed" 却**不带任何数据**，表现为列表恒为空、且把
+            # "uid" 传给 email_read 也读不到。
+            typ, data = conn.uid("search", None, *criteria)
             if typ != "OK":
                 return [], f"IMAP 搜索失败：{data}"
             uids = (data[0] or b"").decode().split() or []
@@ -969,7 +1103,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.1.5"
+    version = "1.2.0"
     description = (
         "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
         "IMAP 收件箱列表 / 关键词搜索 / 读取单封。认证支持 basic（密码/应用密码）"
@@ -1113,9 +1247,12 @@ class EmailPlugin(ToolPlugin):
             ToolDefinition(
                 name="email_send",
                 description=(
-                    "发送电子邮件。发送前会弹出审批卡需用户确认；账号在设置页 → "
-                    "插件 → email-plugin 配置（默认 Hotmail/Outlook）。支持纯文本与 "
-                    "HTML 排版正文（html 由你生成）、附件（限工作区内文件路径）。"
+                    "发送电子邮件。**推荐先 dry_run=true 预览**：会把收件人/主题/"
+                    "正文组装成一张可直接编辑的草稿预览盒返回给用户确认（不发送、"
+                    "不弹审批卡），确认或改好后再去掉 dry_run 真正发送；正式发送时"
+                    "仍会弹出审批卡。账号在设置页 → 插件 → email-plugin 配置"
+                    "（默认 Hotmail/Outlook）。支持纯文本与 HTML 排版正文"
+                    "（html 由你生成）、附件（限工作区内文件路径）。"
                 ),
                 parameters={
                     "type": "object",
@@ -1127,6 +1264,7 @@ class EmailPlugin(ToolPlugin):
                         "body": {"type": "string", "description": "纯文本正文（必填；提供 html 时可同为降级）"},
                         "html": {"type": "string", "description": "HTML 排版正文（可选，客户端优先展示）"},
                         "attachments": {"type": "array", "description": "附件文件名列表（工作区内路径）", "items": {"type": "string"}},
+                        "dry_run": {"type": "boolean", "description": "true＝只返回可修改的草稿预览盒供用户确认，不发送（推荐在正式发送前先预览一次）"},
                     },
                     "required": ["to", "subject", "body"],
                 },
@@ -1455,10 +1593,9 @@ class EmailPlugin(ToolPlugin):
     async def _send(self, args: Dict[str, Any]) -> str:
         from litework.tools.todos import current_session_id
 
-        user, secret, mode, err = _auth_material(self._app)
-        if err:
-            return f"[Error]: {err}"
-
+        # 先做**纯本地**校验（收件人/主题/正文/附件），再取认证材料：oauth2 取
+        # 材料会顺带刷新 access_token（网络请求），字段都没填对时不该先跑一趟
+        # 网络，更不该让「收件人为空」这类输入错误被认证错误盖掉。
         to = _to_list(args.get("to"))
         cc = _to_list(args.get("cc"))
         bcc = _to_list(args.get("bcc"))
@@ -1479,6 +1616,15 @@ class EmailPlugin(ToolPlugin):
             if p is None:
                 return f"[Error]: 附件路径非法或不在工作区内：{rel}"
             attached.append((p, os.path.basename(p)))
+
+        if args.get("dry_run"):
+            # 只预览：不弹审批卡、不连 SMTP、不需要认证材料。内容确认发生在
+            # 对话里（用户能直接改），而不是靠审批卡事后拦截。
+            return _dry_run_report(to, cc, bcc, subject, body, html_body, attached)
+
+        user, secret, mode, err = _auth_material(self._app)
+        if err:
+            return f"[Error]: {err}"
 
         # ---------- 审批（发送前必过；email_require_approval 默认开启） ----------
         gate = getattr(self._app, "approval_gate", None)
