@@ -127,6 +127,14 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
 
 DEFAULT_PROVIDER = "outlook"
 
+#: 公共客户端兜底：未注册 Azure 应用的用户零配置开箱即用。
+#: 取 Azure CLI 的公开客户端 ID（微软第一方应用、公共客户端、无需密钥，
+#: 个人账号可直接授权）。用户在服务商后台注册了自己的应用则填值覆盖。
+PUBLIC_CLIENT_IDS: Dict[str, str] = {
+    "outlook": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+    "gmail": "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
+}
+
 _HTTP_TIMEOUT = 30
 _TOKEN_EXPIRY_SKEW = 120
 
@@ -184,6 +192,41 @@ def _own_cfg(app) -> Dict[str, Any]:
     cfg = getattr(app, "config", None) or {}
     own = cfg.get("email-plugin") if isinstance(cfg, dict) else None
     return own if isinstance(own, dict) else {}
+
+
+class _SimpleApp:
+    """把 config dict 包成 _cfg/_oauth_conf 需要的最小 app 形状。
+
+    settings_action 路径拿不到宿主 app（本地插件实例不被 install），令牌
+    落盘走磁盘直写：读 config_dir/config.json → 合并本插件命名空间 →
+    原子替换写回（0600）。与宿主 save_config 的合并语义一致。
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config if isinstance(config, dict) else {}
+
+    def save_config(self, updates: Dict[str, Any]) -> None:
+        path = os.path.join(_config_dir(), "config.json")
+        data: Dict[str, Any] = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            data = loaded if isinstance(loaded, dict) else {}
+        except Exception:  # noqa: BLE001
+            pass
+        for k, v in (updates or {}).items():
+            if v is None:
+                continue
+            if isinstance(v, dict) and isinstance(data.get(k), dict):
+                data[k] = {**data[k], **v}     # 命名空间浅合并，保住兄弟键
+            else:
+                data[k] = v
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        self.config.update({k: v for k, v in (updates or {}).items() if v is not None})
 
 
 def _read_disk_cfg() -> Dict[str, Any]:
@@ -329,7 +372,8 @@ def _oauth_conf(app) -> Dict[str, Any]:
         "devicecode": pick(preset_str("devicecode"), "email_oauth_devicecode"),
         "scope": pick(preset_str("scope"), "email_oauth_scope"),
         "flow": pick(preset.get("flow") or OAUTH_FLOW_DEVICE, "email_oauth_flow"),
-        "client_id": str(_cfg(app, "email_oauth_client_id", "") or "").strip(),
+        "client_id": (str(_cfg(app, "email_oauth_client_id", "") or "").strip()
+                     or PUBLIC_CLIENT_IDS.get(provider, "")),
         "client_secret": str(_cfg(app, "email_oauth_client_secret", "") or "").strip(),
         "refresh_token": str(_cfg(app, "email_oauth_refresh_token", "") or "").strip(),
         "redirect_uri": str(_cfg(app, "email_oauth_redirect_uri", "") or "").strip(),
@@ -753,9 +797,15 @@ class EmailPlugin(ToolPlugin):
         ]
 
         if mode == AUTH_MODE_OAUTH2:
-            items.append({"key": "email_oauth_client_id", "type": "str",
-                          "label": "客户端 ID",
-                          "hint": "服务商后台注册应用后获得；填好后运行 email_oauth_login 授权"})
+            own_rt = bool(str(own.get("email_oauth_refresh_token") or "").strip())
+            items.append({"key": "email_oauth_authorize", "type": "action",
+                          "label": "立即授权" if not own_rt else "重新授权",
+                          "hint": "点击后自动打开浏览器完成登录授权；一次授权长期有效"
+                                  "（仅主动撤销或改密码才需重新授权）"})
+            if provider not in PUBLIC_CLIENT_IDS:
+                items.append({"key": "email_oauth_client_id", "type": "str",
+                              "label": "客户端 ID",
+                              "hint": "该服务商未内置默认值，需填写 OAuth2 应用的 client_id"})
             if provider == "outlook":
                 items.append({"key": "email_oauth_tenant", "type": "str",
                               "label": "租户（Outlook）", "default": DEFAULT_TENANT,
@@ -809,11 +859,18 @@ class EmailPlugin(ToolPlugin):
                     "reason": "邮箱账号未配置（设置页 → 插件 → email-plugin）"}
         mode = _resolve_auth_mode(own)
         if mode == AUTH_MODE_OAUTH2:
+            provider = str(own.get("email_oauth_provider") or DEFAULT_PROVIDER).strip().lower()
+            if provider in PUBLIC_CLIENT_IDS:
+                if not str(own.get("email_oauth_refresh_token") or "").strip():
+                    return {"state": "not_started",
+                            "reason": "尚未授权（打开右侧「邮件授权」面板点击链接完成授权）"}
+                return {"state": "running"}
             if not str(own.get("email_oauth_client_id") or "").strip():
-                return {"state": "not_started", "reason": "OAuth2 客户端 ID 未配置"}
+                return {"state": "not_started",
+                        "reason": "该服务商未内置客户端 ID，请在设置页填写 client_id"}
             if not str(own.get("email_oauth_refresh_token") or "").strip():
                 return {"state": "not_started",
-                        "reason": "尚未授权（运行 email_oauth_login 完成一次授权）"}
+                        "reason": "尚未授权（打开右侧「邮件授权」面板点击链接完成授权）"}
             return {"state": "running"}
         if not str(own.get("email_password") or "").strip():
             return {"state": "not_started", "reason": "basic 模式未填密码 / 应用密码"}
@@ -922,6 +979,78 @@ class EmailPlugin(ToolPlugin):
         return f"[Error]: 未知工具 {name}"
 
     # ------------------------------------------------------------ OAuth2 授权
+
+    #: 设置页 action 按钮的最近一次结果（前端 5s 内重复点击提示进行中）
+    _ACTION_STATE: Dict[str, Any] = {}
+
+    def settings_action(self, key: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """设置页「立即授权」按钮：弹浏览器 + 后台轮询存令牌。
+
+        同步快返回（HTTP 不挂起）：第一次点击申请设备码、打开浏览器、
+        启动后台轮询线程并返回指引；用户在浏览器同意后轮询线程自动
+        保存令牌。再次点击时若授权已完成则报成功，未完成则报等待中。
+        """
+        if key != "email_oauth_authorize":
+            return {"ok": False, "message": f"未知动作 {key}"}
+
+        own = (config or {}).get(self.name) if isinstance(config, dict) else {}
+        own = own if isinstance(own, dict) else {}
+        if _resolve_auth_mode(own) != AUTH_MODE_OAUTH2:
+            return {"ok": False, "message": "请先把「认证方式」设为 oauth2 并保存"}
+        user = str(own.get("email_user") or "").strip()
+        if not user:
+            return {"ok": False, "message": "请先填写「邮箱账号」并保存"}
+
+        state = self._ACTION_STATE.get("auth") or {}
+        if state.get("running"):
+            return {"ok": True,
+                    "message": "授权进行中——请在弹出的浏览器页面登录并点「同意」，完成后这里会自动更新（也可再点一次查询进度）"}
+
+        # 上一次轮询已拿到令牌 → 直接报成功
+        if state.get("done"):
+            return {"ok": True, "message": "✅ 授权成功，可以发信了（长期有效）"}
+
+        action_app = _SimpleApp(config)   # 可写盘的 app 替身（self._app 在此路径为 None）
+        conf = _oauth_conf(action_app)
+        payload, err = _oauth_device_start(conf)
+        if err:
+            return {"ok": False, "message": f"发起授权失败：{err}"}
+        verify = str(payload.get("verification_uri") or "")
+        user_code = str(payload.get("user_code") or "")
+        _open_browser(verify)
+
+        # 后台轮询：用户在浏览器点同意后自动存令牌（最长等 15 分钟）
+        def _poll():
+            dc = str(payload.get("device_code") or "")
+            deadline = time.time() + min(float(payload.get("expires_in") or 900), 900)
+            interval = max(int(payload.get("interval") or 5), 3)
+            while time.time() < deadline:
+                p, e, st = _oauth_device_poll(conf, dc)
+                if st == "done":
+                    rt = str((p or {}).get("refresh_token") or "")
+                    if rt and _persist_refresh_token(action_app, rt):
+                        with _oauth_lock:
+                            _token_cache.update({"key": "", "access": "", "exp": 0.0})
+                        self._ACTION_STATE["auth"] = {"running": False, "done": True}
+                        logger.info("[email] 设置页按钮授权成功")
+                    else:
+                        self._ACTION_STATE["auth"] = {"running": False, "done": False,
+                                                     "error": "令牌保存失败"}
+                    return
+                if st == "error":
+                    self._ACTION_STATE["auth"] = {"running": False, "done": False,
+                                                 "error": e}
+                    return
+                time.sleep(interval)
+            self._ACTION_STATE["auth"] = {"running": False, "done": False,
+                                          "error": "设备码已过期，请重新点击「立即授权」"}
+
+        self._ACTION_STATE["auth"] = {"running": True}
+        threading.Thread(target=_poll, daemon=True,
+                         name="email-oauth-action").start()
+        return {"ok": True,
+                "message": f"已打开浏览器（若未弹出请访问 {verify}），"
+                           f"登录后输入代码 {user_code} 并点「同意」。完成后再次点击此按钮确认结果"}
 
     def _save_token(self, payload: Dict[str, Any]) -> str:
         """保存 refresh_token 到配置，并清空 access_token 缓存。"""

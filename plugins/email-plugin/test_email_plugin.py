@@ -167,8 +167,9 @@ class PluginUiProtocolTest(EmailPluginBase):
         settings = self.plugin.contributes["settings"]
         keys = {s["key"] for s in settings}
         self.assertIn("email_user", keys)
-        # 默认 oauth2：显示客户端 ID，不出现 basic 的密码字段
-        self.assertIn("email_oauth_client_id", keys)
+        # 默认 oauth2：显示授权按钮，不出现 basic 的密码字段与 client_id
+        self.assertIn("email_oauth_authorize", keys)
+        self.assertNotIn("email_oauth_client_id", keys)
         self.assertNotIn("email_password", keys)
         # 审批开关默认开启
         approval = next(s for s in settings if s["key"] == "email_require_approval")
@@ -460,8 +461,31 @@ class ProviderServerParamsTest(EmailPluginBase):
 
 
 class OauthLoginToolTest(EmailPluginBase):
-    def test_login_without_client_id_reports_actionable_error(self):
-        self.plugin._app = _App(config={"email-plugin": {"email_user": "u@x.com"}})
+    def test_login_with_builtin_client_id_starts_flow(self):
+        """内置 client_id：无需配置即可发起授权（设备码流程，stub 网络）。"""
+        self.plugin._app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "outlook"}})
+        orig_start = emailplugin._oauth_device_start
+        orig_open = emailplugin._open_browser
+        emailplugin._oauth_device_start = lambda conf: (
+            {"device_code": "DC", "user_code": "UC", "expires_in": 900,
+             "verification_uri": "https://microsoft.com/link"}, "")
+        emailplugin._open_browser = lambda url: True
+        emailplugin._device_cache.clear()
+        try:
+            out = asyncio.run(self.plugin._oauth_login({}))
+        finally:
+            emailplugin._oauth_device_start = orig_start
+            emailplugin._open_browser = orig_open
+            emailplugin._device_cache.clear()
+        self.assertIn("已自动为你打开", out)
+        self.assertIn("UC", out)
+
+    def test_custom_provider_without_client_id_reports_actionable(self):
+        self.plugin._app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "custom"}})
         out = asyncio.run(self.plugin._oauth_login({}))
         self.assertIn("client_id", out)
 
@@ -818,11 +842,12 @@ class SettingsSchemaTest(EmailPluginBase):
         spec = next(s for s in settings if s["key"] == "email_oauth_client_secret")
         self.assertTrue(spec.get("secret") or spec.get("type") == "secret")
 
-    def test_status_oauth2_needs_client_id_then_token(self):
+    def test_status_oauth2_unauthorized_then_running(self):
         st = self.plugin.status_from_config(
-            {"email-plugin": {"email_user": "u@x.com", "email_auth": "oauth2"}})
+            {"email-plugin": {"email_user": "u@x.com", "email_auth": "oauth2",
+                              "email_oauth_provider": "outlook"}})
         self.assertEqual(st["state"], "not_started")
-        self.assertIn("客户端 ID", st["reason"])
+        self.assertIn("授权", st["reason"])
         st = self.plugin.status_from_config({"email-plugin": {
             "email_user": "u@x.com", "email_auth": "oauth2",
             "email_oauth_client_id": "cid"}})
@@ -848,7 +873,8 @@ class DynamicSchemaTest(EmailPluginBase):
     def test_oauth2_hides_password_field(self):
         keys = self._keys({"email_auth": "oauth2", "email_oauth_provider": "outlook"})
         self.assertNotIn("email_password", keys)
-        self.assertIn("email_oauth_client_id", keys)
+        self.assertIn("email_oauth_authorize", keys)      # 授权按钮在
+        self.assertNotIn("email_oauth_client_id", keys)   # client_id 已内置，不再显示
 
     def test_basic_hides_oauth_endpoints(self):
         keys = self._keys({"email_auth": "basic"})
@@ -859,7 +885,7 @@ class DynamicSchemaTest(EmailPluginBase):
     def test_preset_provider_hides_manual_endpoints(self):
         """预设服务商已带出端点，不该再让用户手填。"""
         keys = self._keys({"email_auth": "oauth2", "email_oauth_provider": "outlook"})
-        for k in ("email_oauth_token", "email_oauth_devicecode", "email_oauth_authorize"):
+        for k in ("email_oauth_token", "email_oauth_devicecode", "email_oauth_scope"):
             self.assertNotIn(k, keys)
 
     def test_custom_provider_shows_endpoints(self):
@@ -1020,3 +1046,120 @@ class GeneralizationGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SettingsActionTest(EmailPluginBase):
+    """设置页「立即授权」按钮：同步发起 + 后台轮询 + 磁盘落令牌。"""
+
+    def setUp(self):
+        super().setUp()
+        self.plugin._ACTION_STATE.clear()
+
+    def tearDown(self):
+        self.plugin._ACTION_STATE.clear()
+
+    def _cfg(self, extra=None):
+        return {"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "outlook", **(extra or {})}}
+
+    def test_rejects_unknown_action_key(self):
+        out = self.plugin.settings_action("whatever", self._cfg())
+        self.assertFalse(out["ok"])
+
+    def test_rejects_basic_mode(self):
+        out = self.plugin.settings_action(
+            "email_oauth_authorize", {"email-plugin": {
+                "email_user": "u@x.com", "email_auth": "basic"}})
+        self.assertFalse(out["ok"])
+        self.assertIn("oauth2", out["message"])
+
+    def test_rejects_missing_user(self):
+        out = self.plugin.settings_action(
+            "email_oauth_authorize", {"email-plugin": {
+                "email_auth": "oauth2", "email_oauth_provider": "outlook"}})
+        self.assertFalse(out["ok"])
+        self.assertIn("邮箱账号", out["message"])
+
+    def test_start_opens_browser_and_returns_code(self):
+        opened = []
+        orig_start, orig_open = emailplugin._oauth_device_start, emailplugin._open_browser
+        emailplugin._oauth_device_start = lambda conf: (
+            {"device_code": "DC", "user_code": "CODE99", "expires_in": 900,
+             "interval": 1, "verification_uri": "https://microsoft.com/link"}, "")
+        emailplugin._open_browser = lambda url: opened.append(url) or True
+        try:
+            out = self.plugin.settings_action("email_oauth_authorize", self._cfg())
+        finally:
+            emailplugin._oauth_device_start = orig_start
+            emailplugin._open_browser = orig_open
+            self.plugin._ACTION_STATE.clear()
+        self.assertTrue(out["ok"])
+        self.assertEqual(opened, ["https://microsoft.com/link"])
+        self.assertIn("CODE99", out["message"])
+
+    def test_running_state_shows_progress_message(self):
+        self.plugin._ACTION_STATE["auth"] = {"running": True}
+        out = self.plugin.settings_action("email_oauth_authorize", self._cfg())
+        self.assertTrue(out["ok"])
+        self.assertIn("进行中", out["message"])
+
+    def test_done_state_reports_success(self):
+        self.plugin._ACTION_STATE["auth"] = {"running": False, "done": True}
+        out = self.plugin.settings_action("email_oauth_authorize", self._cfg())
+        self.assertTrue(out["ok"])
+        self.assertIn("授权成功", out["message"])
+
+    def test_poll_saves_token_to_disk(self):
+        """后台轮询拿到令牌 → 磁盘写回 + 状态翻转（端到端，stub 网络）。"""
+        import json as _json
+        ws = tempfile.mkdtemp(prefix="lw-act-")
+        cfg_dir = os.path.join(ws, "cfg")
+        os.makedirs(os.path.join(cfg_dir, "plugins", "email-plugin"), exist_ok=True)
+        cfg_path = os.path.join(cfg_dir, "config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            _json.dump({"email-plugin": {"email_user": "u@x.com", "email_auth": "oauth2"},
+                        "other-plugin": {"keep": 1}}, f)
+
+        orig_dir = emailplugin._config_dir
+        orig_start = emailplugin._oauth_device_start
+        orig_poll = emailplugin._oauth_device_poll
+        orig_open = emailplugin._open_browser
+        emailplugin._config_dir = lambda: cfg_dir
+        emailplugin._oauth_device_start = lambda conf: (
+            {"device_code": "DC", "user_code": "UC", "expires_in": 300,
+             "interval": 1, "verification_uri": "https://x"}, "")
+        emailplugin._oauth_device_poll = lambda conf, dc: (
+            {"access_token": "AT", "refresh_token": "RT-DISK"}, "", "done")
+        emailplugin._open_browser = lambda url: True
+        emailplugin._DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
+        try:
+            out = self.plugin.settings_action("email_oauth_authorize",
+                                              _json.load(open(cfg_path)))
+            # 等后台线程完成（轮询立即 done）
+            for _ in range(50):
+                if self.plugin._ACTION_STATE.get("auth", {}).get("done"):
+                    break
+                time.sleep(0.05)
+            with open(cfg_path, encoding="utf-8") as f:
+                saved = _json.load(f)
+            done_state = bool(self.plugin._ACTION_STATE.get("auth", {}).get("done"))
+        finally:
+            emailplugin._config_dir = orig_dir
+            emailplugin._oauth_device_start = orig_start
+            emailplugin._oauth_device_poll = orig_poll
+            emailplugin._open_browser = orig_open
+            emailplugin._DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
+            shutil.rmtree(ws, ignore_errors=True)
+            self.plugin._ACTION_STATE.clear()
+        self.assertTrue(out["ok"])
+        self.assertTrue(done_state, "后台轮询应完成并翻转状态")
+        self.assertEqual(saved["email-plugin"]["email_oauth_refresh_token"], "RT-DISK")
+        self.assertEqual(saved["other-plugin"], {"keep": 1}, "兄弟插件配置不得被抹掉")
+
+    def test_builtin_client_id_used_for_outlook(self):
+        """outlook 内置 client_id：不填也能解析到公共客户端 ID。"""
+        app = _App(config=self._cfg())
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["client_id"],
+                         emailplugin.PUBLIC_CLIENT_IDS["outlook"])
