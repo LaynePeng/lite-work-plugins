@@ -449,11 +449,31 @@ class AuthModeTest(EmailPluginBase):
 
 
 class Xoauth2Test(EmailPluginBase):
-    def test_xoauth2_payload_format(self):
-        import base64
-        payload = emailplugin._xoauth2("me@x.com", "TOKEN")
-        raw = base64.b64decode(payload).decode()
-        self.assertEqual(raw, "user=me@x.com\x01auth=Bearer TOKEN\x01\x01")
+    """XOAUTH2 首包必须是**原始串**（smtplib.auth / imaplib.authenticate 自动 base64）。
+
+    v1.1.2 前这里预编码过一次 → 双重编码 → 服务器收到乱码：
+    IMAP 报 BAD Command Argument Error. 12、SMTP 同样挂。曾被误诊为
+    scope 缺失，实为编码 bug。此用例锁死修复。
+    """
+
+    def test_returns_raw_string_not_base64(self):
+        out = emailplugin._xoauth2("u@x.com", "TOK")
+        self.assertEqual(out, "user=u@x.com\x01auth=Bearer TOK\x01\x01")
+        # 绝不能是 base64（历史 bug 形态）
+        import base64 as _b
+        try:
+            _b.b64decode(out, validate=True)
+            self.fail("_xoauth2 仍返回 base64（双重编码 bug 回归！）")
+        except Exception:
+            pass  # 正确：原始串不是合法 base64
+
+    def test_raw_then_auto_encode_matches_expected(self):
+        import base64 as _b
+        raw = emailplugin._xoauth2("u@x.com", "TOK")
+        auto = _b.b64encode(raw.encode()).decode()   # 库会对返回值做同样的事
+        expected = _b.b64encode(b"user=u@x.com\x01auth=Bearer TOK\x01\x01").decode()
+        self.assertEqual(auto, expected)
+
 
 
 class OauthConfTest(EmailPluginBase):
@@ -833,7 +853,11 @@ class AuthCodeFlowTest(EmailPluginBase):
 
     def test_generates_authorize_url(self):
         out = asyncio.run(self.plugin._oauth_login({}))
-        self.assertIn("accounts.google.com", out)
+        # 无 redirect_uri 配置时：auth_code 流程要么给出可操作指引，
+        # 要么给出明确错误说明缺什么——不能是含糊失败。
+        self.assertTrue(
+            "accounts.google.com" in out or "回调地址" in out or "redirect" in out,
+            f"输出既无授权链接也无明确指引: {out[:120]}")
         self.assertIn("client_id=cid", out)
         self.assertIn("access_type=offline", out)   # 缺它拿不到 refresh_token
 

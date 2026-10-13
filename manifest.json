@@ -269,8 +269,8 @@
     },
     {
       "name": "email-plugin",
-      "version": "1.1.1",
-      "description": "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户审批确认）＋ IMAP 收件箱列表/关键词搜索/读取单封。认证支持 basic（密码/应用密码）与 oauth2（SASL XOAUTH2 通用实现）；预设 Outlook/Gmail/Fastmail/Zoho/QQ/163 并自动带出服务器参数，亦可自定义端点适配任意标准服务；v1.1.1 修复 OAuth 配置误填无提示：租户字段说明改为「仅组织账号、不能填邮箱」，个人账号留空即用 consumers；误填邮箱/网址时自动纠正并给出可读提示；Azure 错误码（AADSTS900023/700016 等）翻译成「该改哪个字段」；客户端 ID 非 GUID 时提前拦下。",
+      "version": "1.1.2",
+      "description": "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户审批确认）＋ IMAP 收件箱列表/关键词搜索/读取单封。认证支持 basic（密码/应用密码）与 oauth2（SASL XOAUTH2 通用实现）；预设 Outlook/Gmail/Fastmail/Zoho/QQ/163 并自动带出服务器参数，亦可自定义端点适配任意标准服务；v1.1.2 修复 SASL XOAUTH2 双重编码（真因）：_xoauth2 预编码后 smtplib.auth/imaplib.authenticate 再编码一次，服务器收到乱码，IMAP 报 BAD Command Argument Error.12（此前被误诊为 scope 缺失）；撤销 v1.1.1 引入的授权码+loopback 默认（MSA 对 Thunderbird ID 的 loopback redirect 报 unauthorized_client），outlook 回到验证可用的设备码流程；授权按钮 增加 SMTP/IMAP 连通性自检（主机从预设取，不硬编码）。",
       "path": "plugins/email-plugin",
       "tools": [
         "email_send",

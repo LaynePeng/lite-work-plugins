@@ -190,11 +190,99 @@ DEFAULT_PROVIDER = "outlook"
 #: 取 Azure CLI 的公开客户端 ID（微软第一方应用、公共客户端、无需密钥，
 #: 个人账号可直接授权）。用户在服务商后台注册了自己的应用则填值覆盖。
 PUBLIC_CLIENT_IDS: Dict[str, str] = {
-    "outlook": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+    # Thunderbird 的公开客户端 ID：微软预授权它访问 Outlook 邮件资源
+    # （https://learn.microsoft.com/entra/identity-platform/scenario-desktop-client-assertion）。
+    # 刻意**不用** Azure CLI 的 04b07795…——那是微软第一方应用，个人用户在
+    # 同意页会得到 "users are not permitted to consent to first party
+    # applications"，授权永远走不完（真实踩坑）。
+    "outlook": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
     "gmail": "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
 }
 
 _HTTP_TIMEOUT = 30
+
+#: loopback 回调端口池（RFC 8252 建议：请求临时端口，失败递增）。
+#: 固定起点让「授权页注册的 redirect」与「本地监听」可预期一致。
+_LOOPBACK_PORT_BASE = 8400
+_LOOPBACK_PORT_RANGE = 20
+
+
+def _loopback_port() -> int:
+    """取一个可用的 loopback 端口（授权码流程的本地回调监听用）。
+
+    固定顺序尝试 8400..8419：同一台机器重复授权时端口稳定，用户在
+    服务商后台注册自定义应用时也好填。全被占用则退回 0（系统随机）——
+    此时 redirect_uri 需用户显式配置（custom 场景本来就要求手填）。
+    """
+    import socket
+    for port in range(_LOOPBACK_PORT_BASE, _LOOPBACK_PORT_BASE + _LOOPBACK_PORT_RANGE):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    return 0
+
+
+_LOOPBACK_LAST: Dict[str, Any] = {}
+
+
+def _loopback_result() -> Dict[str, Any]:
+    """读最近一次 loopback 回调捕获的参数（授权码流程轮询用）。"""
+    return dict(_LOOPBACK_LAST)
+
+
+def _loopback_stop(server) -> None:
+    """停掉 loopback 服务（授权完成/超时后）。"""
+    try:
+        server.shutdown()
+        server.server_close()
+    except Exception:
+        pass
+
+
+def _loopback_server() -> Tuple[Any, str]:
+    """起一个一次性 HTTP 服务收授权码（授权码流程）。
+
+    返回 (server, redirect_uri)。server 由调用方在后台线程 serve，
+    收到 ?code= 后停机。超时（5 分钟）由调用方负责关停。
+    """
+    import http.server
+    import threading
+
+    result: Dict[str, Any] = {"code": "", "state": ""}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server 约定
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            result["code"] = (qs.get("code") or [""])[0]
+            result["state"] = (qs.get("state") or [""])[0]
+            err = (qs.get("error") or [""])[0]
+            if err:
+                result["error"] = err
+            _LOOPBACK_LAST.clear()
+            _LOOPBACK_LAST.update(result)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            ok_msg = "授权成功" if result["code"] else (f"授权失败：{err}" if err else "等待中…")
+            self.wfile.write(
+                f"<html><body style=\"font-family:sans-serif;text-align:center;padding-top:60px\">"
+                f"<h2>lite-work 邮件授权</h2><p>{ok_msg}</p>"
+                f"<p>此页面可以关闭，回到 lite-work 继续。</p></body></html>".encode("utf-8"))
+
+        def log_message(self, *a):  # 静默访问日志
+            pass
+
+    port = _loopback_port()
+    if port == 0:
+        return None, ""
+    srv = http.server.HTTPServer(("127.0.0.1", port), _Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv, f"http://127.0.0.1:{port}/"
 _TOKEN_EXPIRY_SKEW = 120
 
 
@@ -496,9 +584,14 @@ def _post_form(url: str, data: Dict[str, str]) -> Tuple[Optional[Dict[str, Any]]
 
 
 def _xoauth2(user: str, token: str) -> str:
-    """SASL XOAUTH2 首包：base64("user=" + user + ^A + "auth=Bearer " + token + ^A^A)。"""
-    return base64.b64encode(
-        f"user={user}\x01auth=Bearer {token}\x01\x01".encode("utf-8")).decode("ascii")
+    """SASL XOAUTH2 首包（**原始串**，不做 base64）。
+
+    smtplib.auth() 与 imaplib.authenticate() 都会对回调返回值自动 base64，
+    这里必须给原始串；历史上这里先编码过一次导致双重编码——服务器收到乱码，
+    IMAP 报 BAD Command Argument Error. 12、SMTP 同样会挂（曾被误诊为 scope
+    缺失，实为编码 bug，v1.1.2 修复）。
+    """
+    return f"user={user}\x01auth=Bearer {token}\x01\x01"
 
 
 def _open_browser(url: str) -> bool:
@@ -1076,11 +1169,13 @@ class EmailPlugin(ToolPlugin):
     _ACTION_STATE: Dict[str, Any] = {}
 
     def settings_action(self, key: str, config: Dict[str, Any]) -> Dict[str, Any]:
-        """设置页「立即授权」按钮：弹浏览器 + 后台轮询存令牌。
+        """设置页「立即授权」按钮：设备码流程（弹浏览器 + 后台轮询存令牌）。
 
-        同步快返回（HTTP 不挂起）：第一次点击申请设备码、打开浏览器、
-        启动后台轮询线程并返回指引；用户在浏览器同意后轮询线程自动
-        保存令牌。再次点击时若授权已完成则报成功，未完成则报等待中。
+        设备码流程对微软个人账号验证可用（Thunderbird 公开客户端 ID）；
+        授权码 + loopback 流程对 MSA 报 unauthorized_client（应用未注册该
+        redirect），不采用。同步快返回（HTTP 不挂起）：第一次点击申请设备码、
+        打开浏览器、启动后台轮询线程并返回指引；用户在浏览器同意后轮询线程
+        自动保存令牌。再次点击时若授权已完成则报成功（附 SMTP/IMAP 自检）。
         """
         if key != "email_oauth_authorize":
             return {"ok": False, "message": f"未知动作 {key}"}
@@ -1096,13 +1191,17 @@ class EmailPlugin(ToolPlugin):
         state = self._ACTION_STATE.get("auth") or {}
         if state.get("running"):
             return {"ok": True,
-                    "message": "授权进行中——请在弹出的浏览器页面登录并点「同意」，完成后这里会自动更新（也可再点一次查询进度）"}
-
-        # 上一次轮询已拿到令牌 → 直接报成功
+                    "message": "授权进行中——请在弹出的浏览器页面登录并点「同意」，"
+                               "完成后这里会自动更新（也可再点一次查询进度）"}
         if state.get("done"):
-            return {"ok": True, "message": "✅ 授权成功，可以发信了（长期有效）"}
+            action_app = _SimpleApp(config)
+            token, terr = _access_token(action_app)
+            health = f"（SMTP/IMAP 自检：{self._probe_health(user, token)}）" if not terr else ""
+            return {"ok": True, "message": f"✅ 授权成功{health}，长期有效无需重复授权"}
+        if state.get("error"):
+            return {"ok": False, "message": f"上次授权失败：{state['error']}，点击本按钮重试"}
 
-        action_app = _SimpleApp(config)   # 可写盘的 app 替身（self._app 在此路径为 None）
+        action_app = _SimpleApp(config)
         conf = _oauth_conf(action_app)
         payload, err = _oauth_device_start(conf)
         if err:
@@ -1111,7 +1210,6 @@ class EmailPlugin(ToolPlugin):
         user_code = str(payload.get("user_code") or "")
         _open_browser(verify)
 
-        # 后台轮询：用户在浏览器点同意后自动存令牌（最长等 15 分钟）
         def _poll():
             dc = str(payload.get("device_code") or "")
             deadline = time.time() + min(float(payload.get("expires_in") or 900), 900)
@@ -1131,7 +1229,7 @@ class EmailPlugin(ToolPlugin):
                     return
                 if st == "error":
                     self._ACTION_STATE["auth"] = {"running": False, "done": False,
-                                                 "error": e}
+                                                  "error": e}
                     return
                 time.sleep(interval)
             self._ACTION_STATE["auth"] = {"running": False, "done": False,
@@ -1143,6 +1241,39 @@ class EmailPlugin(ToolPlugin):
         return {"ok": True,
                 "message": f"已打开浏览器（若未弹出请访问 {verify}），"
                            f"登录后输入代码 {user_code} 并点「同意」。完成后再次点击此按钮确认结果"}
+
+    def _probe_health(self, user: str, token: str, provider: str = "outlook") -> str:
+        """授权成功后的连通性自检：SMTP + IMAP 各试一次握手。
+
+        主机名从 PROVIDERS 预设取（不硬编码——服务商参数只在预设里，惯例）。
+        """
+        preset = PROVIDERS.get(provider) or PROVIDERS["outlook"]
+        out = []
+        try:
+            import smtplib as _smtplib
+            import base64 as _b64
+            sm = _smtplib.SMTP(preset["smtp_host"], int(preset["smtp_port"]), timeout=15)
+            sm.starttls(); sm.ehlo()
+            auth = f"user={user}\x01auth=Bearer {token}\x01\x01"
+            c, _ = sm.docmd("AUTH", "XOAUTH2 " + _b64.b64encode(auth.encode()).decode())
+            sm.quit()
+            out.append("SMTP " + ("✓" if c == 235 else "✗"))
+        except Exception as exc:  # noqa: BLE001
+            out.append(f"SMTP ✗({type(exc).__name__})")
+        try:
+            import base64 as _b64
+            imaplib = _load_imaplib()
+            conn = imaplib.IMAP4_SSL(preset["imap_host"], int(preset["imap_port"]), timeout=15)
+            # authenticate() 会对返回值自动 base64——必须传**原始串**（与
+            # _imap_login 一致）。此前传了预编码串 = 双重编码，服务器报
+            # BAD Command Argument Error，误导排查方向（真实收发不受影响）。
+            raw = f"user={user}\x01auth=Bearer {token}\x01\x01"
+            conn.authenticate("XOAUTH2", lambda x: raw)
+            conn.logout()
+            out.append("IMAP ✓")
+        except Exception as exc:  # noqa: BLE001
+            out.append(f"IMAP ✗({str(exc)[:40]})")
+        return " / ".join(out)
 
     def _save_token(self, payload: Dict[str, Any]) -> str:
         """保存 refresh_token 到配置，并清空 access_token 缓存。"""
@@ -1189,6 +1320,23 @@ class EmailPlugin(ToolPlugin):
         if flow == OAUTH_FLOW_AUTHCODE:
             if not conf["authorize"]:
                 return "[Error]: 未配置授权端点，无法生成授权链接。"
+
+            # 已有 code：直接换票（手动流程 / custom 服务商）
+            code = str(args.get("code") or "").strip()
+            if code:
+                data = {"grant_type": "authorization_code", "client_id": conf["client_id"],
+                        "code": code}
+                if conf["redirect_uri"]:
+                    data["redirect_uri"] = conf["redirect_uri"]
+                if conf["client_secret"]:
+                    data["client_secret"] = conf["client_secret"]
+                payload, err = await asyncio.to_thread(_post_form, conf["token"], data)
+                if err:
+                    return f"[Error]: 用授权码换令牌失败：{err}"
+                return self._save_token(payload or {})
+
+            # 生成授权链接（手动流程）：用户浏览器完成授权后，把地址栏
+            # code=... 的值通过本工具的 code 参数传回来。
             params = {"client_id": conf["client_id"], "response_type": "code",
                       "scope": conf["scope"], "access_type": "offline",
                       "prompt": "consent"}
@@ -1198,7 +1346,7 @@ class EmailPlugin(ToolPlugin):
             opened = await asyncio.to_thread(_open_browser, url)
             return (f"[Email]: 请在浏览器完成授权"
                     + ("（已自动打开）" if opened else "（未能自动打开，请手动复制下方链接）")
-                    + "，然后把拿到的 code 传给本工具（email_oauth_login 的 code 参数）：\n"
+                    + "，然后把跳转地址中 code= 后面的值传给本工具（code 参数）：\n"
                     + url)
 
         # device code 流程
