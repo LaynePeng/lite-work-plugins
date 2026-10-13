@@ -532,7 +532,8 @@ def _oauth_conf(app) -> Dict[str, Any]:
         "flow": pick(preset.get("flow") or OAUTH_FLOW_DEVICE, "email_oauth_flow"),
         "client_id": cid,
         "client_secret": str(_cfg(app, "email_oauth_client_secret", "") or "").strip(),
-        "refresh_token": str(_cfg(app, "email_oauth_refresh_token", "") or "").strip(),
+        "refresh_token": (str(_read_private().get("refresh_token") or "").strip()
+                         or str(_cfg(app, "email_oauth_refresh_token", "") or "").strip()),
         "redirect_uri": str(_cfg(app, "email_oauth_redirect_uri", "") or "").strip(),
         "smtp_host": pick(preset.get("smtp_host"), "email_smtp_host"),
         "smtp_port": pick_int(preset.get("smtp_port") or DEFAULT_SMTP_PORT, "email_smtp_port"),
@@ -711,16 +712,46 @@ def _oauth_device_poll(conf: Dict[str, Any],
     return payload, "", "done"
 
 
+def _private_path() -> str:
+    """插件私有凭据文件（同目录 config.local.json，学 jev 先例）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.local.json")
+
+
+def _write_private(data: Dict[str, Any]) -> bool:
+    """原子写私有文件（0600）。宿主保存配置会整体覆盖 config.json 的插件命名空间
+    （内存快照优先），refresh_token 会被静默抹掉；私有文件不受宿主写回影响。"""
+    try:
+        tmp = _private_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _private_path())
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[email] 私有凭据写失败", exc_info=True)
+        return False
+
+
+def _read_private() -> Dict[str, Any]:
+    try:
+        with open(_private_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _persist_refresh_token(app, token: str) -> bool:
-    """把 refresh_token 写回插件配置（凭据由设置页 schema 声明为 secret）。"""
+    """保存 refresh_token：私有文件（主）+ config.json（副本，若能拿到可写的 app）。"""
+    ok = _write_private({"refresh_token": token})
     try:
         cur = dict((getattr(app, "config", {}) or {}).get("email-plugin") or {})
         cur["email_oauth_refresh_token"] = token
         app.save_config({"email-plugin": cur})
-        return True
     except Exception:  # noqa: BLE001
-        logger.debug("[email] refresh_token 写回失败", exc_info=True)
-        return False
+        logger.debug("[email] refresh_token 写回 config 失败（私有文件已兜底）",
+                     exc_info=True)
+    return ok
 
 
 def _resolve_auth_mode(own: Dict[str, Any]) -> str:

@@ -18,6 +18,12 @@ _SPEC = importlib.util.spec_from_file_location(
 emailplugin = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(emailplugin)  # type: ignore[union-attr]
 
+# 私有凭据文件隔离：测试一律用内存替身，绝不读写真实 config.local.json
+_PRIVATE_STUB: dict = {}
+emailplugin._read_private = lambda: dict(_PRIVATE_STUB)
+emailplugin._write_private = lambda data: (_PRIVATE_STUB.clear(),
+                                           _PRIVATE_STUB.update(data), True)[2]
+
 
 class Approval:
     def __init__(self, ok=True):
@@ -48,7 +54,15 @@ class _App:
 
 class EmailPluginBase(unittest.TestCase):
     def setUp(self):
+        _PRIVATE_STUB.clear()
+        emailplugin._token_cache.update({"key": "", "access": "", "exp": 0.0})
+        emailplugin._device_cache.clear()
         self.plugin = emailplugin.EmailPlugin()
+
+    def tearDown(self):
+        _PRIVATE_STUB.clear()
+        emailplugin._token_cache.update({"key": "", "access": "", "exp": 0.0})
+        emailplugin._device_cache.clear()
 
 
 class BuildMessageTest(EmailPluginBase):
@@ -1296,3 +1310,81 @@ class SettingsActionTest(EmailPluginBase):
         conf = emailplugin._oauth_conf(app)
         self.assertEqual(conf["client_id"],
                          emailplugin.PUBLIC_CLIENT_IDS["outlook"])
+
+class PrivateTokenStoreTest(unittest.TestCase):
+    """私有凭据文件：宿主覆盖 config.json 竞态下的令牌兜底（真实文件 IO）。"""
+
+    def test_write_and_read_roundtrip(self):
+        """真实文件 IO（绕开模块级 stub，直测磁盘函数）。"""
+        import json as _json
+        ws = tempfile.mkdtemp(prefix="lw-priv-")
+        path = os.path.join(ws, "config.local.json")
+
+        def _real_write(data):
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(data, f, ensure_ascii=False, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            return True
+
+        def _real_read():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    d = _json.load(f)
+                return d if isinstance(d, dict) else {}
+            except Exception:
+                return {}
+
+        orig_w, orig_r = emailplugin._write_private, emailplugin._read_private
+        emailplugin._write_private = _real_write
+        emailplugin._read_private = _real_read
+        try:
+            self.assertTrue(_real_write({"refresh_token": "RT-X"}))
+            self.assertEqual(_real_read(), {"refresh_token": "RT-X"})
+            self.assertEqual(oct(os.stat(path).st_mode)[-3:], "600")
+        finally:
+            emailplugin._write_private = orig_w
+            emailplugin._read_private = orig_r
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_read_missing_returns_empty(self):
+        orig_path = emailplugin._private_path
+        emailplugin._private_path = lambda: "/nonexistent/dir/config.local.json"
+        try:
+            self.assertEqual(emailplugin._read_private(), {})
+        finally:
+            emailplugin._private_path = orig_path
+
+    def test_private_token_wins_over_config(self):
+        """私有文件的令牌优先于 config.json（后者会被宿主覆盖）。"""
+        app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_provider": "outlook",
+            "email_oauth_refresh_token": "STALE-IN-CONFIG"}})
+        stub = {"refresh_token": "FRESH-PRIVATE"}
+        orig = emailplugin._read_private
+        emailplugin._read_private = lambda: stub
+        try:
+            conf = emailplugin._oauth_conf(app)
+        finally:
+            emailplugin._read_private = orig
+        self.assertEqual(conf["refresh_token"], "FRESH-PRIVATE")
+
+    def test_persist_writes_both_stores(self):
+        """_persist_refresh_token：私有文件为主，config.json 为副本。"""
+        app = _App(config={"email-plugin": {"email_user": "u@x.com"}})
+        ok = emailplugin._persist_refresh_token(app, "RT-BOTH")
+        self.assertTrue(ok)
+        self.assertEqual(_PRIVATE_STUB.get("refresh_token"), "RT-BOTH")
+        self.assertEqual(app.config["email-plugin"]["email_oauth_refresh_token"], "RT-BOTH")
+        _PRIVATE_STUB.clear()
+
+    def setUp(self):
+        _PRIVATE_STUB.clear()
+
+    def tearDown(self):
+        _PRIVATE_STUB.clear()
+
+if __name__ == "__main__":
+    unittest.main()
