@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import smtplib
+import sys
 import threading
 import time
 import urllib.error
@@ -130,6 +131,9 @@ _HTTP_TIMEOUT = 30
 _TOKEN_EXPIRY_SKEW = 120
 
 
+#: 磁盘配置缓存：设置表单渲染时插件实例还没绑定 app，只能读 config.json
+_DISK_CFG: Dict[str, Any] = {"path": "", "mtime": 0.0, "data": {}}
+
 #: IMAP 客户端模块缓存：None=未解析 / False=不可用 / 模块对象=已就绪
 _IMAPLIB: Any = None
 _IMAPLIB_ERR = ""
@@ -180,6 +184,40 @@ def _own_cfg(app) -> Dict[str, Any]:
     cfg = getattr(app, "config", None) or {}
     own = cfg.get("email-plugin") if isinstance(cfg, dict) else None
     return own if isinstance(own, dict) else {}
+
+
+def _read_disk_cfg() -> Dict[str, Any]:
+    """从磁盘读本插件配置（按 mtime 缓存）。
+
+    渲染设置表单时插件实例尚未绑定 app（宿主 load_plugins 只实例化、不 install），
+    拿不到内存配置。只能读 config.json —— 设置表单要按当前认证方式展示不同字段。
+    """
+    global _DISK_CFG
+    path = os.path.join(_config_dir(), "config.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _DISK_CFG["path"] == path and _DISK_CFG["mtime"] == mtime:
+        return _DISK_CFG["data"]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        own = data.get("email-plugin") if isinstance(data, dict) else None
+        own = own if isinstance(own, dict) else {}
+    except Exception:  # noqa: BLE001
+        own = {}
+    _DISK_CFG.update({"path": path, "mtime": mtime, "data": own})
+    return own
+
+
+def _config_dir() -> str:
+    """推断 lite-work 配置目录（插件在 <config_dir>/plugins/<name>/）。"""
+    env = os.environ.get("LITEWORK_CONFIG_DIR")
+    if env:
+        return os.path.expanduser(env)
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(here))
 
 
 def _cfg(app, key: str, default: Any = None) -> Any:
@@ -350,6 +388,32 @@ def _xoauth2(user: str, token: str) -> str:
         f"user={user}\x01auth=Bearer {token}\x01\x01".encode("utf-8")).decode("ascii")
 
 
+def _open_browser(url: str) -> bool:
+    """尽力打开系统浏览器（跨平台）；失败不影响授权流程本身。
+
+    优先 webbrowser 标准库，异常时按平台回退系统命令。冻结宿主里子进程执行
+    系统命令比 Python GUI 调用更可靠，故两条路都留。
+    """
+    if not url:
+        return False
+    try:
+        import webbrowser
+        if webbrowser.open(url):
+            return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[email] webbrowser 打开失败", exc_info=True)
+    cmd = {"darwin": ["open"], "win32": ["cmd", "/c", "start", ""]}.get(
+        sys.platform, ["xdg-open"])
+    try:
+        import subprocess
+        subprocess.Popen(cmd + [url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[email] 系统命令打开浏览器失败", exc_info=True)
+        return False
+
+
 def _oauth_refresh(conf: Dict[str, Any]) -> Tuple[str, int, str]:
     """用 refresh_token 换 access_token（refresh_token 长期有效，自动续期）。
 
@@ -448,7 +512,12 @@ def _persist_refresh_token(app, token: str) -> bool:
 
 
 def _resolve_auth_mode(own: Dict[str, Any]) -> str:
-    """认证方式：显式配置优先；未配置时按已有凭据推断（兼容仅填密码的旧配置）。"""
+    """认证方式：显式配置 > 已有凭据推断 > 默认值。
+
+    表单里「认证方式」的默认值是 oauth2，此处必须一致，否则新用户看到 oauth2
+    的字段却按 basic 发信。旧配置只填了密码（无 email_auth）时判为 basic，
+    避免升级后突然改用 OAuth2 而发不出信。
+    """
     mode = str(own.get("email_auth") or "").strip().lower()
     if mode in (AUTH_MODE_BASIC, AUTH_MODE_OAUTH2):
         return mode
@@ -456,7 +525,9 @@ def _resolve_auth_mode(own: Dict[str, Any]) -> str:
         return AUTH_MODE_OAUTH2
     if str(own.get("email_oauth_client_id") or "").strip():
         return AUTH_MODE_OAUTH2
-    return AUTH_MODE_BASIC
+    if str(own.get("email_password") or "").strip():
+        return AUTH_MODE_BASIC
+    return DEFAULT_AUTH_MODE
 
 
 def _auth_material(app) -> Tuple[str, str, str, str]:
@@ -658,65 +729,75 @@ class EmailPlugin(ToolPlugin):
         "可自定义端点）；服务器参数随服务商预设自动带出，亦可手填。"
     )
 
-    #: 通用插件 UI 协议：设置页据此自动渲染配置表单（仅安装本插件后出现）；
-    #: 值经 POST /api/config 写入 config["email-plugin"][key] 嵌套命名空间。
-    #: 表单按数组顺序平铺渲染（主程序不支持分组/条件显隐），故把「认证方式」与
-    #: 「服务商」放最前，其余字段用 label 前缀区分归属。
-    contributes = {
-        "settings": [
+    #: 通用插件 UI 协议。表单按数组顺序平铺渲染，宿主不支持条件显隐，因此这里
+    #: 用 @property 按**当前认证方式**动态裁剪字段：oauth2 不显示密码、basic 不显示
+    #: 端点；端点/服务器只在「服务商=custom」或 basic 下才出现，避免 20 个字段全平铺。
+    #: 实例未绑定 app 时（宿主只实例化不 install）读磁盘 config.json 取当前值。
+    @property
+    def contributes(self) -> Dict[str, Any]:
+        own = _own_cfg(self._app) or _read_disk_cfg()
+        mode = _resolve_auth_mode(own)
+        provider = str(own.get("email_oauth_provider") or DEFAULT_PROVIDER).strip().lower()
+        custom = provider == "custom"
+
+        items: List[Dict[str, Any]] = [
             {"key": "email_auth", "type": "select", "label": "认证方式",
              "options": [AUTH_MODE_OAUTH2, AUTH_MODE_BASIC], "default": DEFAULT_AUTH_MODE,
-             "hint": "oauth2：SASL XOAUTH2，Outlook/Gmail 等已停用密码登录的服务必选；"
-                     "basic：用户名 + 密码/应用密码，自建或第三方 SMTP 常用"},
-            {"key": "email_oauth_provider", "type": "select", "label": "服务商（自动带出服务器与端点）",
+             "hint": "oauth2＝授权登录（Outlook/Gmail 等已停用密码的服务必选）；"
+                     "basic＝用户名+密码/应用密码"},
+            {"key": "email_oauth_provider", "type": "select", "label": "服务商",
              "options": sorted(PROVIDERS.keys()), "default": DEFAULT_PROVIDER,
-             "hint": "选定后 SMTP/IMAP 服务器、OAuth2 端点与 scope 自动套用预设；"
-                     "下方任何填写都会覆盖预设。custom＝自建或未收录服务"},
+             "hint": "服务器与端点按服务商自动套用；选 custom 才需手填"},
             {"key": "email_user", "type": "str", "label": "邮箱账号",
-             "hint": "完整邮箱地址，如 you@outlook.com / you@gmail.com"},
+             "hint": "完整邮箱地址"},
+        ]
 
-            {"key": "email_password", "type": "secret", "label": "［basic］密码 / 应用密码",
-             "hint": "仅 basic 模式使用；OAuth2 模式留空"},
-            {"key": "email_oauth_client_id", "type": "str",
-             "label": "［oauth2］客户端 ID", "hint": "OAuth2 应用的 client_id"},
-            {"key": "email_oauth_client_secret", "type": "secret",
-             "label": "［oauth2］客户端密钥（可选）",
-             "hint": "公共客户端留空；机密客户端需填"},
-            {"key": "email_oauth_tenant", "type": "str",
-             "label": "［oauth2］租户（仅 Outlook 用）", "default": "consumers",
-             "hint": "consumers＝个人账号，common＝个人+组织，亦可填租户 ID/域名"},
-            {"key": "email_oauth_scope", "type": "str",
-             "label": "［oauth2］Scope（留空用预设）",
-             "hint": "Outlook：offline_access + SMTP.Send + IMAP.AccessAsUser.All；"
-                     "Gmail：https://mail.google.com/"},
-            {"key": "email_oauth_authorize", "type": "str",
-             "label": "［oauth2］授权端点（留空用预设）"},
-            {"key": "email_oauth_token", "type": "str",
-             "label": "［oauth2］Token 端点（留空用预设）"},
-            {"key": "email_oauth_devicecode", "type": "str",
-             "label": "［oauth2］设备码端点（留空用预设）"},
-            {"key": "email_oauth_redirect_uri", "type": "str",
-             "label": "［oauth2］回调地址（授权码流程用）"},
-            {"key": "email_oauth_refresh_token", "type": "secret",
-             "label": "［oauth2］Refresh Token",
-             "hint": "由 email_oauth_login 自动写入，一般无需手填"},
+        if mode == AUTH_MODE_OAUTH2:
+            items.append({"key": "email_oauth_client_id", "type": "str",
+                          "label": "客户端 ID",
+                          "hint": "服务商后台注册应用后获得；填好后运行 email_oauth_login 授权"})
+            if provider == "outlook":
+                items.append({"key": "email_oauth_tenant", "type": "str",
+                              "label": "租户（Outlook）", "default": DEFAULT_TENANT,
+                              "hint": "consumers＝个人账号，common＝个人+组织"})
+            if custom:
+                items += [
+                    {"key": "email_oauth_authorize", "type": "str", "label": "授权端点"},
+                    {"key": "email_oauth_token", "type": "str", "label": "Token 端点"},
+                    {"key": "email_oauth_devicecode", "type": "str", "label": "设备码端点"},
+                    {"key": "email_oauth_redirect_uri", "type": "str", "label": "回调地址"},
+                    {"key": "email_oauth_scope", "type": "str", "label": "Scope"},
+                    {"key": "email_oauth_client_secret", "type": "secret",
+                     "label": "客户端密钥（可选）",
+                     "hint": "公共客户端留空；机密客户端需填"},
+                ]
+        else:
+            items.append({"key": "email_password", "type": "secret",
+                          "label": "密码 / 应用密码",
+                          "hint": "多数服务商需先在邮箱设置里开启 SMTP/IMAP 并生成授权码"})
 
-            {"key": "email_smtp_host", "type": "str", "label": "SMTP 服务器（留空用预设）"},
-            {"key": "email_smtp_port", "type": "number", "label": "SMTP 端口（留空用预设）",
-             "default": DEFAULT_SMTP_PORT},
-            {"key": "email_smtp_tls", "type": "select", "label": "SMTP 加密方式",
-             "options": [SMTP_TLS_STARTTLS, SMTP_TLS_SSL], "default": SMTP_TLS_STARTTLS,
-             "hint": "starttls＝587 端口（明文起、再升级）；ssl＝465 端口（连接即 TLS）"},
-            {"key": "email_imap_host", "type": "str", "label": "IMAP 服务器（留空用预设）"},
-            {"key": "email_imap_port", "type": "number", "label": "IMAP 端口（留空用预设）",
-             "default": DEFAULT_IMAP_PORT},
+        # 服务器参数：预设已带出，仅 basic 或 custom 需要（此处暴露）
+        if mode == AUTH_MODE_BASIC or custom:
+            items += [
+                {"key": "email_smtp_host", "type": "str", "label": "SMTP 服务器"},
+                {"key": "email_smtp_port", "type": "number", "label": "SMTP 端口",
+                 "default": DEFAULT_SMTP_PORT},
+                {"key": "email_smtp_tls", "type": "select", "label": "SMTP 加密",
+                 "options": [SMTP_TLS_STARTTLS, SMTP_TLS_SSL], "default": SMTP_TLS_STARTTLS,
+                 "hint": "starttls＝587；ssl＝465"},
+                {"key": "email_imap_host", "type": "str", "label": "IMAP 服务器"},
+                {"key": "email_imap_port", "type": "number", "label": "IMAP 端口",
+                 "default": DEFAULT_IMAP_PORT},
+            ]
+
+        items += [
             {"key": "email_from", "type": "str", "label": "发件人地址（可选）",
-             "hint": "留空则用邮箱账号。可填纯邮箱或「姓名 <邮箱>」；只填姓名会被忽略"},
+             "hint": "留空则用邮箱账号"},
             {"key": "email_require_approval", "type": "boolean",
              "label": "发送前需审批（推荐开启）", "default": True,
              "hint": "每次 email_send 弹审批卡，用户确认后才发出"},
-        ],
-    }
+        ]
+        return {"settings": items}
 
     def status_from_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         """设置页显示的运行状态：按认证方式判断凭据是否齐备。"""
@@ -893,8 +974,11 @@ class EmailPlugin(ToolPlugin):
             if conf["redirect_uri"]:
                 params["redirect_uri"] = conf["redirect_uri"]
             url = f"{conf['authorize']}?{urllib.parse.urlencode(params)}"
-            return (f"[Email]: 请在浏览器打开以下链接完成授权，然后把拿到的 code 传给本工具"
-                    f"（email_oauth_login 的 code 参数）：\n{url}")
+            opened = await asyncio.to_thread(_open_browser, url)
+            return (f"[Email]: 请在浏览器完成授权"
+                    + ("（已自动打开）" if opened else "（未能自动打开，请手动复制下方链接）")
+                    + "，然后把拿到的 code 传给本工具（email_oauth_login 的 code 参数）：\n"
+                    + url)
 
         # device code 流程
         pending = _device_cache.get("pending") or {}
@@ -944,8 +1028,10 @@ class EmailPlugin(ToolPlugin):
         msg = str(payload.get("message") or "").strip()
         verify = str(payload.get("verification_uri") or payload.get("verification_url") or "")
         minutes = int(expires_in // 60) or 1
+        opened = await asyncio.to_thread(_open_browser, verify) if verify else False
         return (f"[Email]: 请完成 OAuth2 授权（{minutes} 分钟内有效）——\n"
-                f"1) 浏览器打开：{verify}\n"
+                f"1) 浏览器打开：{verify}"
+                + ("（已自动为你打开）" if opened else "（未能自动打开，请手动复制）") + "\n"
                 f"2) 输入代码：{payload.get('user_code')}\n"
                 + (f"3) {msg}\n" if msg else "")
                 + "完成后再次调用 email_oauth_login（会自动领取并存下 refresh_token）。")
