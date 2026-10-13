@@ -969,7 +969,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.1.4"
+    version = "1.1.5"
     description = (
         "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
         "IMAP 收件箱列表 / 关键词搜索 / 读取单封。认证支持 basic（密码/应用密码）"
