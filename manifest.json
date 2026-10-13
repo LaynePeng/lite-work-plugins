@@ -269,13 +269,14 @@
     },
     {
       "name": "email-plugin",
-      "version": "1.0.2",
-      "description": "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户审批确认）＋ IMAP 收件箱列表/关键词搜索/读取单封（Hotmail/Outlook 默认配置，账号在设置页「邮件」填写）",
+      "version": "1.1.0",
+      "description": "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户审批确认）＋ IMAP 收件箱列表/关键词搜索/读取单封。认证支持 basic（密码/应用密码）与 oauth2（SASL XOAUTH2 通用实现）；预设 Outlook/Gmail/Fastmail/Zoho/QQ/163 并自动带出服务器参数，亦可自定义端点适配任意标准服务",
       "path": "plugins/email-plugin",
       "tools": [
         "email_send",
         "email_list",
-        "email_read"
+        "email_read",
+        "email_oauth_login"
       ]
     }
   ],

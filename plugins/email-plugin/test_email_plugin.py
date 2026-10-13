@@ -40,6 +40,10 @@ class _App:
         self.workspace = workspace or tempfile.mkdtemp(prefix="lw-email-test-")
         self.approval_gate = gate
 
+    def save_config(self, updates):
+        """对齐真实 app：按顶层键合并写入（插件只写自己的命名空间）。"""
+        self.config.update({k: v for k, v in updates.items() if v is not None})
+
 
 class EmailPluginBase(unittest.TestCase):
     def setUp(self):
@@ -300,6 +304,353 @@ class VendoredImaplibTest(unittest.TestCase):
                 mod.os.path.isfile = orig
         self.assertEqual(items, [])
         self.assertIn("IMAP 不可用", err)
+
+
+class AuthModeTest(EmailPluginBase):
+    """认证方式：显式配置优先；未配置时按已有凭据推断（兼容旧 basic 配置）。"""
+
+    def test_explicit_mode_wins(self):
+        self.assertEqual(emailplugin._resolve_auth_mode({"email_auth": "basic"}), "basic")
+        self.assertEqual(emailplugin._resolve_auth_mode({"email_auth": "oauth2"}), "oauth2")
+
+    def test_infer_oauth2_from_refresh_token(self):
+        self.assertEqual(
+            emailplugin._resolve_auth_mode({"email_oauth_refresh_token": "rt"}), "oauth2")
+
+    def test_infer_basic_when_only_password(self):
+        self.assertEqual(
+            emailplugin._resolve_auth_mode({"email_password": "pw"}), "basic")
+
+    def test_auth_material_oauth2_missing_config(self):
+        app = _App(config={"email-plugin": {"email_user": "u@x.com", "email_auth": "oauth2"}})
+        user, secret, mode, err = emailplugin._auth_material(app)
+        self.assertEqual((user, secret, mode), ("", "", "oauth2"))
+        self.assertIn("OAuth2 配置不完整", err)
+
+    def test_auth_material_basic_ok(self):
+        app = _App(config={"email-plugin": {"email_user": "u@x.com", "email_password": "pw"}})
+        user, secret, mode, err = emailplugin._auth_material(app)
+        self.assertEqual((user, secret, mode, err), ("u@x.com", "pw", "basic", ""))
+
+    def test_auth_material_no_user(self):
+        _u, _s, _m, err = emailplugin._auth_material(_App(config={"email-plugin": {}}))
+        self.assertIn("邮箱账号未配置", err)
+
+
+class Xoauth2Test(EmailPluginBase):
+    def test_xoauth2_payload_format(self):
+        import base64
+        payload = emailplugin._xoauth2("me@x.com", "TOKEN")
+        raw = base64.b64decode(payload).decode()
+        self.assertEqual(raw, "user=me@x.com\x01auth=Bearer TOKEN\x01\x01")
+
+
+class OauthConfTest(EmailPluginBase):
+    def test_outlook_preset_endpoints(self):
+        app = _App(config={"email-plugin": {
+            "email_oauth_provider": "outlook", "email_oauth_tenant": "consumers"}})
+        conf = emailplugin._oauth_conf(app)
+        self.assertIn("login.microsoftonline.com/consumers", conf["token"])
+        self.assertIn("SMTP.Send", conf["scope"])
+        self.assertEqual(conf["flow"], "device_code")
+
+    def test_gmail_preset(self):
+        app = _App(config={"email-plugin": {"email_oauth_provider": "gmail"}})
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["token"], "https://oauth2.googleapis.com/token")
+        self.assertEqual(conf["scope"], "https://mail.google.com/")
+
+    def test_custom_endpoint_override(self):
+        app = _App(config={"email-plugin": {
+            "email_oauth_provider": "custom",
+            "email_oauth_token": "https://idp.example.com/token",
+            "email_oauth_scope": "mail.read mail.send"}})
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["token"], "https://idp.example.com/token")
+        self.assertEqual(conf["scope"], "mail.read mail.send")
+
+    def test_user_value_overrides_preset(self):
+        app = _App(config={"email-plugin": {
+            "email_oauth_provider": "outlook",
+            "email_oauth_token": "https://custom/token"}})
+        self.assertEqual(emailplugin._oauth_conf(app)["token"], "https://custom/token")
+
+
+class ProviderServerParamsTest(EmailPluginBase):
+    """通用性核心：服务商预设同时带出 SMTP/IMAP 服务器与加密方式。"""
+
+    def test_gmail_brings_its_own_servers(self):
+        app = _App(config={"email-plugin": {"email_oauth_provider": "gmail"}})
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["smtp_host"], "smtp.gmail.com")
+        self.assertEqual(conf["smtp_port"], 465)
+        self.assertEqual(conf["smtp_tls"], "ssl")
+        self.assertEqual(conf["imap_host"], "imap.gmail.com")
+
+    def test_outlook_uses_starttls_on_587(self):
+        app = _App(config={"email-plugin": {"email_oauth_provider": "outlook"}})
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["smtp_port"], 587)
+        self.assertEqual(conf["smtp_tls"], "starttls")
+
+    def test_each_preset_has_servers(self):
+        for name, preset in emailplugin.PROVIDERS.items():
+            if name == "custom":
+                continue
+            self.assertTrue(preset["smtp_host"], f"{name} 缺 smtp_host")
+            self.assertTrue(preset["imap_host"], f"{name} 缺 imap_host")
+            self.assertIn(preset["smtp_tls"], ("starttls", "ssl"), name)
+
+    def test_explicit_server_overrides_preset(self):
+        app = _App(config={"email-plugin": {
+            "email_oauth_provider": "gmail",
+            "email_smtp_host": "smtp.example.com",
+            "email_smtp_port": "2525"}})
+        conf = emailplugin._oauth_conf(app)
+        self.assertEqual(conf["smtp_host"], "smtp.example.com")
+        self.assertEqual(conf["smtp_port"], 2525)
+
+    def test_explicit_tls_mode_overrides_preset(self):
+        app = _App(config={"email-plugin": {
+            "email_oauth_provider": "gmail", "email_smtp_tls": "starttls"}})
+        self.assertEqual(emailplugin._oauth_conf(app)["smtp_tls"], "starttls")
+
+    def test_invalid_tls_value_falls_back_to_preset(self):
+        app = _App(config={"email-plugin": {
+            "email_oauth_provider": "gmail", "email_smtp_tls": "bogus"}})
+        self.assertEqual(emailplugin._oauth_conf(app)["smtp_tls"], "ssl")
+
+    def test_custom_provider_has_no_server(self):
+        app = _App(config={"email-plugin": {"email_oauth_provider": "custom"}})
+        self.assertEqual(emailplugin._oauth_conf(app)["smtp_host"], "")
+
+    def test_smtp_send_picks_ssl_for_465(self):
+        """465 走 SMTP_SSL，587 走 STARTTLS——用替身验证分支。"""
+        import smtplib
+        seen = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                seen.append(("plain", host, port))
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def starttls(self): seen.append(("starttls",))
+            def send_message(self, msg, from_addr=None): pass
+
+        class FakeSSL(FakeSMTP):
+            def __init__(self, host, port, timeout=None):
+                seen.append(("ssl", host, port))
+
+        orig_plain, orig_ssl = smtplib.SMTP, smtplib.SMTP_SSL
+        orig_login = emailplugin._smtp_login
+        smtplib.SMTP, smtplib.SMTP_SSL = FakeSMTP, FakeSSL
+        emailplugin._smtp_login = lambda *a, **k: None
+        try:
+            emailplugin._smtp_send("h", 465, "u", "s", "f@x.com", object(),
+                                   "basic", "ssl")
+            emailplugin._smtp_send("h", 587, "u", "s", "f@x.com", object(),
+                                   "basic", "starttls")
+        finally:
+            smtplib.SMTP, smtplib.SMTP_SSL = orig_plain, orig_ssl
+            emailplugin._smtp_login = orig_login
+        self.assertIn(("ssl", "h", 465), seen)
+        self.assertIn(("plain", "h", 587), seen)
+        self.assertIn(("starttls",), seen)
+
+
+class OauthLoginToolTest(EmailPluginBase):
+    def test_login_without_client_id_reports_actionable_error(self):
+        self.plugin._app = _App(config={"email-plugin": {"email_user": "u@x.com"}})
+        out = asyncio.run(self.plugin._oauth_login({}))
+        self.assertIn("client_id", out)
+
+    def test_device_start_returns_code_and_uri(self):
+        self.plugin._app = _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_oauth_client_id": "cid"}})
+        orig = emailplugin._oauth_device_start
+        emailplugin._oauth_device_start = lambda conf: (
+            {"device_code": "DC", "user_code": "ABCD-EFGH",
+             "verification_uri": "https://microsoft.com/devicelogin", "interval": 5}, "")
+        emailplugin._device_cache.clear()
+        try:
+            out = asyncio.run(self.plugin._oauth_login({}))
+        finally:
+            emailplugin._oauth_device_start = orig
+            emailplugin._device_cache.clear()
+        self.assertIn("ABCD-EFGH", out)
+        self.assertIn("devicelogin", out)
+
+    def test_save_token_persists_refresh_token(self):
+        app = _App(config={"email-plugin": {"email_user": "u@x.com"}})
+        self.plugin._app = app
+        out = self.plugin._save_token({"refresh_token": "RT-123"})
+        self.assertIn("授权成功", out)
+        self.assertEqual(app.config["email-plugin"]["email_oauth_refresh_token"], "RT-123")
+
+    def test_save_token_without_refresh_token(self):
+        self.plugin._app = _App(config={"email-plugin": {"email_user": "u@x.com"}})
+        out = self.plugin._save_token({"access_token": "AT"})
+        self.assertIn("没有 refresh_token", out)
+
+
+class OauthTokenCacheTest(EmailPluginBase):
+    """access_token 缓存与刷新：命中缓存不重复换票，过期自动续期。"""
+
+    def setUp(self):
+        super().setUp()
+        emailplugin._token_cache.update({"key": "", "access": "", "exp": 0.0})
+
+    def _app(self):
+        return _App(config={"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_client_id": "cid", "email_oauth_refresh_token": "rt"}})
+
+    def test_refresh_uses_server_expires_in(self):
+        orig = emailplugin._post_form
+        emailplugin._post_form = lambda url, data: (
+            {"access_token": "AT", "expires_in": 900}, "")
+        try:
+            token, ttl, err = emailplugin._oauth_refresh(
+                emailplugin._oauth_conf(self._app()))
+        finally:
+            emailplugin._post_form = orig
+        self.assertEqual((token, ttl, err), ("AT", 900, ""))
+
+    def test_access_token_cached(self):
+        calls = []
+        orig = emailplugin._oauth_refresh
+
+        def fake_refresh(conf):
+            calls.append(1)
+            return "AT", 3600, ""
+
+        emailplugin._oauth_refresh = fake_refresh
+        try:
+            app = self._app()
+            t1, e1 = emailplugin._access_token(app)
+            t2, e2 = emailplugin._access_token(app)
+        finally:
+            emailplugin._oauth_refresh = orig
+            emailplugin._token_cache.update({"key": "", "access": "", "exp": 0.0})
+        self.assertEqual((t1, e1), ("AT", ""))
+        self.assertEqual((t2, e2), ("AT", ""))
+        self.assertEqual(len(calls), 1, "第二次应命中缓存，不再换票")
+
+    def test_expired_token_refreshes_again(self):
+        calls = []
+
+        def fake_refresh(conf):
+            calls.append(1)
+            return "AT-%d" % len(calls), 1, ""
+
+        orig = emailplugin._oauth_refresh
+        emailplugin._oauth_refresh = fake_refresh
+        try:
+            app = self._app()
+            emailplugin._access_token(app)
+            emailplugin._token_cache["exp"] = 0.0   # 强制过期
+            t2, _ = emailplugin._access_token(app)
+        finally:
+            emailplugin._oauth_refresh = orig
+            emailplugin._token_cache.update({"key": "", "access": "", "exp": 0.0})
+        self.assertEqual(t2, "AT-2")
+
+
+class SettingsSchemaTest(EmailPluginBase):
+    def test_auth_selector_is_first_and_select_type(self):
+        settings = self.plugin.contributes["settings"]
+        first = settings[0]
+        self.assertEqual(first["key"], "email_auth")
+        self.assertEqual(first["type"], "select")
+        self.assertIn("oauth2", first["options"])
+        self.assertIn("basic", first["options"])
+
+    def test_oauth_secrets_declared_secret(self):
+        settings = self.plugin.contributes["settings"]
+        for key in ("email_oauth_refresh_token", "email_oauth_client_secret"):
+            spec = next(s for s in settings if s["key"] == key)
+            self.assertTrue(spec.get("secret") or spec.get("type") == "secret")
+
+    def test_status_oauth2_needs_client_id_then_token(self):
+        st = self.plugin.status_from_config(
+            {"email-plugin": {"email_user": "u@x.com", "email_auth": "oauth2"}})
+        self.assertEqual(st["state"], "not_started")
+        self.assertIn("客户端 ID", st["reason"])
+        st = self.plugin.status_from_config({"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_client_id": "cid"}})
+        self.assertIn("授权", st["reason"])
+        st = self.plugin.status_from_config({"email-plugin": {
+            "email_user": "u@x.com", "email_auth": "oauth2",
+            "email_oauth_client_id": "cid", "email_oauth_refresh_token": "rt"}})
+        self.assertEqual(st["state"], "running")
+
+    def test_legacy_basic_config_still_running(self):
+        st = self.plugin.status_from_config(
+            {"email-plugin": {"email_user": "u@x.com", "email_password": "pw"}})
+        self.assertEqual(st["state"], "running")
+
+
+class FromAddressTest(EmailPluginBase):
+    """发件人解析：只填显示名不能当发件人（From 头里必须有邮箱地址）。"""
+
+    def _app(self, from_val):
+        return _App(config={"email-plugin": {"email_user": "me@x.com",
+                                             "email_from": from_val}})
+
+    def test_plain_email(self):
+        self.assertEqual(emailplugin._resolve_from_addr(self._app("a@b.com"), "me@x.com"),
+                         "a@b.com")
+
+    def test_name_and_email_kept(self):
+        out = emailplugin._resolve_from_addr(self._app("Layne <a@b.com>"), "me@x.com")
+        _, addr = __import__("email.utils", fromlist=["x"]).parseaddr(out)
+        self.assertEqual(addr, "a@b.com")
+
+    def test_display_name_only_falls_back_to_account(self):
+        """回归点：真实配置里 email_from='Layne Peng'，曾导致 From 头没有地址。"""
+        self.assertEqual(emailplugin._resolve_from_addr(self._app("Layne Peng"), "me@x.com"),
+                         "me@x.com")
+
+    def test_empty_falls_back_to_account(self):
+        self.assertEqual(emailplugin._resolve_from_addr(self._app(""), "me@x.com"), "me@x.com")
+
+    def test_result_always_has_address(self):
+        from email.utils import parseaddr
+        for val in ("a@b.com", "Layne <a@b.com>", "Layne Peng", ""):
+            out = emailplugin._resolve_from_addr(self._app(val), "me@x.com")
+            self.assertTrue(parseaddr(out)[1], f"{val!r} -> {out!r} 缺邮箱地址")
+
+
+class GeneralizationGuardTest(unittest.TestCase):
+    """通用性守卫：服务商相关的字面量只允许出现在 PROVIDERS 预设里。
+
+    回归点：曾把 smtp-mail.outlook.com / outlook.office365.com 写死在发送与
+    收信路径，导致换 Gmail 时服务器不跟着走——OAuth 通用化后必须靠预设驱动。
+    """
+
+    PROVIDER_LITERALS = ("outlook.", "gmail.", "fastmail.", "zoho.", "qq.com", "163.com")
+
+    def _source_lines(self):
+        with open(os.path.join(_HERE, "plugin.py"), encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    def test_no_hardcoded_hosts_outside_presets(self):
+        lines = self._source_lines()
+        # PROVIDERS 字典范围（含其后的自定义预设）
+        start = next(i for i, l in enumerate(lines) if l.startswith("PROVIDERS:"))
+        end = next(i for i, l in enumerate(lines[start:], start) if l.strip() == "}")
+        offenders = []
+        for i, line in enumerate(lines):
+            if start <= i <= end or line.lstrip().startswith("#"):
+                continue
+            low = line.lower()
+            for lit in self.PROVIDER_LITERALS:
+                # 邮箱地址样例（you@outlook.com / u@gmail.com 之类）不算硬编码
+                if lit in low and "@" not in low:
+                    offenders.append(f"{i+1}: {line.strip()}")
+        self.assertEqual(offenders, [], "服务商字面量应只在 PROVIDERS 预设中：\n" +
+                         "\n".join(offenders))
 
 
 if __name__ == "__main__":
