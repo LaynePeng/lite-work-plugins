@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shutil
+import sys
 import importlib.util
 import os
 import tempfile
@@ -187,6 +188,118 @@ class PluginUiProtocolTest(EmailPluginBase):
         self.assertIsNone(emailplugin._cfg(app, "email_smtp_host"))
         self.assertEqual(emailplugin._cfg(app, "email_smtp_host", "h"), "h")
         self.assertIsNone(emailplugin._cfg(None, "email_user"))
+
+
+class _NoImaplib:
+    """上下文管理器：在 with 内屏蔽标准库 imaplib（模拟未捆绑 imaplib 的冻结宿主）。
+
+    必须覆盖整个测试流程——回退加载发生在调用 `_load_imaplib()` 时，
+    若导入阶段结束就恢复 import，测的就是标准库而非 vendored 副本。
+    """
+
+    def __enter__(self):
+        import builtins
+        self._real = builtins.__import__
+        self._prev = sys.modules.pop("imaplib", None)
+        self._had = self._prev is not None
+
+        def blocked(name, *a, **k):
+            if name == "imaplib" or name.startswith("imaplib."):
+                raise ImportError("No module named 'imaplib'")
+            return self._real(name, *a, **k)
+
+        builtins.__import__ = blocked
+        return self
+
+    def __exit__(self, *exc):
+        import builtins
+        builtins.__import__ = self._real
+        sys.modules.pop("imaplib", None)
+        if self._had and self._prev is not None:
+            sys.modules["imaplib"] = self._prev
+        return False
+
+    @staticmethod
+    def load_fresh():
+        """重新导入插件模块（此时 imaplib 被屏蔽）。"""
+        spec = importlib.util.spec_from_file_location(
+            "email_plugin_no_imaplib", os.path.join(_HERE, "plugin.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
+
+
+class VendoredImaplibTest(unittest.TestCase):
+    """冻结宿主可能没捆绑 imaplib（PyInstaller 静态分析看不到插件 import）。
+
+    回归点：模块 import 不得因 imaplib 缺席而失败——否则 contributes 读不出来，
+    设置页连「配置」表单都不出现（本 bug 的实际症状）。
+    """
+
+    def test_import_survives_missing_imaplib(self):
+        with _NoImaplib():
+            mod = _NoImaplib.load_fresh()
+        self.assertTrue(hasattr(mod, "EmailPlugin"))
+
+    def test_contributes_readable_without_imaplib(self):
+        """核心症状：imaplib 缺席时设置表单仍须能渲染。"""
+        with _NoImaplib():
+            mod = _NoImaplib.load_fresh()
+            keys = {s["key"] for s in mod.EmailPlugin().contributes["settings"]}
+        self.assertIn("email_user", keys)
+        self.assertIn("email_password", keys)
+
+    def test_fallback_loads_vendored_copy(self):
+        with _NoImaplib():
+            mod = _NoImaplib.load_fresh()
+            mod._IMAPLIB = None  # 清缓存，强制走回退
+            m = mod._load_imaplib()
+            path = os.path.abspath(m.__file__)
+        self.assertIn("_vendor", path)
+        self.assertTrue(hasattr(m, "IMAP4_SSL"))
+
+    def test_fallback_does_not_pollute_global_state(self):
+        """显式按路径加载：不入 sys.modules['imaplib']、不往 sys.path 塞 _vendor。"""
+        with _NoImaplib():
+            mod = _NoImaplib.load_fresh()
+            mod._IMAPLIB = None
+            mod._load_imaplib()
+            leaked = "imaplib" in sys.modules
+            injected = any("_vendor" in p for p in sys.path)
+        self.assertFalse(leaked, "vendored 副本不应注册成全局 imaplib")
+        self.assertFalse(injected, "_vendor 不应被加进 sys.path")
+
+    def test_missing_both_reports_actionable_error(self):
+        """宿主没捆绑 + 无自带副本 → 明确报错，而不是 AttributeError。"""
+        with _NoImaplib():
+            mod = _NoImaplib.load_fresh()
+            mod._IMAPLIB = None
+            orig = mod.os.path.isfile
+            mod.os.path.isfile = lambda p: False if "_vendor" in p else orig(p)
+            try:
+                with self.assertRaises(ImportError) as cm:
+                    mod._load_imaplib()
+                msg = str(cm.exception)
+            finally:
+                mod.os.path.isfile = orig
+        self.assertIn("imaplib", msg)
+
+    def test_imap_tool_reports_unavailable_not_crash(self):
+        """连 IMAP 但客户端不可用 → 工具返回可读原因（不抛异常）。"""
+        with _NoImaplib():
+            mod = _NoImaplib.load_fresh()
+            mod._IMAPLIB = None
+            plugin = mod.EmailPlugin()
+            plugin._app = _App(config={"email-plugin": {
+                "email_user": "u@x.com", "email_password": "p"}})
+            orig = mod.os.path.isfile
+            mod.os.path.isfile = lambda p: False if "_vendor" in p else orig(p)
+            try:
+                items, err = mod._imap_fetch(plugin._app, "INBOX", ["ALL"], 5)
+            finally:
+                mod.os.path.isfile = orig
+        self.assertEqual(items, [])
+        self.assertIn("IMAP 不可用", err)
 
 
 if __name__ == "__main__":

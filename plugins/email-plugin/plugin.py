@@ -4,7 +4,8 @@
 # - 默认面向 Hotmail/Outlook（SMTP smtp-mail.outlook.com:587 STARTTLS /
 #   IMAP outlook.office365.com:993 SSL），也兼容任意标准 SMTP/IMAP 服务
 # - email_send 发送前必须过审批门（app.approval_gate）；凭据不写日志、不进返回值
-# - 纯标准库（smtplib / imaplib / email / html.parser），无需 wheels
+# - 纯标准库（smtplib / imaplib / email / html.parser）；宿主为 PyInstaller 冻结包时
+#   imaplib 可能缺席（静态分析看不到插件 import），按需回退自带副本，故无需 wheels
 # - 配置从 app.config 读取（设置页「邮件」区块写入 email_* 键）
 # - 单一账号；附件限 workspace 内路径
 #
@@ -14,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import html as _html
-import imaplib
+import importlib.util
 import logging
 import os
 import re
@@ -38,6 +39,49 @@ MAX_LIST_ITEMS = 50
 DEFAULT_LIST_ITEMS = 20
 MAX_ATTACHMENTS = 8
 _MAX_ATTACH_BYTES = 20 * 1024 * 1024
+
+
+#: IMAP 客户端模块缓存：None=未解析 / False=不可用 / 模块对象=已就绪
+_IMAPLIB: Any = None
+_IMAPLIB_ERR = ""
+
+
+def _load_imaplib():
+    """取 IMAP 客户端模块：优先标准库，缺失时回退插件自带副本（_vendor/）。
+
+    PyInstaller 冻结宿主只静态分析主程序 import，运行时才加载的插件 import
+    看不到——imaplib 因此可能缺席（smtplib 恰好被传递依赖捎带进包）。回退走
+    **显式按路径加载**，不把 _vendor 加进 sys.path：imaplib 是通用模块名，
+    进 sys.path 会覆盖整个进程的标准库，影响面远超本插件。
+    """
+    global _IMAPLIB, _IMAPLIB_ERR
+    if _IMAPLIB is not None:
+        if _IMAPLIB is False:
+            raise ImportError(_IMAPLIB_ERR)
+        return _IMAPLIB
+    try:
+        import imaplib as _mod
+        _IMAPLIB = _mod
+        return _mod
+    except ImportError:
+        pass
+    vendored = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "_vendor", "imaplib.py")
+    if not os.path.isfile(vendored):
+        _IMAPLIB, _IMAPLIB_ERR = False, "宿主未捆绑 imaplib，插件自带副本缺失"
+        raise ImportError(_IMAPLIB_ERR)
+    spec = importlib.util.spec_from_file_location("litework_email_imaplib", vendored)
+    if spec is None or spec.loader is None:
+        _IMAPLIB, _IMAPLIB_ERR = False, f"自带 imaplib 无法加载：{vendored}"
+        raise ImportError(_IMAPLIB_ERR)
+    try:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as exc:
+        _IMAPLIB, _IMAPLIB_ERR = False, f"自带 imaplib 加载失败：{exc}"
+        raise ImportError(_IMAPLIB_ERR)
+    _IMAPLIB = mod
+    return mod
 
 
 def _cfg(app, key: str, default: Any = None) -> Any:
@@ -136,6 +180,10 @@ def _imap_fetch(app, mailbox: str, criteria: List[str],
     host = str(_cfg(app, "email_imap_host", DEFAULT_IMAP_HOST) or DEFAULT_IMAP_HOST)
     port = int(_cfg(app, "email_imap_port", DEFAULT_IMAP_PORT) or DEFAULT_IMAP_PORT)
     try:
+        imaplib = _load_imaplib()
+    except ImportError as exc:
+        return [], f"IMAP 不可用：{exc}"
+    try:
         import email.parser as _ep
         with imaplib.IMAP4_SSL(host, port, timeout=30) as conn:
             conn.login(user, password)
@@ -179,6 +227,10 @@ def _imap_read(app, mailbox: str, uid: str) -> Tuple[Optional[Dict[str, Any]], s
         return None, "邮件账号未配置：请先在设置页 → 插件 → email-plugin 填写邮箱与应用密码。"
     host = str(_cfg(app, "email_imap_host", DEFAULT_IMAP_HOST) or DEFAULT_IMAP_HOST)
     port = int(_cfg(app, "email_imap_port", DEFAULT_IMAP_PORT) or DEFAULT_IMAP_PORT)
+    try:
+        imaplib = _load_imaplib()
+    except ImportError as exc:
+        return None, f"IMAP 不可用：{exc}"
     try:
         from email.parser import BytesParser
         with imaplib.IMAP4_SSL(host, port, timeout=30) as conn:
@@ -228,7 +280,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.0.1"
+    version = "1.0.2"
     description = (
         "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
         "IMAP 收件箱列表 / 关键词搜索 / 读取单封（Hotmail/Outlook 默认配置，"
