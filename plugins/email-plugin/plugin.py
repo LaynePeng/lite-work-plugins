@@ -612,23 +612,35 @@ def _dry_run_report(to: List[str], cc: List[str], bcc: List[str], subject: str,
     """dry_run 的返回值：可读摘要 + 一段可直接渲染的预览盒。
 
     刻意**不走审批卡、不连 SMTP**：让「确认内容」发生在对话里，由用户看清楚
-    并直接修改，而不是靠一张审批卡事后拦截。
+    并直接修改，而不是靠一张审批卡事后拦截。前端 RichBlocks 渲染
+    ```email-draft 围栏为可编辑草稿卡（收件人/主题/正文直接改），用户点
+    「确认发送这封」后 Agent 拿 edits 重新调用（去 dry_run）正式发送。
     """
-    lines = ["[Email Preview]: 草稿已组装，**尚未发送**（dry_run=true）。",
-             f"收件人：{', '.join(to)}"]
+    import uuid
+    draft_id = "ed-" + uuid.uuid4().hex[:8]
+    payload = {
+        "id": draft_id,
+        "to": ", ".join(to),
+        "cc": ", ".join(cc),
+        "bcc": ", ".join(bcc),
+        "subject": subject,
+        "body": body,
+        "html": html_body or "",
+        "attachments": [n for _, n in attached],
+    }
+    lines = [f"[Email Preview]: 草稿 {draft_id} 已组装，尚未发送（dry_run）。",
+             f"收件人：{', '.join(to)}",
+             f"主题：{subject}"]
     if cc:
         lines.append(f"抄送：{', '.join(cc)}")
-    if bcc:
-        lines.append(f"密送：{', '.join(bcc)}")
-    lines.append(f"主题：{subject}")
     lines.append("附件：" + (", ".join(n for _, n in attached) if attached else "(无)"))
     lines += ["",
-              "```html",
-              _preview_box(to, cc, bcc, subject, body, html_body, attached),
+              "```email-draft",
+              json.dumps(payload, ensure_ascii=False),
               "```",
               "",
-              "下一步：把预览内容给用户确认/修改；用户同意后，去掉 dry_run 用相同参数"
-              "再次调用 email_send 才是正式发送（会弹审批卡，需用户点「允许」）。"]
+              f"这张草稿卡可直接编辑。用户点「确认发送这封」会回传改动；"
+              f"正式发送时去掉 dry_run，把用户改后的 to/subject/body/html 传入。"]
     return "\n".join(lines)
 
 
