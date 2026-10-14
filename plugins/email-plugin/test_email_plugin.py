@@ -191,6 +191,17 @@ class ExecutePathsTest(EmailPluginBase):
 class PluginUiProtocolTest(EmailPluginBase):
     """通用插件 UI 协议：contributes 设置声明 + status_from_config + 嵌套读值。"""
 
+    def setUp(self):
+        # contributes 在实例未绑定 app 时会读磁盘真实 config.json（本机配置
+        # 会渗进测试）——钉死成空配置，用例只验证纯 schema 形状。
+        self._orig_disk = emailplugin._read_disk_cfg
+        emailplugin._read_disk_cfg = lambda: {}
+        super().setUp()
+
+    def tearDown(self):
+        emailplugin._read_disk_cfg = self._orig_disk
+        super().tearDown()
+
     def test_contributes_settings_schema(self):
         settings = self.plugin.contributes["settings"]
         keys = {s["key"] for s in settings}
