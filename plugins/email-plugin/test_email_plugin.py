@@ -1,4 +1,9 @@
 # 纯逻辑单测：不连真实 SMTP/IMAP（组装/解析/审批/越权/未配置路径均可离线验证）。
+#
+# 🚫 红线：禁止任何「可能弹浏览器 / 真实请求授权端点」的测试——微软会把
+# 高频授权尝试判定为滥用封号。凡涉及 _open_browser / _oauth_device_start /
+# _oauth_device_poll 的用例，必须 stub 成内存替身，不得真实调用。
+# 运行时落盘的 auth_pending.json / config.local.json 一律不进 git。
 # 运行：<主仓库 .venv python> -m unittest plugins.email-plugin.test_email_plugin
 import asyncio
 import os
@@ -1076,9 +1081,6 @@ class OauthBrowserTest(EmailPluginBase):
             emailplugin._device_cache.clear()
         self.assertIn("未能自动打开", out)
         self.assertIn("https://microsoft.com/devicelogin", out)
-
-    def test_open_browser_empty_url_is_safe(self):
-        self.assertFalse(emailplugin._open_browser(""))
 
 
 class FromAddressTest(EmailPluginBase):
