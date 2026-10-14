@@ -1378,5 +1378,271 @@ class PrivateTokenStoreTest(unittest.TestCase):
     def tearDown(self):
         _PRIVATE_STUB.clear()
 
+
+# ------------------------------------------------ 管理/文件夹/回复（v1.4.0 新增，全程离线）
+
+class _FakeImapConn:
+    """内存替身：不触网，按预置数据返回 SEARCH/FETCH/LIST/STATUS 结果。"""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self._encoding = None
+        self.selected = None
+
+    def login(self, user, password):
+        return ("OK", [b"1"])
+
+    def authenticate(self, mech, cb):
+        return ("OK", [b"1"])
+
+    def select(self, mailbox, readonly=False):
+        self.selected = mailbox
+        self.owner.selected = mailbox
+        return ("OK", [b"1"])
+
+    def uid(self, command, *args):
+        cmd = str(command).lower()
+        self.owner.commands.append((cmd, args))
+        if cmd == "search":
+            return ("OK", [self.owner.search_result])
+        if cmd == "fetch":
+            return ("OK", [(b"x", self.owner.raw)])
+        return ("OK", [b""])
+
+    def status(self, mailbox, names):
+        return ("OK", [self.owner.status_result])
+
+    def list(self, directory="", pattern="*"):
+        return ("OK", list(self.owner.listing))
+
+    def expunge(self):
+        return ("OK", [b"1"])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeImaplib:
+    def __init__(self, raw=b"", search_result=b"", listing=(), status_result=b""):
+        self.raw = raw
+        self.search_result = search_result
+        self.listing = list(listing)
+        self.status_result = status_result
+        self.commands = []
+        self.selected = None
+
+    def IMAP4_SSL(self, host, port, timeout=None):
+        return _FakeImapConn(self)
+
+
+_BASIC_CFG = {"email-plugin": {"email_auth": "basic",
+                               "email_user": "me@x.com",
+                               "email_password": "pw"}}
+
+
+def _basic_app():
+    return _App(config={k: dict(v) for k, v in _BASIC_CFG.items()})
+
+
+class Utf7FolderNameTest(unittest.TestCase):
+    def test_ascii_passthrough(self):
+        self.assertEqual(emailplugin._utf7_encode("INBOX"), "INBOX")
+        self.assertEqual(emailplugin._utf7_decode("Sent Items"), "Sent Items")
+
+    def test_chinese_roundtrip(self):
+        for name in ("已发送", "我的/项目 邮件", "收件箱"):
+            enc = emailplugin._utf7_encode(name)
+            self.assertTrue(enc.isascii(), msg=enc)
+            self.assertEqual(emailplugin._utf7_decode(enc), name)
+
+    def test_literal_ampersand(self):
+        self.assertEqual(emailplugin._utf7_encode("A&B"), "A&-B")
+        self.assertEqual(emailplugin._utf7_decode("A&-B"), "A&B")
+
+    def test_rfc3501_known_vector(self):
+        # RFC 3501 §5.1.3 例：'&U,BTFw-' 解码为「台北」
+        self.assertEqual(emailplugin._utf7_decode("&U,BTFw-"), "台北")
+
+
+class ManageToolValidationTest(EmailPluginBase):
+    def _run(self, args):
+        return asyncio.run(self.plugin.execute("email_manage", args))
+
+    def test_unknown_action(self):
+        self.assertIn("action 需为", self._run({"action": "purge"}))
+
+    def test_requires_uid_or_filter(self):
+        self.assertIn("uids", self._run({"action": "delete"}))
+
+    def test_move_requires_target(self):
+        self.assertIn("target", self._run({"action": "move", "uids": ["1"]}))
+
+    def test_mark_requires_valid_flag(self):
+        self.assertIn("flag", self._run({"action": "mark", "uids": ["1"], "flag": "purple"}))
+
+    def test_mark_accepts_known_flag(self):
+        # 合法 flag：越过校验进入执行（无 IMAP 配置 → 返回配置/连接类错误，非参数错误）
+        out = self._run({"action": "mark", "uids": ["1"], "flag": "read"})
+        self.assertNotIn("flag 需指定", out)
+
+
+class ManageToolFlowTest(EmailPluginBase):
+    def _patch_imap(self, fake):
+        old = emailplugin._IMAPLIB
+        emailplugin._IMAPLIB = fake
+        return old
+
+    def test_dry_run_previews_without_executing(self):
+        m = EmailMessage()
+        m["From"] = "news@x.com"
+        m["Subject"] = "订阅更新"
+        m["Date"] = "Mon, 1 Jan 2024 10:00:00 +0800"
+        m.set_content("内容")
+        fake = _FakeImaplib(raw=m.as_bytes(), search_result=b"1,2")
+        old = self._patch_imap(fake)
+        try:
+            self.plugin._app = _basic_app()
+            out = asyncio.run(self.plugin.execute(
+                "email_manage", {"action": "delete", "uids": ["1", "2"], "dry_run": True}))
+        finally:
+            emailplugin._IMAPLIB = old
+        self.assertIn("预览", out)
+        self.assertIn("2 封", out)
+        self.assertNotIn("OK", out)          # 未真正执行
+        # 预览走 SEARCH+FETCH，且不得出现任何写操作
+        self.assertTrue(all(cmd in ("search", "fetch") for cmd, _ in fake.commands), fake.commands)
+
+    def test_manage_move_executes_and_counts(self):
+        fake = _FakeImaplib(search_result=b"")
+        old = self._patch_imap(fake)
+        try:
+            app = _basic_app()
+            done, err = emailplugin._imap_manage(
+                app, "INBOX", ["1", "2", "3"], "move", target="Archive")
+        finally:
+            emailplugin._IMAPLIB = old
+        self.assertEqual(err, "")
+        self.assertEqual(done, 3)
+        cmds = [c for c, _ in fake.commands]
+        self.assertIn("copy", cmds)
+        self.assertIn("store", cmds)
+
+    def test_manage_mark_only_stores(self):
+        fake = _FakeImaplib()
+        old = self._patch_imap(fake)
+        try:
+            done, err = emailplugin._imap_manage(
+                _basic_app(), "INBOX", ["7"], "mark", flag="read")
+        finally:
+            emailplugin._IMAPLIB = old
+        self.assertEqual(err, "")
+        self.assertEqual(done, 1)
+        cmds = [c for c, _ in fake.commands]
+        self.assertIn("store", cmds)
+        self.assertNotIn("copy", cmds)
+
+    def test_manage_uses_utf7_for_non_ascii_folder(self):
+        fake = _FakeImaplib()
+        old = self._patch_imap(fake)
+        try:
+            emailplugin._imap_manage(_basic_app(), "已发送", ["1"], "mark", flag="read")
+        finally:
+            emailplugin._IMAPLIB = old
+        self.assertEqual(fake.selected, emailplugin._utf7_encode("已发送"))
+
+
+class FoldersToolTest(EmailPluginBase):
+    def test_list_and_status_parsed(self):
+        fake = _FakeImaplib(
+            listing=[b'(\\HasNoChildren) "/" "INBOX"',
+                     b'(\\HasNoChildren \\Trash) "/" "Deleted Items"',
+                     b'(\\HasNoChildren) "/" "&XfJT0ZAB-"'],
+            status_result=b'INBOX (MESSAGES 12 UNSEEN 3)')
+        old = emailplugin._IMAPLIB
+        emailplugin._IMAPLIB = fake
+        try:
+            folders, err = emailplugin._imap_folder_list(_basic_app(), with_counts=True)
+        finally:
+            emailplugin._IMAPLIB = old
+        self.assertEqual(err, "")
+        by_name = {f["name"]: f for f in folders}
+        self.assertIn("INBOX", by_name)
+        self.assertIn("Deleted Items", by_name)
+        self.assertEqual(by_name["INBOX"]["special"], "收件箱")
+        self.assertEqual(by_name["INBOX"]["messages"], 12)
+        self.assertEqual(by_name["INBOX"]["unseen"], 3)
+        self.assertEqual(by_name["Deleted Items"]["special"], "已删除")
+
+
+class ReadAttachmentTest(EmailPluginBase):
+    def test_attachment_and_message_id_extracted(self):
+        m = EmailMessage()
+        m["From"] = "sender@x.com"
+        m["To"] = "me@x.com"
+        m["Subject"] = "带附件"
+        m["Message-ID"] = "<mid@x.com>"
+        m.set_content("正文内容")
+        m.add_attachment(b"%PDF-1.4 data", maintype="application",
+                         subtype="pdf", filename="report.pdf")
+        old = emailplugin._IMAPLIB
+        emailplugin._IMAPLIB = _FakeImaplib(raw=m.as_bytes())
+        try:
+            item, err = emailplugin._imap_read(_basic_app(), "INBOX", "5")
+        finally:
+            emailplugin._IMAPLIB = old
+        self.assertEqual(err, "")
+        self.assertIsNotNone(item)
+        self.assertEqual(item["message_id"], "<mid@x.com>")
+        self.assertIn("正文内容", item["body"])
+        names = [a["name"] for a in item["attachments"]]
+        self.assertIn("report.pdf", names)
+        self.assertTrue(all(a["size"] > 0 for a in item["attachments"]))
+
+
+class BuildMessageHeadersTest(EmailPluginBase):
+    def test_reply_headers_attached(self):
+        msg = emailplugin._build_msg(
+            "me@x.com", ["a@x.com"], [], [], "Re: hi", "b", None, [],
+            headers={"In-Reply-To": "<mid@x.com>", "References": "<mid@x.com>"})
+        self.assertEqual(msg["In-Reply-To"], "<mid@x.com>")
+        self.assertEqual(msg["References"], "<mid@x.com>")
+
+    def test_empty_header_values_skipped(self):
+        msg = emailplugin._build_msg("me@x.com", ["a@x.com"], [], [], "s", "b", None, [],
+                                     headers={"In-Reply-To": ""})
+        self.assertIsNone(msg["In-Reply-To"])
+
+
+class ReplyForwardValidationTest(EmailPluginBase):
+    def test_reply_requires_numeric_uid(self):
+        out = asyncio.run(self.plugin.execute("email_reply", {"uid": "abc", "body": "hi"}))
+        self.assertIn("uid", out)
+
+    def test_reply_requires_body(self):
+        out = asyncio.run(self.plugin.execute("email_reply", {"uid": "5", "body": " "}))
+        self.assertIn("正文", out)
+
+    def test_forward_requires_to(self):
+        out = asyncio.run(self.plugin.execute("email_forward", {"uid": "5"}))
+        self.assertIn("to", out)
+
+    def test_forward_requires_numeric_uid(self):
+        out = asyncio.run(self.plugin.execute("email_forward", {"uid": "x", "to": "a@x.com"}))
+        self.assertIn("uid", out)
+
+
+class NewToolsRegisteredTest(EmailPluginBase):
+    def test_all_new_tools_present(self):
+        names = {t.name for t in self.plugin.get_tools()}
+        for n in ("email_manage", "email_folders", "email_reply", "email_forward"):
+            self.assertIn(n, names)
+
+    def test_version_is_140(self):
+        self.assertEqual(emailplugin.EmailPlugin.version, "1.4.0")
+
+
 if __name__ == "__main__":
     unittest.main()

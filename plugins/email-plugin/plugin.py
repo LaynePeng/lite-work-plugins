@@ -64,6 +64,8 @@ MAX_BODY_CHARS = 8000
 MAX_LIST_ITEMS = 50
 DEFAULT_LIST_ITEMS = 20
 MAX_ATTACHMENTS = 8
+MAX_MANAGE_ITEMS = 200      # email_manage 单次最多处理封数
+DEFAULT_MANAGE_ITEMS = 50   # email_manage filter 模式默认处理封数
 _MAX_ATTACH_BYTES = 20 * 1024 * 1024
 
 DEFAULT_SMTP_TLS = "starttls"
@@ -1067,7 +1069,7 @@ def _smtp_send(smtp_host: str, smtp_port: int, user: str, secret: str,
         smtp.send_message(msg, from_addr=from_addr)
 
 
-def _build_msg(from_addr, to, cc, bcc, subject, body, html_body, attached):
+def _build_msg(from_addr, to, cc, bcc, subject, body, html_body, attached, headers=None):
     msg = EmailMessage()
     msg["From"] = from_addr
     msg["To"] = ", ".join(to)
@@ -1076,6 +1078,9 @@ def _build_msg(from_addr, to, cc, bcc, subject, body, html_body, attached):
     if bcc:
         msg["Bcc"] = ", ".join(bcc)
     msg["Subject"] = subject
+    for hk, hv in (headers or {}).items():
+        if hv:
+            msg[hk] = hv      # 回复/转发：In-Reply-To / References 会话头
     if body and html_body:
         msg.set_content(body)
         msg.add_alternative(html_body, subtype="html")
@@ -1169,10 +1174,19 @@ def _imap_read(app, mailbox: str, uid: str) -> Tuple[Optional[Dict[str, Any]], s
             msg = BytesParser().parsebytes(d[0][1])
             body = ""
             html_part = ""
+            attachments: List[Dict[str, Any]] = []
             for part in msg.walk():
                 ctype = part.get_content_type()
                 cdisp = str(part.get("Content-Disposition") or "")
-                if "attachment" in cdisp:
+                if "attachment" in cdisp or (part.get_filename() and not ctype.startswith("text/")):
+                    try:
+                        raw = part.get_payload(decode=True) or b""
+                    except Exception:  # noqa: BLE001 - 编码异常的附件跳过大小统计
+                        raw = b""
+                    attachments.append({
+                        "name": _decode(part.get_filename() or "") or "(未命名)",
+                        "size": len(raw),
+                    })
                     continue
                 try:
                     payload = part.get_payload(decode=True)
@@ -1195,12 +1209,266 @@ def _imap_read(app, mailbox: str, uid: str) -> Tuple[Optional[Dict[str, Any]], s
                 "cc": _decode(msg.get("Cc") or ""),
                 "subject": _decode(msg.get("Subject") or "") or "(无主题)",
                 "date": _decode(msg.get("Date") or "") or "",
+                "message_id": _decode(msg.get("Message-ID") or "").strip(),
+                "references": _decode(msg.get("References") or "").strip(),
+                "attachments": attachments,
                 "body": body,
             }, ""
     except imaplib.IMAP4.error as e:
         return None, f"IMAP 错误：{e}"
     except Exception as e:
         return None, f"IMAP 连接失败（{host}:{port}）：{e}"
+
+
+# ---------------------------------------------------------------- IMAP 管理（删除/移动/标记）
+
+
+def _utf7_encode(s: str) -> str:
+    """IMAP modified UTF-7 编码（RFC 3501 §5.1.3）。纯 ASCII 名原样返回。
+
+    IMAP 协议里邮箱名不是 UTF-8 而是 modified UTF-7（'+' 作转义前缀，
+    RFC 3501 改用 '&'）——直接发中文名给严格的服务器会 BAD。这里做正解。
+    """
+    if not s or (s.isascii() and "&" not in s):
+        return s
+    out = bytearray()
+    buf = bytearray()   # 累积待编码的非 ASCII（UTF-16BE）字节
+
+    def flush() -> None:
+        if buf:
+            b64 = base64.b64encode(bytes(buf)).rstrip(b"=").replace(b"/", b",")
+            out.extend(b"&" + b64 + b"-")
+            buf.clear()
+
+    for ch in s:
+        o = ord(ch)
+        if 0x20 <= o <= 0x7E:
+            flush()
+            out.extend(b"&-" if ch == "&" else ch.encode("ascii"))
+        else:
+            buf.extend(ch.encode("utf-16-be"))
+    flush()
+    return out.decode("ascii")
+
+
+def _utf7_decode(s: str) -> str:
+    """IMAP modified UTF-7 解码（_utf7_encode 的逆）。无法解码的片段原样保留。"""
+    if not s or (s.isascii() and "&" not in s):
+        return s
+    out: List[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch != "&":
+            out.append(ch)
+            i += 1
+            continue
+        j = s.find("-", i + 1)
+        if j == i + 1:                      # "&-" → 字面 '&'
+            out.append("&")
+            i = j + 1
+            continue
+        if j == -1:                         # 无终止符：原样保留剩余
+            out.append(s[i:])
+            break
+        chunk = s[i + 1:j].replace(",", "/")
+        pad = "=" * (-len(chunk) % 4)
+        try:
+            out.append(base64.b64decode(chunk + pad).decode("utf-16-be"))
+        except Exception:                   # noqa: BLE001 - 非本编码则原样
+            out.append(s[i:j + 1])
+        i = j + 1
+    return "".join(out)
+
+
+#: 每批 UID 上限：命令行过长会被服务器拒（分批提交）
+_MANAGE_BATCH = 50
+
+#: mark 动作 → IMAP STORE 的 (操作, 旗标)
+_FLAG_STORE = {
+    "read": ("+FLAGS", r"(\Seen)"),
+    "unread": ("-FLAGS", r"(\Seen)"),
+    "flagged": ("+FLAGS", r"(\Flagged)"),
+    "unflagged": ("-FLAGS", r"(\Flagged)"),
+}
+
+
+def _imap_manage(app, mailbox: str, uids: List[str], action: str,
+                 target: str = "", flag: str = "") -> Tuple[Optional[int], str]:
+    """同步 IMAP 批量管理。返回 (已处理封数, 错误消息)。
+
+    action=move：COPY 到 target 后从源文件夹删除（源=目标时仅打旗标）。
+    action=delete：永久删除（STORE \\Deleted + EXPUNGE）。
+    action=mark：仅改旗标（read/unread/flagged/unflagged），不移动不删。
+    """
+    if not uids:
+        return 0, ""
+    user, secret, mode, err = _auth_material(app)
+    if err:
+        return None, err
+    conf = _oauth_conf(app)
+    host, port = conf["imap_host"], conf["imap_port"]
+    try:
+        imaplib = _load_imaplib()
+    except ImportError as exc:
+        return None, f"IMAP 不可用：{exc}"
+    src = _utf7_encode(mailbox or "INBOX")
+    dst = _utf7_encode(target) if target else ""
+    try:
+        with imaplib.IMAP4_SSL(host, port, timeout=30) as conn:
+            conn._encoding = "utf-8"
+            _imap_login(conn, user, secret, mode)
+            typ, _d = conn.select(src)
+            if typ != "OK":
+                return None, f"无法打开文件夹「{mailbox}」——请先用 email_folders 确认名称。"
+            done = 0
+            for k in range(0, len(uids), _MANAGE_BATCH):
+                batch = ",".join(uids[k:k + _MANAGE_BATCH])
+                if action == "mark":
+                    op, flags = _FLAG_STORE.get(flag, ("+FLAGS", r"(\Seen)"))
+                    typ, d = conn.uid("STORE", batch, op, flags)
+                    if typ != "OK":
+                        return done, f"标记失败：{d}"
+                else:
+                    if action == "move":
+                        typ, d = conn.uid("COPY", batch, dst)
+                        if typ != "OK":
+                            return done, f"移动失败（COPY → {target}）：{d}"
+                    typ, d = conn.uid("STORE", batch, "+FLAGS", r"(\Deleted)")
+                    if typ != "OK":
+                        return done, f"删除标记失败：{d}"
+                done += len(uids[k:k + _MANAGE_BATCH])
+            if action != "mark":
+                # 优先 UID EXPUNGE（RFC 4315 UIDPLUS，只清本批，避免误删同文件夹里
+                # 其他早已打旗标待删的邮件）；服务器不支持时回退普通 EXPUNGE。
+                exp_ok = False
+                try:
+                    etyp, _ed = conn.uid("EXPUNGE", ",".join(uids))
+                    exp_ok = etyp == "OK"
+                except Exception:  # noqa: BLE001 - 不支持该扩展
+                    exp_ok = False
+                if not exp_ok:
+                    conn.expunge()
+            return done, ""
+    except imaplib.IMAP4.error as e:
+        err = str(e)
+        if "authentication" in err.lower():
+            return None, f"IMAP 认证失败（{host}:{port}）：检查账号密码或 OAuth2 授权。"
+        return None, f"IMAP 错误：{err}"
+    except Exception as e:
+        logger.warning("[email] IMAP 管理失败 %s:%s", host, port, exc_info=True)
+        return None, f"IMAP 连接失败（{host}:{port}）：{type(e).__name__}: {e}"
+
+
+def _imap_folder_list(app, with_counts: bool = True
+                      ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """同步 IMAP：LIST 全部文件夹（可选 STATUS 取邮件数/未读数）。"""
+    user, secret, mode, err = _auth_material(app)
+    if err:
+        return None, err
+    conf = _oauth_conf(app)
+    host, port = conf["imap_host"], conf["imap_port"]
+    try:
+        imaplib = _load_imaplib()
+    except ImportError as exc:
+        return None, f"IMAP 不可用：{exc}"
+    try:
+        with imaplib.IMAP4_SSL(host, port, timeout=30) as conn:
+            conn._encoding = "utf-8"
+            _imap_login(conn, user, secret, mode)
+            typ, data = conn.list()
+            if typ != "OK":
+                return None, f"列出文件夹失败：{data}"
+            folders: List[Dict[str, Any]] = []
+            for raw in data or []:
+                if not raw:
+                    continue
+                line = (raw.decode("utf-8", "replace")
+                        if isinstance(raw, (bytes, bytearray)) else str(raw))
+                # 形如：(\HasNoChildren) "/" "INBOX"  或  (\Sent) "/" "Sent Items"
+                m = re.match(r'\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.*)$', line)
+                if not m:
+                    continue
+                name_raw = m.group("name").strip()
+                if len(name_raw) >= 2 and name_raw.startswith('"') and name_raw.endswith('"'):
+                    name_raw = name_raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+                if not name_raw:
+                    continue
+                fl = m.group("flags").lower()
+                special = ""
+                for flag_key, label in (("\\sent", "已发送"), ("\\drafts", "草稿"),
+                                        ("\\trash", "已删除"), ("\\junk", "垃圾"),
+                                        ("\\archive", "归档")):
+                    if flag_key in fl:
+                        special = label
+                        break
+                if name_raw.upper() == "INBOX":
+                    special = special or "收件箱"
+                folders.append({
+                    "name": _utf7_decode(name_raw),
+                    "raw": name_raw,
+                    "flags": m.group("flags"),
+                    "special": special,
+                    "noselect": "\\noselect" in fl,
+                    "messages": None,
+                    "unseen": None,
+                })
+            if with_counts:
+                for f in folders:
+                    if f["noselect"]:
+                        continue
+                    try:
+                        styp, sdat = conn.status(f["raw"], "(MESSAGES UNSEEN)")
+                    except Exception:  # noqa: BLE001 - 个别文件夹不支持 STATUS
+                        continue
+                    if styp != "OK" or not sdat or not isinstance(sdat[0], (bytes, bytearray)):
+                        continue
+                    s = sdat[0].decode("utf-8", "replace")
+                    mm = re.search(r"MESSAGES\s+(\d+)", s)
+                    uu = re.search(r"UNSEEN\s+(\d+)", s)
+                    if mm:
+                        f["messages"] = int(mm.group(1))
+                    if uu:
+                        f["unseen"] = int(uu.group(1))
+            return folders, ""
+    except imaplib.IMAP4.error as e:
+        err = str(e)
+        if "authentication" in err.lower():
+            return None, f"IMAP 认证失败（{host}:{port}）：检查账号密码或 OAuth2 授权。"
+        return None, f"IMAP 错误：{err}"
+    except Exception as e:
+        logger.warning("[email] IMAP 列文件夹失败 %s:%s", host, port, exc_info=True)
+        return None, f"IMAP 连接失败（{host}:{port}）：{type(e).__name__}: {e}"
+
+
+def _imap_find_trash(app) -> Tuple[str, str]:
+    """找「已删除」文件夹名：优先 \\Trash 特殊用途标记，其次常见名称。"""
+    folders, err = _imap_folder_list(app, with_counts=False)
+    if err:
+        return "", err
+    for f in folders or []:
+        if "\\trash" in (f.get("flags") or "").lower():
+            return str(f["name"]), ""
+    wanted = ("deleted items", "deleted", "trash", "已删除邮件", "已删除", "垃圾桶")
+    for f in folders or []:
+        if str(f.get("name") or "").strip().lower() in wanted:
+            return str(f["name"]), ""
+    return "", "未找到「已删除」文件夹"
+
+
+def _preview_by_uids(app, mailbox: str, uids: List[str]
+                     ) -> Tuple[List[Dict[str, Any]], str]:
+    """按 UID 列表取头字段（预览与审批卡用）：SEARCH UID <set> 再 FETCH。"""
+    if not uids:
+        return [], ""
+    return _imap_fetch(app, mailbox, ["UID", ",".join(uids)], len(uids))
+
+
+def _quote_original(item: Dict[str, Any]) -> str:
+    """引用原文（回复/转发用）：头部信息 + '>' 前缀正文。"""
+    head = f"在 {item.get('date', '')}，{item.get('from', '')} 写道："
+    lines = ["> " + ln for ln in str(item.get("body") or "").splitlines()]
+    return head + "\n" + "\n".join(lines)
 
 
 class EmailWatch(WatchSource):
@@ -1286,12 +1554,13 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.3.2"
+    version = "1.4.0"
     description = (
-        "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
-        "IMAP 收件箱列表 / 关键词搜索 / 读取单封。认证支持 basic（密码/应用密码）"
-        "与 oauth2（SASL XOAUTH2 通用实现；预设 Outlook/Gmail/Fastmail/Zoho/QQ/163，"
-        "可自定义端点）；服务器参数随服务商预设自动带出，亦可手填。"
+        "邮件：SMTP 发信 / 回复 / 转发（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱"
+        "列表 / 关键词搜索 / 读取单封（含附件清单）/ 文件夹管理 / 删除·移动·标记。"
+        "认证支持 basic（密码/应用密码）与 oauth2（SASL XOAUTH2 通用实现；"
+        "预设 Outlook/Gmail/Fastmail/Zoho/QQ/163，可自定义端点）；服务器参数随服务商"
+        "预设自动带出，亦可手填。"
     )
 
     #: 通用插件 UI 协议。表单按数组顺序平铺渲染，宿主不支持条件显隐，因此这里
@@ -1386,8 +1655,8 @@ class EmailPlugin(ToolPlugin):
             {"key": "email_from", "type": "str", "label": "发件人地址（可选）",
              "hint": "留空则用邮箱账号"},
             {"key": "email_require_approval", "type": "boolean",
-             "label": "发送前需审批（推荐开启）", "default": True,
-             "hint": "每次 email_send 弹审批卡，用户确认后才发出"},
+             "label": "敏感操作前需审批（推荐开启）", "default": True,
+             "hint": "email_send 发送、email_manage 删除邮件时弹审批卡，用户确认后才执行"},
         ]
         return {"settings": items}
 
@@ -1524,6 +1793,110 @@ class EmailPlugin(ToolPlugin):
                     },
                 },
             ),
+            ToolDefinition(
+                name="email_manage",
+                description=(
+                    "管理邮件：删除 / 移动 / 标记已读未读（IMAP）。用 uids（来自 email_list）"
+                    "或 filter 条件（from/subject/since/until/unread）批量定位。"
+                    "删除默认**软删**（移入「已删除」文件夹，可找回），permanent=true 才彻底删除；"
+                    "删除前会弹审批卡确认。建议先 dry_run=true 预览将影响的邮件再执行。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["delete", "move", "mark"],
+                                   "description": "delete 删除 / move 移动 / mark 标记"},
+                        "uids": {"type": "array", "description": "邮件 UID 列表（来自 email_list）",
+                                 "items": {"type": "string"}},
+                        "filter": {"type": "object",
+                                   "description": "批量定位条件（与 uids 二选一）",
+                                   "properties": {
+                                       "from": {"type": "string"},
+                                       "subject": {"type": "string"},
+                                       "since": {"type": "string", "description": "起始日期 YYYY-MM-DD"},
+                                       "until": {"type": "string", "description": "截止日期 YYYY-MM-DD"},
+                                       "unread": {"type": "boolean"},
+                                   }},
+                        "folder": {"type": "string", "description": "源文件夹（默认 INBOX）"},
+                        "target": {"type": "string", "description": "move 的目标文件夹（move 必填）"},
+                        "flag": {"type": "string",
+                                 "enum": ["read", "unread", "flagged", "unflagged"],
+                                 "description": "mark 的旗标（mark 必填）"},
+                        "permanent": {"type": "boolean",
+                                      "description": "delete 时是否彻底删除（默认 false＝软删进「已删除」）"},
+                        "dry_run": {"type": "boolean",
+                                    "description": "true＝只预览将影响的邮件，不执行"},
+                        "max": {"type": "integer",
+                                "description": "filter 模式最多处理封数（默认 50，上限 200）"},
+                    },
+                    "required": ["action"],
+                },
+            ),
+            ToolDefinition(
+                name="email_folders",
+                description=(
+                    "列出邮箱所有 IMAP 文件夹及邮件数/未读数，标注收件箱/已发送/草稿/"
+                    "已删除等特殊文件夹。返回的名称可直接用于 email_list / email_manage "
+                    "的 folder 与 target 参数。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "counts": {"type": "boolean",
+                                   "description": "是否统计每个文件夹的邮件数/未读数"
+                                                  "（默认 true；文件夹多时较慢可设 false）"},
+                    },
+                },
+            ),
+            ToolDefinition(
+                name="email_reply",
+                description=(
+                    "回复某封邮件（自动 Re: 主题、引用原文、带 In-Reply-To/References 会话头）。"
+                    "先用 email_list/email_read 拿到 uid。默认只回复发件人，reply_all=true "
+                    "抄送原收件人。发送同样遵循三步：先 dry_run 预览，用户确认后再正式发送。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "原邮件所在文件夹（默认 INBOX）"},
+                        "uid": {"type": "string", "description": "原邮件 UID（必填，来自 email_list）"},
+                        "body": {"type": "string", "description": "你的回复正文（必填）"},
+                        "html": {"type": "string", "description": "HTML 排版正文（可选）"},
+                        "reply_all": {"type": "boolean", "description": "是否回复全部（默认 false）"},
+                        "attachments": {"type": "array",
+                                        "description": "附件文件名列表（工作区内路径）",
+                                        "items": {"type": "string"}},
+                        "dry_run": {"type": "boolean", "description": "true＝只预览草稿，不发送"},
+                    },
+                    "required": ["uid", "body"],
+                },
+            ),
+            ToolDefinition(
+                name="email_forward",
+                description=(
+                    "转发某封邮件（自动 Fwd: 主题、引用原文）。需指定收件人 to。"
+                    "先用 email_list/email_read 拿到 uid。发送同样遵循三步：先 dry_run 预览，"
+                    "用户确认后再正式发送。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "原邮件所在文件夹（默认 INBOX）"},
+                        "uid": {"type": "string", "description": "原邮件 UID（必填）"},
+                        "to": {"type": ["string", "array"], "description": "转发收件人（必填）",
+                               "items": {"type": "string"}},
+                        "cc": {"type": ["string", "array"], "description": "抄送",
+                               "items": {"type": "string"}},
+                        "body": {"type": "string", "description": "转发时附在原文前的说明（可选）"},
+                        "html": {"type": "string", "description": "HTML 排版正文（可选）"},
+                        "attachments": {"type": "array",
+                                        "description": "额外附件（工作区内路径）",
+                                        "items": {"type": "string"}},
+                        "dry_run": {"type": "boolean", "description": "true＝只预览草稿，不发送"},
+                    },
+                    "required": ["uid", "to"],
+                },
+            ),
         ]
 
     async def execute(self, name: str, args: Dict[str, Any]) -> str:
@@ -1535,6 +1908,14 @@ class EmailPlugin(ToolPlugin):
             return await self._read(args)
         if name == "email_oauth_login":
             return await self._oauth_login(args)
+        if name == "email_manage":
+            return await self._manage(args)
+        if name == "email_folders":
+            return await self._folders(args)
+        if name == "email_reply":
+            return await self._reply(args)
+        if name == "email_forward":
+            return await self._forward(args)
         return f"[Error]: 未知工具 {name}"
 
     # ------------------------------------------------------------ OAuth2 授权
@@ -1990,7 +2371,8 @@ class EmailPlugin(ToolPlugin):
                     "选择服务商，或直接填写 SMTP 服务器地址。")
         from_addr = _resolve_from_addr(self._app, user)
 
-        msg = _build_msg(from_addr, to, cc, bcc, subject, body, html_body, attached)
+        msg = _build_msg(from_addr, to, cc, bcc, subject, body, html_body, attached,
+                         headers=args.get("_headers"))
 
         try:
             await asyncio.to_thread(
@@ -2103,13 +2485,254 @@ class EmailPlugin(ToolPlugin):
             return f"[Error]: {err}"
         if item is None:
             return "[Error]: 未读到该邮件。"
+        atts = item.get("attachments") or []
+        att_line = ("\n附件：" + "；".join(
+            f"{a['name']}（{a['size']} 字节）" for a in atts)) if atts else ""
         return (
             f"[Email]: 主题：{item['subject']}\n"
             f"发件人：{item['from']}\n"
             f"收件人：{item['to']}（抄送 {item['cc'] or '(无)'}）\n"
-            f"日期：{item['date']}\n"
+            f"日期：{item['date']}{att_line}\n"
             f"---- 正文 ----\n{item['body']}"
         )
+
+    # ------------------------------------------------------------ 管理 / 文件夹 / 回复
+
+    def _resolve_uids(self, folder: str, flt: Dict[str, Any],
+                      max_items: int) -> Tuple[List[str], str]:
+        """filter 条件 → uid 列表（同步，复用列表检索的 IMAP/本地兜底策略）。"""
+        criteria = ["UNSEEN"] if flt.get("unread") else ["ALL"]
+        client_subj = ""
+        frm = str(flt.get("from") or "").strip()
+        if frm:
+            if frm.isascii():
+                criteria += ["FROM", f'"{frm}"']
+            else:
+                client_subj = frm          # 非 ASCII 发件人：本地过滤兜底
+        subj = str(flt.get("subject") or "").strip()
+        if subj:
+            if subj.isascii():
+                criteria += ["SUBJECT", f'"{subj}"']
+            else:
+                client_subj = subj
+        try:
+            if flt.get("since"):
+                criteria += ["SINCE", _imap_date(str(flt["since"]).strip())]
+            if flt.get("until"):
+                criteria += ["BEFORE", _imap_date(str(flt["until"]).strip())]
+        except ValueError:
+            return [], "日期格式应为 YYYY-MM-DD。"
+        fetch_max = max_items * 5 if client_subj else max_items
+        items, err = _imap_fetch(self._app, folder, criteria, fetch_max)
+        if err:
+            return [], err
+        if client_subj:
+            items = [it for it in items if client_subj in str(it.get("subject") or "")]
+        return [str(it["uid"]) for it in items][:max_items], ""
+
+    async def _manage(self, args: Dict[str, Any]) -> str:
+        from litework.tools.todos import current_session_id
+
+        action = str(args.get("action") or "").strip().lower()
+        if action not in ("delete", "move", "mark"):
+            return "[Error]: action 需为 delete / move / mark 之一。"
+        folder = str(args.get("folder") or "INBOX").strip() or "INBOX"
+        target = str(args.get("target") or "").strip()
+        flag = str(args.get("flag") or "").strip().lower()
+        if action == "move" and not target:
+            return "[Error]: move 需指定 target（目标文件夹，可用 email_folders 查看）。"
+        if action == "mark" and flag not in _FLAG_STORE:
+            return "[Error]: mark 需指定 flag＝read / unread / flagged / unflagged。"
+        permanent = bool(args.get("permanent")) and action == "delete"
+        dry_run = bool(args.get("dry_run"))
+        try:
+            raw_max = int(args.get("max") or DEFAULT_MANAGE_ITEMS)
+        except (TypeError, ValueError):
+            raw_max = DEFAULT_MANAGE_ITEMS
+        max_items = max(1, min(raw_max, MAX_MANAGE_ITEMS))
+
+        uids = [str(u).strip() for u in _to_list(args.get("uids") or [])
+                if re.fullmatch(r"\d+", str(u).strip())]
+        flt = args.get("filter") if isinstance(args.get("filter"), dict) else None
+        if not uids and not flt:
+            return ("[Error]: 需提供 uids（来自 email_list），或 filter"
+                    "（from/subject/since/until/unread）批量定位。")
+        if not uids:
+            resolved, rerr = await asyncio.to_thread(
+                self._resolve_uids, folder, flt or {}, max_items)
+            if rerr:
+                return f"[Error]: {rerr}"
+            uids = resolved
+            if not uids:
+                return f"[Email]: {folder} 中没有匹配 filter 条件的邮件。"
+        uids = uids[:max_items]
+
+        # 预览明细（dry_run 与审批卡复用；读不到不影响执行）
+        items, _perr = await asyncio.to_thread(_preview_by_uids, self._app, folder, uids)
+        preview = ""
+        if items:
+            shown = items[:10]
+            preview = "\n".join(
+                f"- {it.get('date', '')} | {it.get('from', '')} | {it.get('subject', '')}"
+                for it in shown)
+            if len(items) > len(shown):
+                preview += "\n…"
+
+        if dry_run:
+            head = {"delete": "永久删除" if permanent else "删除（移入「已删除」）",
+                    "move": f"移动到「{target}」",
+                    "mark": f"标记为 {flag}"}[action]
+            return (f"[Email]: 预览（未执行）—— 将对 {folder} 中 {len(uids)} 封邮件：{head}\n"
+                    + (preview or "（无法读取预览明细）")
+                    + "\n确认后去掉 dry_run 再执行。")
+
+        # 软删＝移动到「已删除」文件夹（可找回）；永久删＝就地 EXPUNGE
+        eff_action, eff_target = action, target
+        if action == "delete" and not permanent:
+            trash, terr = await asyncio.to_thread(_imap_find_trash, self._app)
+            if terr or not trash:
+                return ("[Error]: 未找到「已删除」文件夹，无法软删。"
+                        "如需彻底删除请传 permanent=true。")
+            eff_action, eff_target = "move", trash
+
+        # 删除（破坏性）走审批门
+        if action == "delete":
+            gate = getattr(self._app, "approval_gate", None)
+            try:
+                require = bool(_cfg(self._app, "email_require_approval", True))
+            except Exception:
+                require = True
+            if require:
+                if gate is None:
+                    return "[Error]: 审批门不可用，无法删除邮件（删除审批已开启）。"
+                what = "永久删除" if permanent else f"移入「{eff_target}」"
+                title = f"删除邮件：{len(uids)} 封（{what}）"
+                context = (f"文件夹：{folder}\n数量：{len(uids)} 封\n操作：{what}\n"
+                           + (preview + "\n" if preview else "")
+                           + "\n批准后立即执行；软删可在「已删除」中找回。")
+                session_id = current_session_id.get("")
+                future = gate.request_approval(title, context, session_id=session_id)
+                approval_id = gate.current_id(future) if hasattr(gate, "current_id") else ""
+                kernel = getattr(self, "_kernel", None)
+                if approval_id and kernel is not None:
+                    try:
+                        await kernel.events.emit("approval:request", {
+                            "id": approval_id,
+                            "action": title,
+                            "reason": context,
+                            "rememberable": False,
+                            "judge_opinion": None,
+                        })
+                    except Exception:
+                        logger.debug("[email] 删除审批事件发送失败（前端经兜底轮询补卡）",
+                                     exc_info=True)
+                try:
+                    result = await future
+                except Exception as e:
+                    return f"[Error]: 审批等待异常：{e}"
+                if isinstance(result, dict):
+                    if not result.get("approved"):
+                        return "[Denied]: 用户取消了删除操作。"
+                elif not result:
+                    return "[Denied]: 用户取消了删除操作。"
+
+        count, merr = await asyncio.to_thread(
+            _imap_manage, self._app, folder, uids, eff_action,
+            eff_target if eff_action == "move" else "", flag)
+        if merr:
+            return f"[Error]: {merr}（已处理 {count or 0} 封）"
+        desc = {"delete": "已永久删除" if permanent else f"已移入「{eff_target}」",
+                "move": f"已移动到「{target}」",
+                "mark": f"已标记为 {flag}"}[action]
+        return f"[Email OK]: {folder} 中 {count} 封邮件{desc}。"
+
+    async def _folders(self, args: Dict[str, Any]) -> str:
+        counts = args.get("counts")
+        counts = True if counts is None else bool(counts)
+        folders, err = await asyncio.to_thread(_imap_folder_list, self._app, counts)
+        if err:
+            return f"[Error]: {err}"
+        if not folders:
+            return "[Email]: 未列出任何文件夹。"
+        lines = [f"[Email]: 共 {len(folders)} 个文件夹"
+                 "（名称可直接用于 email_list / email_manage 的 folder）："]
+        for f in folders:
+            tag = f" [{f['special']}]" if f.get("special") else ""
+            ro = "（不可选/只读）" if f.get("noselect") else ""
+            stat = ""
+            if counts:
+                if f.get("messages") is not None:
+                    stat = f" | 邮件 {f['messages']} | 未读 {f.get('unseen', 0)}"
+                elif not f.get("noselect"):
+                    stat = " | (无法统计)"
+            lines.append(f"- {f['name']}{tag}{ro}{stat}")
+        return "\n".join(lines)
+
+    async def _reply(self, args: Dict[str, Any]) -> str:
+        folder = str(args.get("folder") or "INBOX").strip() or "INBOX"
+        uid = str(args.get("uid") or "").strip()
+        if not re.fullmatch(r"\d+", uid):
+            return "[Error]: uid 必须是 email_list 返回的纯数字 UID。"
+        body = str(args.get("body") or "").strip()
+        if not body and not str(args.get("html") or "").strip():
+            return "[Error]: 回复正文为空（body 必填）。"
+        item, err = await asyncio.to_thread(_imap_read, self._app, folder, uid)
+        if err:
+            return f"[Error]: {err}"
+        if item is None:
+            return "[Error]: 未读到该邮件。"
+        addr = parseaddr(str(item.get("from") or ""))[1]
+        if not addr:
+            return "[Error]: 原邮件发件人无法解析，无法回复。"
+        to = [addr]
+        cc: List[str] = []
+        if args.get("reply_all"):
+            me = str(_cfg(self._app, "email_user", "") or "").strip().lower()
+            others = [parseaddr(x)[1]
+                      for x in re.split(r"[,;]",
+                                        f"{item.get('to', '')},{item.get('cc', '')}")
+                      if parseaddr(x)[1]]
+            cc = [a for a in dict.fromkeys(others)
+                  if a.lower() not in (me, addr.lower())]
+        subj = str(item.get("subject") or "")
+        if not subj.lower().startswith("re:"):
+            subj = "Re: " + subj
+        headers: Dict[str, str] = {}
+        mid = str(item.get("message_id") or "").strip()
+        if mid:
+            headers["In-Reply-To"] = mid
+            refs = str(item.get("references") or "").strip()
+            headers["References"] = (refs + " " + mid).strip() if refs else mid
+        text = f"{body}\n\n{_quote_original(item)}"
+        return await self._send({
+            "to": to, "cc": cc, "subject": subj, "body": text,
+            "html": args.get("html"), "attachments": args.get("attachments"),
+            "dry_run": bool(args.get("dry_run")), "_headers": headers,
+        })
+
+    async def _forward(self, args: Dict[str, Any]) -> str:
+        folder = str(args.get("folder") or "INBOX").strip() or "INBOX"
+        uid = str(args.get("uid") or "").strip()
+        if not re.fullmatch(r"\d+", uid):
+            return "[Error]: uid 必须是 email_list 返回的纯数字 UID。"
+        to = _to_list(args.get("to"))
+        if not to:
+            return "[Error]: 转发需指定收件人 to。"
+        item, err = await asyncio.to_thread(_imap_read, self._app, folder, uid)
+        if err:
+            return f"[Error]: {err}"
+        if item is None:
+            return "[Error]: 未读到该邮件。"
+        subj = str(item.get("subject") or "")
+        if not subj.lower().startswith("fwd:"):
+            subj = "Fwd: " + subj
+        note = str(args.get("body") or "").strip()
+        text = (note + "\n\n" if note else "") + _quote_original(item)
+        return await self._send({
+            "to": to, "cc": args.get("cc"), "subject": subj, "body": text,
+            "html": args.get("html"), "attachments": args.get("attachments"),
+            "dry_run": bool(args.get("dry_run")),
+        })
 
 
 def _imap_date(d: str) -> str:
