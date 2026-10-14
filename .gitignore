@@ -5,3 +5,7 @@ engines/
 __pycache__/
 *.pyc
 .DS_Store
+
+# 测试/运行时泄漏的授权中间态，绝不入库
+plugins/*/auth_pending.json
+plugins/*/config.local.json

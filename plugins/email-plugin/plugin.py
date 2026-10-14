@@ -35,6 +35,29 @@ from litework.tools.plugin import ToolPlugin
 
 logger = logging.getLogger("litework.email")
 
+# 盯梢源基类（lite-work ≥1.10.9）。旧宿主没有 litework.watch 时下面定义的
+# EmailWatch 不注册——基类退化为空 object，加载器挑 WatchSource 子类时自然
+# 跳过本模块，不影响 email-plugin 的四个工具照常工作。
+try:
+    from litework.watch.registry import ProbeContext, ProbeResult, WatchSource
+except ImportError:  # 旧宿主降级
+    class WatchSource:  # type: ignore[no-redef]
+        """空基类占位（旧宿主无盯梢扩展点）。"""
+
+        name = "watch-source"
+        source_kind = ""
+        display_name = ""
+        description = ""
+        version = "1.0.0"
+        probe_interval_hint = 300
+        config_schema: Dict[str, str] = {}
+
+        async def probe(self, cfg: Dict[str, Any], ctx: Any) -> Any:  # pragma: no cover
+            raise NotImplementedError
+
+    ProbeResult = None  # type: ignore[assignment,misc]
+    ProbeContext = None  # type: ignore[assignment,misc]
+
 DEFAULT_SMTP_PORT = 587
 DEFAULT_IMAP_PORT = 993
 MAX_BODY_CHARS = 8000
@@ -436,13 +459,34 @@ def _decode(s: Any) -> str:
 
 
 def _to_list(v: Any) -> List[str]:
-    """兼容字符串/数组入参的收件人解析（逗号分隔亦可）。"""
+    """兼容字符串/数组入参的收件人解析（逗号分隔亦可）。
+
+    真实故障：JSON 数组参数偶发被宿主序列化成 '["a@x.com"]' 字符串，
+    原实现只按逗号切，方括号/引号原样进 To 头 → SMTP 报 5.1.3 Invalid
+    address。这里对字符串先剥 JSON 数组包装再切，兜住这条路径。
+    """
     if v is None:
         return []
     if isinstance(v, list):
-        return [str(x).strip() for x in v if str(x).strip()]
+        out: List[str] = []
+        for x in v:
+            if isinstance(x, (list, tuple)):
+                out += [str(i).strip() for i in x if str(i).strip()]
+            else:
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+        return out
     if isinstance(v, str):
-        return [x.strip() for x in v.split(",") if x.strip()]
+        s = v.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return _to_list(parsed)
+            except Exception:  # noqa: BLE001 - 不是 JSON 就按原文切
+                pass
+        return [x.strip() for x in s.split(",") if x.strip()]
     return []
 
 
@@ -852,6 +896,8 @@ def _read_private() -> Dict[str, Any]:
 def _persist_refresh_token(app, token: str) -> bool:
     """保存 refresh_token：私有文件（主）+ config.json（副本，若能拿到可写的 app）。"""
     ok = _write_private({"refresh_token": token})
+    # 拿到新令牌意味着授权完成，待授权信息一并清掉
+    _write_auth_pending(None)
     try:
         cur = dict((getattr(app, "config", {}) or {}).get("email-plugin") or {})
         cur["email_oauth_refresh_token"] = token
@@ -860,6 +906,51 @@ def _persist_refresh_token(app, token: str) -> bool:
         logger.debug("[email] refresh_token 写回 config 失败（私有文件已兜底）",
                      exc_info=True)
     return ok
+
+
+_AUTH_PENDING_NAME = "auth_pending.json"
+
+
+def _auth_pending_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), _AUTH_PENDING_NAME)
+
+
+def _read_auth_pending() -> Dict[str, Any]:
+    """读待授权的设备码（磁盘持久化，跨重启可续接）。
+
+    授权流程的老毛病：设备码只在内存里（_ACTION_STATE / _device_cache），
+    用户没来得及抄码、或应用一重启，码就没了且无法回退，只能整轮重来。
+    现在码落盘，任何时候都能回看 / 续授 / 作废。
+    """
+    try:
+        with open(_auth_pending_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        if float(data.get("expires_at") or 0) < time.time():
+            return {}          # 过期码不外泄
+        return data
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_auth_pending(data: Optional[Dict[str, Any]]) -> bool:
+    """写 / 清（None）待授权设备码（原子写，0600——里面没有秘密，但保持一致）。"""
+    path = _auth_pending_path()
+    try:
+        if data is None:
+            if os.path.exists(path):
+                os.remove(path)
+            return True
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[email] 待授权设备码写盘失败", exc_info=True)
+        return False
 
 
 def _resolve_auth_mode(own: Dict[str, Any]) -> str:
@@ -1099,11 +1190,90 @@ def _imap_read(app, mailbox: str, uid: str) -> Tuple[Optional[Dict[str, Any]], s
         return None, f"IMAP 连接失败（{host}:{port}）：{e}"
 
 
+class EmailWatch(WatchSource):
+    """盯梢源：盯邮箱里出现（或变动）的邮件——支持关键字/发件人过滤。
+
+    复用 email-plugin 已配好的认证与 IMAP 通道（同目录共享 _imap_fetch），
+    零额外配置：只要 email-plugin 本身能用，本源即可用。探针只取快照：
+    命中邮件的 uid+主题列表；指纹变了（新邮件到达/命中集变化）才触发 Agent。
+    """
+
+    name = "email-watch"
+    source_kind = "email"
+    display_name = "邮件（关键字盯梢）"
+    description = ("定时检查邮箱（复用 email-plugin 的认证与 IMAP 通道），"
+                   "按关键字/发件人/未读过滤，命中集变化时触发。"
+                   "需要 email-plugin 已配置并完成授权。")
+    probe_interval_hint = 300
+
+    #: 字段说明（主程序按此渲染计划编辑器）
+    config_schema = {
+        "keyword": "关键字（多个逗号分隔，匹配主题/发件人/正文；留空＝盯全部新邮件）",
+        "from": "可选：只盯某个发件人",
+        "unread": "可选：true＝只盯未读",
+        "folder": "可选：邮箱文件夹（默认 INBOX）",
+    }
+
+    async def probe(self, cfg: Dict[str, Any], ctx: "ProbeContext") -> "ProbeResult":
+        # 依赖同目录 plugin.py 顶层的 _imap_fetch / _own_cfg；本类与之同居
+        # 一个模块，直接用。app 形状：ProbeContext 只给 config dict，
+        # 包成 _SimpleApp 即可复用全部配置读取路径。
+        own = (ctx.config or {}).get("email-plugin")
+        if not isinstance(own, dict) or not str(own.get("email_user") or "").strip():
+            return ProbeResult(ok=False,
+                               error="email-plugin 未配置（先在设置页完成邮箱配置）")
+        app = _SimpleApp(ctx.config)
+        folder = str(cfg.get("folder") or "INBOX").strip() or "INBOX"
+        criteria = ["UNSEEN" if cfg.get("unread") else "ALL"]
+        frm = str(cfg.get("from") or "").strip()
+        if frm and frm.isascii():
+            criteria += ["FROM", f'"{frm}"']
+        # 盯梢窗口：默认最近 1 天（SINCE），避免首跑把整个收件箱当快照——
+        # 那样「变化」语义就变成「历史任何一封被删也算变化」。
+        try:
+            import datetime as _dt
+            since_days = max(1, min(int(cfg.get("since_days") or 1), 30))
+        except (TypeError, ValueError):
+            since_days = 1
+        since = (_dt.date.today() - _dt.timedelta(days=since_days)).strftime("%d-%b-%Y")
+        criteria += ["SINCE", since]
+
+        keywords = [k.strip() for k in
+                    _to_list(cfg.get("keyword") or "") if k.strip()]
+        max_scan = 50 if keywords else 20
+        items, err = await asyncio.to_thread(
+            _imap_fetch, app, folder, criteria, max_scan)
+        if err:
+            return ProbeResult(ok=False, error=f"IMAP 探测失败：{err}")
+
+        if keywords:
+            def _hit(it: Dict[str, Any]) -> bool:
+                head = f"{it.get('subject', '')}\n{it.get('from', '')}"
+                for k in keywords:
+                    if k.lower() not in head.lower():
+                        # 头字段没命中 → 拉正文再验（懒加载）
+                        body, berr = _imap_read(app, folder, str(it["uid"]))
+                        if berr or not body:
+                            return False
+                        if k.lower() not in str(body.get("body", "")).lower():
+                            return False
+                return True
+            items = [it for it in items if _hit(it)]
+
+        snapshot = "\n".join(f"{it['uid']}|{it['subject']}" for it in items)
+        summary = f"{len(items)} 封命中" + (f"（关键字:{'+'.join(keywords)}）" if keywords else "")
+        hint = ""
+        if items:
+            hint = "命中的最新邮件：\n" + "\n".join(
+                f"- {it['date']} | {it['from']} | {it['subject']}" for it in items[:5])
+        return ProbeResult(snapshot=snapshot, summary=summary, changed_hint=hint)
+
+
 class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.2.0"
+    version = "1.3.0"
     description = (
         "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
         "IMAP 收件箱列表 / 关键词搜索 / 读取单封。认证支持 basic（密码/应用密码）"
@@ -1139,7 +1309,11 @@ class EmailPlugin(ToolPlugin):
             items.append({"key": "email_oauth_authorize", "type": "action",
                           "label": "立即授权" if not own_rt else "重新授权",
                           "hint": "点击后自动打开浏览器完成登录授权；一次授权长期有效"
-                                  "（仅主动撤销或改密码才需重新授权）"})
+                                  "（仅主动撤销或改密码才需重新授权）。忘了设备码"
+                                  "随时**再点一次本按钮**即可回看（不换码）"})
+            items.append({"key": "email_oauth_cancel", "type": "action",
+                          "label": "取消授权",
+                          "hint": "作废进行中的设备码；下次点「立即授权」拿到全新代码"})
             if provider not in PUBLIC_CLIENT_IDS:
                 items.append({"key": "email_oauth_client_id", "type": "str",
                               "label": "客户端 ID",
@@ -1273,7 +1447,8 @@ class EmailPlugin(ToolPlugin):
                 name="email_list",
                 description=(
                     "列出收件箱邮件（IMAP；默认 INBOX，最新在前）。可按发件人/主题关键词/"
-                    "未读/日期范围过滤。返回每封的 uid/发件人/主题/日期。"
+                    "全文关键词/未读/日期范围过滤。返回每封的 uid/发件人/主题/日期。"
+                    "keyword 支持全文搜索（主题+发件人+正文），多个关键词逗号分隔、须同时命中。"
                 ),
                 parameters={
                     "type": "object",
@@ -1281,6 +1456,9 @@ class EmailPlugin(ToolPlugin):
                         "folder": {"type": "string", "description": "IMAP 文件夹（默认 INBOX）"},
                         "from": {"type": "string", "description": "按发件人过滤"},
                         "subject": {"type": "string", "description": "按主题关键词过滤"},
+                        "keyword": {"type": ["string", "array"],
+                                    "description": "全文关键词（匹配主题/发件人/正文；多个逗号分隔=AND）",
+                                    "items": {"type": "string"}},
                         "unread": {"type": "boolean", "description": "仅未读"},
                         "since": {"type": "string", "description": "起始日期 YYYY-MM-DD"},
                         "until": {"type": "string", "description": "截止日期 YYYY-MM-DD"},
@@ -1351,7 +1529,7 @@ class EmailPlugin(ToolPlugin):
         打开浏览器、启动后台轮询线程并返回指引；用户在浏览器同意后轮询线程
         自动保存令牌。再次点击时若授权已完成则报成功（附 SMTP/IMAP 自检）。
         """
-        if key != "email_oauth_authorize":
+        if key not in ("email_oauth_authorize", "email_oauth_cancel"):
             return {"ok": False, "message": f"未知动作 {key}"}
 
         own = (config or {}).get(self.name) if isinstance(config, dict) else {}
@@ -1362,18 +1540,32 @@ class EmailPlugin(ToolPlugin):
         if not user:
             return {"ok": False, "message": "请先填写「邮箱账号」并保存"}
 
+        # ---- 取消授权：作废进行中的设备码，下次点「立即授权」拿全新的 ----
+        if key == "email_oauth_cancel":
+            self._ACTION_STATE["auth"] = {}
+            _write_auth_pending(None)
+            return {"ok": True, "message": "已取消进行中的授权（设备码作废）。点击「立即授权」可重新开始"}
+
+        # ---- 进行中的授权：优先看内存轮询状态；没有则读磁盘（跨重启续接） ----
         state = self._ACTION_STATE.get("auth") or {}
-        if state.get("running"):
-            # 再次点击不重发设备码（Azure 同一设备码只能轮询，重发会让
-            # 用户拿到的旧码作废），但要**把同一组码再说一遍**：前端是
-            # 覆盖式渲染这条消息，若这里只回「进行中」，用户一旦点第二次
-            # 就再也看不到码，只能干等或反复点。故状态里留着码原样回显。
-            code = str(state.get("user_code") or "")
-            verify = str(state.get("verify") or "")
+        pending_disk = _read_auth_pending()
+        if state.get("running") or (not state.get("done") and pending_disk
+                                    and pending_disk.get("running")):
+            # 再次点击不重发设备码（Azure 同一设备码只能轮询，重发会让用户
+            # 拿到的旧码作废），但**把同一组码再说一遍**。码现在有磁盘副本，
+            # 即便应用重启、内存丢了，也照样回显——这是老流程「没抄下码就
+            # 无法回退」的根治点。
+            pend = pending_disk if (not state.get("running") and pending_disk) else state
+            code = str(pend.get("user_code") or "")
+            verify = str(pend.get("verify") or "")
+            if not state.get("running"):
+                # 重启后续接：起一个新的轮询线程接上同一个设备码
+                self._resume_poll(config, pend)
             guide = (f"请打开 {verify} 输入代码 {code}" if code
                      else "请在弹出的浏览器页面完成登录授权")
             return {"ok": True,
-                    "message": f"授权进行中——{guide}，点「同意」后这里会自动变成成功"}
+                    "message": (f"授权进行中——{guide}，点「同意」后这里会自动变成成功；"
+                                f"也可点「取消授权」作废重来")}
         if state.get("done"):
             action_app = _SimpleApp(config)
             token, terr = _access_token(action_app)
@@ -1396,6 +1588,8 @@ class EmailPlugin(ToolPlugin):
             deadline = time.time() + min(float(payload.get("expires_in") or 900), 900)
             interval = max(int(payload.get("interval") or 5), 3)
             while time.time() < deadline:
+                if not _read_auth_pending().get("running"):
+                    return            # 用户点了「取消授权」，停止轮询
                 p, e, st = _oauth_device_poll(conf, dc)
                 if st == "done":
                     rt = str((p or {}).get("refresh_token") or "")
@@ -1411,19 +1605,73 @@ class EmailPlugin(ToolPlugin):
                 if st == "error":
                     self._ACTION_STATE["auth"] = {"running": False, "done": False,
                                                   "error": e}
+                    _write_auth_pending(None)
                     return
                 time.sleep(interval)
             self._ACTION_STATE["auth"] = {"running": False, "done": False,
                                           "error": "设备码已过期，请重新点击「立即授权」"}
+            _write_auth_pending(None)
 
-        # 码存进状态：运行中重复点击时原样回显（前端覆盖式渲染，不存就丢）
+        # 码双写：内存（运行中回显）+ 磁盘（重启后回看/续接/取消）
+        try:
+            expires_in = min(float(payload.get("expires_in") or 900), 900)
+        except (TypeError, ValueError):
+            expires_in = 900.0
         self._ACTION_STATE["auth"] = {"running": True, "user_code": user_code,
                                       "verify": verify}
+        _write_auth_pending({
+            "running": True, "user_code": user_code, "verify": verify,
+            "device_code": str(payload.get("device_code") or ""),
+            "interval": payload.get("interval") or 5,
+            "expires_at": time.time() + expires_in,
+        })
         threading.Thread(target=_poll, daemon=True,
                          name="email-oauth-action").start()
         return {"ok": True,
-                "message": f"已打开浏览器（若未弹出请访问 {verify}），"
-                           f"登录后输入代码 {user_code} 并点「同意」。完成后再次点击此按钮确认结果"}
+                "message": (f"已打开浏览器（若未弹出请访问 {verify}），"
+                            f"登录后输入代码 {user_code} 并点「同意」。"
+                            f"**代码 {expires_in/60:.0f} 分钟内有效，忘了随时回来点本按钮查看**；"
+                            f"完成后再次点击确认结果")}
+
+    def _resume_poll(self, config: Dict[str, Any], pend: Dict[str, Any]) -> None:
+        """应用重启后接续轮询磁盘上未过期的设备码（不重发新码）。"""
+        conf = _oauth_conf(_SimpleApp(config))
+        dc = str(pend.get("device_code") or "")
+        if not dc:
+            return
+        interval = max(int(pend.get("interval") or 5), 3)
+        deadline = float(pend.get("expires_at") or 0)
+
+        def _poll():
+            while time.time() < deadline:
+                if not _read_auth_pending().get("running"):
+                    return
+                p, e, st = _oauth_device_poll(conf, dc)
+                if st == "done":
+                    rt = str((p or {}).get("refresh_token") or "")
+                    if rt and _persist_refresh_token(_SimpleApp(config), rt):
+                        with _oauth_lock:
+                            _token_cache.update({"key": "", "access": "", "exp": 0.0})
+                        self._ACTION_STATE["auth"] = {"running": False, "done": True}
+                    else:
+                        self._ACTION_STATE["auth"] = {"running": False, "done": False,
+                                                     "error": "令牌保存失败"}
+                    return
+                if st == "error":
+                    self._ACTION_STATE["auth"] = {"running": False, "done": False,
+                                                  "error": e}
+                    _write_auth_pending(None)
+                    return
+                time.sleep(interval)
+            self._ACTION_STATE["auth"] = {"running": False, "done": False,
+                                          "error": "设备码已过期，请重新点击「立即授权」"}
+            _write_auth_pending(None)
+
+        self._ACTION_STATE["auth"] = {"running": True,
+                                      "user_code": pend.get("user_code"),
+                                      "verify": pend.get("verify")}
+        threading.Thread(target=_poll, daemon=True,
+                         name="email-oauth-resume").start()
 
     def _probe_health(self, user: str, token: str, provider: str = "outlook") -> str:
         """授权成功后的连通性自检：SMTP + IMAP 各试一次握手。
@@ -1696,6 +1944,7 @@ class EmailPlugin(ToolPlugin):
         # UTF-8 原样都会被微软服务器拒为 BAD Command Error。因此非 ASCII 的
         # 主题/发件人条件不进 IMAP 搜索，改为拉取后在客户端本地过滤。
         client_subj = ""
+        client_body: List[str] = []      # 全文关键词（本地过滤；见下）
         criteria = ["ALL"]
         if args.get("unread"):
             criteria = ["UNSEEN"]
@@ -1711,6 +1960,16 @@ class EmailPlugin(ToolPlugin):
                 criteria += ["SUBJECT", f'"{subj}"']
             else:
                 client_subj = subj         # 中文主题：本地过滤
+
+        # 全文关键词搜索：keyword=（单串可含逗号/空格分词）搜正文+主题+发件人。
+        # 不用 IMAP TEXT/BODY 条件——微软服务器对含空格/中文的 TEXT 条件回
+        # BAD，且 BODY 搜不到 Subject。统一客户端过滤：拉头字段 + 必要时
+        # 拉正文，本地匹配（大小写不敏感）。多关键词之间是 AND。
+        for kw in _to_list(args.get("keyword") or ""):
+            k = str(kw).strip()
+            if k:
+                client_body.append(k)
+
         try:
             if args.get("since"):
                 criteria += ["SINCE", _imap_date(str(args["since"]).strip())]
@@ -1719,17 +1978,34 @@ class EmailPlugin(ToolPlugin):
         except ValueError:
             return "[Error]: 日期格式应为 YYYY-MM-DD。"
 
-        # 中文条件本地过滤时多拉一些，避免目标邮件被 max 截断
-        fetch_max = max_items * 5 if client_subj else max_items
+        # 本地过滤（中文条件 / 全文关键词）时多拉一些，避免目标邮件被 max 截断
+        fetch_max = max_items * 5 if (client_subj or client_body) else max_items
         items, err = await asyncio.to_thread(
             _imap_fetch, self._app, folder, criteria, fetch_max)
         if err:
             return f"[Error]: {err}"
         if client_subj:
-            items = [it for it in items if client_subj in it["subject"]][:max_items]
+            items = [it for it in items if client_subj in it["subject"]]
+        if client_body:
+            # 全文关键词：头字段匹配不上的再逐封拉正文匹配（懒加载——多数
+            # 邮件在主题/发件人就能匹配或被其他条件排除，不必每封都拉正文）。
+            def _hit(it: Dict[str, Any]) -> bool:
+                head = f"{it.get('subject', '')}\n{it.get('from', '')}".lower()
+                for k in client_body:
+                    if k.lower() in head:
+                        continue      # 头字段已命中，无需拉正文
+                    body, berr = _imap_read(self._app, folder, str(it["uid"]))
+                    if berr or not body:
+                        return False
+                    if k.lower() not in str(body.get("body", "")).lower():
+                        return False
+                return True
+            items = [it for it in items if _hit(it)]
+        items = items[:max_items]
         if not items:
             return f"[Email]: {folder} 中没有匹配的邮件（条件：{' '.join(criteria)}" \
-                   + (f" / 本地过滤:{client_subj}" if client_subj else "") + "）。"
+                   + (f" / 本地过滤:{client_subj}" if client_subj else "") \
+                   + (f" / 关键词:{'+'.join(client_body)}" if client_body else "") + "）。"
         lines = [f"[Email]: {folder} 共找到 {len(items)} 封（最新在前，uid 供 email_read 使用）："]
         for it in items:
             lines.append(f"- uid={it['uid']} | {it['date']} | {it['from']} | {it['subject']}")

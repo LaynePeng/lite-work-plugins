@@ -24,6 +24,13 @@ emailplugin._read_private = lambda: dict(_PRIVATE_STUB)
 emailplugin._write_private = lambda data: (_PRIVATE_STUB.clear(),
                                            _PRIVATE_STUB.update(data), True)[2]
 
+# 待授权设备码同样隔离（新授权流程把它落盘；测试不碰真实文件）
+_PENDING_STUB: dict = {}
+emailplugin._read_auth_pending = lambda: dict(_PENDING_STUB)
+emailplugin._write_auth_pending = lambda data: (_PENDING_STUB.clear(),
+                                                (_PENDING_STUB.update(data)
+                                                 if data is not None else None), True)[2]
+
 
 class Approval:
     def __init__(self, ok=True):
@@ -55,12 +62,14 @@ class _App:
 class EmailPluginBase(unittest.TestCase):
     def setUp(self):
         _PRIVATE_STUB.clear()
+        _PENDING_STUB.clear()
         emailplugin._token_cache.update({"key": "", "access": "", "exp": 0.0})
         emailplugin._device_cache.clear()
         self.plugin = emailplugin.EmailPlugin()
 
     def tearDown(self):
         _PRIVATE_STUB.clear()
+        _PENDING_STUB.clear()
         emailplugin._token_cache.update({"key": "", "access": "", "exp": 0.0})
         emailplugin._device_cache.clear()
 
