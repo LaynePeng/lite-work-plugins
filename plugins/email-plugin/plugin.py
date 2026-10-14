@@ -1408,8 +1408,10 @@ class EmailPlugin(ToolPlugin):
 
     def __init__(self) -> None:
         self._app = None
+        self._kernel = None
 
     def install(self, kernel) -> None:
+        self._kernel = kernel
         try:
             if kernel.has_service("app"):
                 self._app = kernel.get_service("app")
@@ -1896,12 +1898,59 @@ class EmailPlugin(ToolPlugin):
                 + (f"\n附件：{', '.join(n for _, n in attached) or '(无)'}" if attached else "")
                 + "\n\n批准后该邮件将被立即发送。"
             )
-            future = gate.request_approval(f"发送邮件：{subject}", context, session_id=session_id)
+            # 结构化草稿：前端审批卡渲染 WYSIWYG 邮件编辑器（字段 + 富文本正文
+            # + HTML 源码模式）；用户改后 approve 携带 edits 回来，此处覆盖发送。
+            draft = {
+                "kind": "email",
+                "to": ", ".join(to),
+                "cc": ", ".join(cc),
+                "bcc": ", ".join(bcc),
+                "subject": subject,
+                "body": body,
+                "html": html_body or "",
+                "attachments": [n for _, n in attached],
+            }
+            future = gate.request_approval(f"发送邮件：{subject}", context,
+                                           session_id=session_id, draft=draft)
+            # 直连 gate 不经过 security 中间件——必须自发 approval:request 事件，
+            # 否则审批卡只能靠 30s 兜底轮询出现（慢且此前不带 draft）。
+            approval_id = gate.current_id(future) if hasattr(gate, "current_id") else ""
+            kernel = getattr(self, "_kernel", None)
+            if approval_id and kernel is not None:
+                try:
+                    await kernel.events.emit("approval:request", {
+                        "id": approval_id,
+                        "action": f"发送邮件：{subject}",
+                        "reason": context,
+                        "rememberable": False,
+                        "judge_opinion": None,
+                        "draft": draft,
+                    })
+                except Exception:
+                    logger.debug("[email] approval:request 事件发送失败（前端将经兜底轮询补卡）", exc_info=True)
             try:
-                ok = await future
+                result = await future
             except Exception as e:
                 return f"[Error]: 审批等待异常：{e}"
-            if not ok:
+            # 结果三种形态：False（拒绝）/ True（原稿发送）/ {"approved":True,"edits":{…}}
+            if isinstance(result, dict):
+                if not result.get("approved"):
+                    return "[Denied]: 用户拒绝发送该邮件。"
+                edits = result.get("edits") or {}
+                if isinstance(edits, dict):
+                    def _apply_list(cur: List[str], raw: Any) -> List[str]:
+                        v = _to_list(raw)
+                        return v if v else cur
+                    to = _apply_list(to, edits.get("to"))
+                    cc = _apply_list(cc, edits.get("cc"))
+                    bcc = _apply_list(bcc, edits.get("bcc"))
+                    if str(edits.get("subject") or "").strip():
+                        subject = str(edits["subject"]).strip()
+                    if str(edits.get("body") or "").strip():
+                        body = str(edits["body"]).strip()
+                    if "html" in edits and str(edits.get("html") or "").strip():
+                        html_body = str(edits["html"]).strip()
+            elif not result:
                 return "[Denied]: 用户拒绝发送该邮件。"
 
         # ---------- 组装与发送 ----------

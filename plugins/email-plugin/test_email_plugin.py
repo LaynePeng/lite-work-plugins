@@ -43,9 +43,10 @@ class Approval:
         self.last_title = None
         self.last_context = None
 
-    def request_approval(self, title, context, session_id=""):
+    def request_approval(self, title, context, session_id="", **kwargs):
         self.last_title = title
         self.last_context = context
+        self.last_kwargs = kwargs
         fut = asyncio.Future()
         fut.set_result(self.ok)
         return fut
@@ -162,6 +163,38 @@ class ExecutePathsTest(EmailPluginBase):
         out = asyncio.run(self.plugin._send({"to": "a@x.com", "subject": "测试", "body": "hi"}))
         self.assertIn("拒绝", out)
         self.assertIn("测试", gate.last_title)
+
+    def test_send_approval_edits_applied(self):
+        """用户在审批卡改了收件人/主题/正文/HTML → edits 覆盖后发送。"""
+        import email as _emailmod
+
+        sent = {}
+
+        class GateWithEdits:
+            def request_approval(self, title, context, session_id="", **kwargs):
+                fut = asyncio.Future()
+                fut.set_result({"approved": True, "edits": {
+                    "to": "edited@x.com",
+                    "subject": "改后主题",
+                    "body": "改后正文",
+                    "html": "<p>改后正文</p>",
+                }})
+                return fut
+
+        class App2(_App):
+            pass
+
+        app = _App(config={"email-plugin": {"email_user": "u@x.com", "email_password": "p",
+                           "email_require_approval": True}},
+                   workspace=None, gate=GateWithEdits())
+        self.plugin._app = app
+
+        import unittest.mock as _mock
+        with _mock.patch.object(emailplugin, "_smtp_send", side_effect=lambda host, port, user, secret, from_addr, msg, *a, **k: sent.update(msg=str(msg))):
+            out = asyncio.run(self.plugin._send({"to": "orig@x.com", "subject": "原标题", "body": "原正文"}))
+        self.assertIn("已发送", out)
+        self.assertIn("edited@x.com", out)
+        self.assertIn("改后主题", out)
 
     def test_send_approval_context_sanitized(self):
         gate = Approval(ok=False)
