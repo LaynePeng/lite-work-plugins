@@ -627,7 +627,8 @@ def _dry_run_report(to: List[str], cc: List[str], bcc: List[str], subject: str,
               _preview_box(to, cc, bcc, subject, body, html_body, attached),
               "```",
               "",
-              "确认或修改后，去掉 dry_run 再调 email_send 即真正发出。"]
+              "下一步：把预览内容给用户确认/修改；用户同意后，去掉 dry_run 用相同参数"
+              "再次调用 email_send 才是正式发送（会弹审批卡，需用户点「允许」）。"]
     return "\n".join(lines)
 
 
@@ -1421,10 +1422,13 @@ class EmailPlugin(ToolPlugin):
             ToolDefinition(
                 name="email_send",
                 description=(
-                    "发送电子邮件。**推荐先 dry_run=true 预览**：会把收件人/主题/"
-                    "正文组装成一张可直接编辑的草稿预览盒返回给用户确认（不发送、"
-                    "不弹审批卡），确认或改好后再去掉 dry_run 真正发送；正式发送时"
-                    "仍会弹出审批卡。账号在设置页 → 插件 → email-plugin 配置"
+                    "发送电子邮件。**标准三步流程（务必遵守）**："
+                    "①第一次调用带 dry_run=true 预览——只组装一张可编辑草稿预览盒"
+                    "（含收件人/主题/正文），不发送、不弹审批卡；"
+                    "②把预览内容给用户确认或修改（用户改后按改动重新 dry_run）；"
+                    "③用户明确同意后，**去掉 dry_run 用相同参数再次调用才是正式发送**，"
+                    "届时会弹出审批卡，需用户点「允许」——审批等待有超时，用户未确认时"
+                    "不要反复重发。账号在设置页 → 插件 → email-plugin 配置"
                     "（默认 Hotmail/Outlook）。支持纯文本与 HTML 排版正文"
                     "（html 由你生成）、附件（限工作区内文件路径）。"
                 ),
