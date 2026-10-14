@@ -1286,7 +1286,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.3.0"
+    version = "1.3.2"
     description = (
         "邮件：SMTP 发信（支持 HTML 排版与附件，发送前需用户在审批卡确认）＋ "
         "IMAP 收件箱列表 / 关键词搜索 / 读取单封。认证支持 basic（密码/应用密码）"
@@ -1402,15 +1402,19 @@ class EmailPlugin(ToolPlugin):
         mode = _resolve_auth_mode(own)
         if mode == AUTH_MODE_OAUTH2:
             provider = str(own.get("email_oauth_provider") or DEFAULT_PROVIDER).strip().lower()
+            # 令牌主存私有文件（宿主会整体覆盖 config.json 命名空间），两处任一存在即视为已授权
+            has_token = bool(
+                str(_read_private().get("refresh_token") or "").strip()
+                or str(own.get("email_oauth_refresh_token") or "").strip())
             if provider in PUBLIC_CLIENT_IDS:
-                if not str(own.get("email_oauth_refresh_token") or "").strip():
+                if not has_token:
                     return {"state": "not_started",
-                            "reason": "尚未授权（打开右侧「邮件授权」面板点击链接完成授权）"}
+                            "reason": "尚未授权（设置页点「立即授权」按钮，按步骤完成）"}
                 return {"state": "running"}
             if not str(own.get("email_oauth_client_id") or "").strip():
                 return {"state": "not_started",
                         "reason": "该服务商未内置客户端 ID，请在设置页填写 client_id"}
-            if not str(own.get("email_oauth_refresh_token") or "").strip():
+            if not has_token:
                 return {"state": "not_started",
                         "reason": "尚未授权（打开右侧「邮件授权」面板点击链接完成授权）"}
             return {"state": "running"}
@@ -1564,6 +1568,16 @@ class EmailPlugin(ToolPlugin):
             _write_auth_pending(None)
             return {"ok": True, "message": "已取消进行中的授权（设备码作废）。点击「立即授权」可重新开始"}
 
+        # ---- 已授权（有效令牌在库）：直接报成功，绝不发起重复授权 ----
+        # 优先级最高——避免「已授权用户点按钮又被弹浏览器」的困惑。
+        action_app = _SimpleApp(config)
+        token, terr = _access_token(action_app)
+        if not terr and token:
+            health = f"（SMTP/IMAP 自检：{self._probe_health(user, token)}）"
+            return {"ok": True,
+                    "message": "✅ 已授权，邮箱可用" + health + "。长期有效无需重复授权；"
+                               "仅当微软侧撤销或改密码后才需重新授权"}
+
         # ---- 进行中的授权：优先看内存轮询状态；没有则读磁盘（跨重启续接） ----
         state = self._ACTION_STATE.get("auth") or {}
         pending_disk = _read_auth_pending()
@@ -1579,11 +1593,13 @@ class EmailPlugin(ToolPlugin):
             if not state.get("running"):
                 # 重启后续接：起一个新的轮询线程接上同一个设备码
                 self._resume_poll(config, pend)
-            guide = (f"请打开 {verify} 输入代码 {code}" if code
+            guide = ("① 打开 " + verify + "（浏览器应已弹出）\n"
+                     "② 登录后在页面输入代码：" + code if code
                      else "请在弹出的浏览器页面完成登录授权")
             return {"ok": True,
-                    "message": (f"授权进行中——{guide}，点「同意」后这里会自动变成成功；"
-                                f"也可点「取消授权」作废重来")}
+                    "message": ("授权进行中（等待你在浏览器点「同意」）——\n" + guide +
+                                "\n③ 点「同意」后，再点一次「立即授权」查看结果；"
+                                "或点「取消授权」作废重来")}
         if state.get("done"):
             action_app = _SimpleApp(config)
             token, terr = _access_token(action_app)
@@ -1635,6 +1651,7 @@ class EmailPlugin(ToolPlugin):
             expires_in = min(float(payload.get("expires_in") or 900), 900)
         except (TypeError, ValueError):
             expires_in = 900.0
+        minutes = int(expires_in // 60) or 1
         self._ACTION_STATE["auth"] = {"running": True, "user_code": user_code,
                                       "verify": verify}
         _write_auth_pending({
@@ -1646,10 +1663,10 @@ class EmailPlugin(ToolPlugin):
         threading.Thread(target=_poll, daemon=True,
                          name="email-oauth-action").start()
         return {"ok": True,
-                "message": (f"已打开浏览器（若未弹出请访问 {verify}），"
-                            f"登录后输入代码 {user_code} 并点「同意」。"
-                            f"**代码 {expires_in/60:.0f} 分钟内有效，忘了随时回来点本按钮查看**；"
-                            f"完成后再次点击确认结果")}
+                "message": ("① 浏览器已自动打开微软登录页（没弹出？手动访问 " + verify + "）\n"
+                            "② 登录 " + user + " 后，在页面输入这个代码：" + user_code + "\n"
+                            "③ 点「Accept / 同意」——完成后回到这里，再点一次「立即授权」查看结果\n"
+                            "（代码 " + str(minutes) + " 分钟内有效；期间随时回来点本按钮可重新查看代码）")}
 
     def _resume_poll(self, config: Dict[str, Any], pend: Dict[str, Any]) -> None:
         """应用重启后接续轮询磁盘上未过期的设备码（不重发新码）。"""
