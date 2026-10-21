@@ -6,7 +6,7 @@ description: Generate profile for 1:1, content-faithful re-layout of an existing
 
 > Generate profile, not a top-level route. [`edit-native-pptx.md`](../edit-native-pptx.md) keeps a deck's native design and edits selected pages; this profile keeps a deck's content and redoes its layout: text verbatim, source palette/fonts as the preselected recommendation (only explicit user requirements or final confirmation override them), layout, hierarchy, whitespace, and visual treatment rebuilt into a new native deck through the SVG pipeline — not a patch over the original.
 
-**Trigger**: the user supplies a `.pptx` and asks to beautify / re-layout / 重新排版 / 美化 while keeping the content — explicit intent plus a provided file, never inferred.
+**Trigger**: the user supplies a `.pptx` and asks, in any language, to beautify or re-layout it while keeping the content — explicit intent plus a provided file, never inferred.
 
 **Hard rule — select one runtime before continuing**: when the request also meets [`quick-generate.md`](./quick-generate.md)'s explicit trigger, load that runtime and not `generate-pptx.md`; otherwise load [`generate-pptx.md`](../generate-pptx.md) and not Quick. The 1:1 constraints below apply in either runtime.
 
@@ -16,7 +16,7 @@ description: Generate profile for 1:1, content-faithful re-layout of an existing
 
 Existing `.pptx` + beautify intent ("把这份 PPT 美化一下" / "make this deck look better"), re-layout intent ("重新排版这份 PPT，内容别动"), or paste-back intent ("重排后我要把元素贴回原来的模板").
 
-**Hard rule — content is frozen**: every source text string is preserved exactly (no add / remove / reword / reorder); freedom lives only in layout, hierarchy, spacing, and rhythm. Run-level emphasis (words the source colors or bolds) is hierarchy to keep: the same words stand out, restyled in the effective palette.
+**Hard rule — content is frozen**: every source text string is preserved exactly (no add / remove / reword / reorder); freedom lives only in layout, hierarchy, spacing, and rhythm. Run-level emphasis (words the source colors or bolds) is hierarchy to keep: the same words stand out, restyled in the effective palette. Off-canvas Morph staging copies ([`animations.md`](../../references/animations.md) §3.1) would duplicate frozen strings in the export, so a page takes the fade instead. Page chrome the source lacks — page numbers, footers, running heads — is not added either: the export then carries no character the source did not, and PowerPoint inserts numbering in one step when the user wants it.
 
 **Hard rule — not a patch, not a fill**: this regenerates a native deck through the selected runtime; it never edits the source in place, is not Edit Native PPTX, and never parses a third-party template for text-only substitution (the rejected #53 direction). It is the inverse of a `replication_mode: mirror` template ([`executor-structured.md`](../../references/executor-structured.md) §1.1), which keeps layout and edits text. When the authoritative input is a raster page roster whose visible layout must be preserved, activate the Quick-only [`image-to-pptx.md`](./image-to-pptx.md) instead; the two fidelity profiles never compose.
 
@@ -65,7 +65,7 @@ Use the cleaned `svg-flat/slide_*.svg` pages and `svg-flat_vector_asset_inventor
 python3 ${SKILL_DIR}/scripts/beautify_inventory.py <project_path>/analysis/<stem>.slide_library.json --images <project_path>/images/image_manifest.json -o <project_path>/analysis/beautify_inventory.json
 ```
 
-Omit `--images` when no pictures were extracted. It joins `text_blocks`, `tables`, `charts`, `diagrams` (SmartArt nodes + hierarchy + source layout), and `images` (bound through `image_manifest` `occurrences[].slide_index`, with geometry and `usage_count`) per slide with frozen values inlined, and emits empty `ignored` and `needs_confirmation` arrays to fill with judgment: `ignored` — hidden slides/shapes, master-only text, full-slide template-skin or fully covered pictures, image crop/opacity/rotation/mask; `needs_confirmation` — unreadable SmartArt, combo / dual-axis / waterfall charts, merged-cell or multi-header tables, density outliers (overcrowded or near-empty; `--summary` counts each page's `text_char_count`). SmartArt keeps its wording and relationships and is redrawn as ordinary editable shapes, never regenerated natively.
+Omit `--images` when no pictures were extracted. It joins `text_blocks`, `tables`, `charts`, `diagrams` (SmartArt nodes + hierarchy + source layout), and `images` (bound through `image_manifest` `occurrences[].slide_index`, with geometry and `usage_count`) per slide with frozen values inlined, and emits empty `ignored` and `needs_confirmation` arrays to fill with judgment: `ignored` — hidden slides/shapes, master-only text, full-slide template-skin or fully covered pictures (a logo baked into that skin may be cropped out as a prepared derivative; its baked slogans and URLs drop, and the delivery names them), image crop/opacity/rotation/mask; `needs_confirmation` — unreadable SmartArt, combo / dual-axis / waterfall charts, merged-cell or multi-header tables, density outliers (overcrowded or near-empty; `--summary` counts each page's `text_char_count`). SmartArt keeps its wording and relationships and is redrawn as ordinary editable shapes, never regenerated natively.
 
 **Mandatory — bounded inventory reads**: the complete inventory is the validation ledger, not the authoring prompt. Read `beautify_inventory.py <inventory> --summary`, then `--page <N>`, adding `--with-geometry` only for structural ambiguity; never bulk-read either complete file during authoring.
 
@@ -83,7 +83,7 @@ Omit `--images` when no pictures were extracted. It joins `text_blocks`, `tables
 
 ### Quick branch
 
-Do not run the Default confirmation flow. Apply the same inventory interpretation, identity judgment, and body-size method directly in active context: explicit user requirements are authoritative, otherwise the source identity is the default; resolve `ignored` and `needs_confirmation` without a payload, Design Spec, lock, or substitute plan; if a flagged complex object cannot be regenerated without losing frozen facts, stop as a hard prerequisite instead of simplifying. **Mandatory — close the transient state before §6**: exact source-order roster and one core message per page; identity, palette, fonts, body size, and type-role anchors; per-page density, body frame, primary zone, and composition direction; frozen relationships, reading path, neighbor/section rhythm, and ending; usable local resources and decided notes / motion / audio / image / icon / formula / Chart-Table / verification outcomes. Keep it transient, then continue to §6 Quick.
+Do not run the Default confirmation flow. Apply the same inventory interpretation, identity judgment, and body-size method (the `body_size` paragraph under the Default branch is method, not interaction — read it, `× 4/3` included) directly in active context: explicit user requirements are authoritative, otherwise the source identity is the default; resolve `ignored` and `needs_confirmation` without a payload, Design Spec, lock, or substitute plan; if a flagged complex object cannot be regenerated without losing frozen facts, stop as a hard prerequisite instead of simplifying. **Mandatory — close the transient state before §6**: exact source-order roster and one core message per page; identity, palette, fonts, body size, and type-role anchors; per-page density, body frame, primary zone, and composition direction; frozen relationships, reading path, neighbor/section rhythm, and ending; usable local resources and decided notes / motion / audio / image / icon / formula / Chart-Table / verification outcomes. Keep it transient — no Design Spec, lock, or payload — while still filling the inventory's `ignored` / `needs_confirmation` arrays, which §7 verifies against; then continue to §6 Quick.
 
 ### Default branch — Recommend & Confirm
 
@@ -99,7 +99,7 @@ Do not run the Default confirmation flow. Apply the same inventory interpretatio
 
 **Hard rule — content is frozen, not the scope decisions**: text and chart/table/cell values are non-negotiable; which identity to inherit, what to ignore, and how to treat flagged items are recommend-then-confirm, never silently decided. **Name the v1 ceiling honestly**: an overcrowded page improves within the page as-is (no information-overload relief — flag it for manual split); paste-back keeps confirmed palette + font declarations but guarantees neither coordinate alignment nor font availability; combo / dual-axis / waterfall charts and merged-cell tables are best-effort from captured data and flagged.
 
-**Visual re-confirm**: apply Step 4's surface decision; in the UI branch use `confirm_ui/recommendations.stage1.json` / `.stage2.json` at the same two handoffs and the same server, in the chat branch present the same stages without a server or `result.json`. Rows abbreviated; follow the four-locale contract ([`confirm-surface.md`](../../references/confirm-surface.md)) and omit `english` for English sources:
+**Visual re-confirm**: apply Step 4's surface decision; in the UI branch use `confirm_ui/recommendations.stage1.json` / `.stage2.json` at the same two handoffs and the same server, in the chat branch present the same stages without a server or `result.json`. Rows abbreviated; follow the four-locale contract ([`confirm-surface.md`](../../references/confirm-surface.md)) — display text is written once, in the confirmed UI language — and omit `english` for English sources:
 
 ```json
 {
@@ -114,10 +114,10 @@ Do not run the Default confirmation flow. Apply the same inventory interpretatio
   "artifact_afterlife": {"value": "<review / approval / archive / hand-off / reuse / none planned>"},
   "content_divergence": {"value": "keep source wording and page structure verbatim", "locked": true},
   "design_directions": {"selected": 0, "candidates": [
-    {"id": "source-replica", "name_en": "Source replica (recommended)", "mode": "custom", "mode_behavior_zh": "briefing 基底；逐页结构、顺序与文字 1:1 逐字不变。", "visual_style": "custom", "visual_style_behavior_zh": "复刻源 PPT 视觉身份与版式。", "icons": "…",
+    {"id": "source-replica", "name": "<Source replica (recommended)>", "mode": "custom", "mode_behavior": "<briefing base; per-page structure, order, and text 1:1 verbatim>", "visual_style": "custom", "visual_style_behavior": "<replicate the source deck's visual identity and layout>", "icons": "…",
      "color": {"palette": {"background": "#...", "secondary_bg": "#...", "primary": "#...", "accent": "#...", "secondary_accent": "#...", "body_text": "#..."}},
      "typography": {"heading": {"primary": "…"}, "body": {"primary": "…"}, "body_size": "<dominant observed.sizes_pt × 4/3 × canvas scale, as px>"},
-     "image_strategy": {"rendering": "custom", "behavior_zh": "…"}},
+     "image_strategy": {"rendering": "custom", "behavior": "<…>"}},
     {"id": "alternative-a", "...": "same shape; body_size = canvas-appropriate baseline"},
     {"id": "alternative-b", "...": "same shape"}
   ]}
@@ -144,7 +144,7 @@ Run Step 4's confirmation orchestration unchanged. In the UI branch read `confir
 
 ## 7. Validate Output
 
-`python3 ${SKILL_DIR}/scripts/source_to_md/ppt_to_md.py <project_path>/exports/<output.pptx>` — every source text string appears unaltered (read-back orders text by position and splits at authored line breaks, so compare each page as whitespace-stripped containment, not sequence); chart categories / series / table cells match exactly; slide count equals the source; charts/tables are native SVG in the effective palette; text and shapes use the effective colors and fonts; paste-back elements retain palette and font declarations (alignment and font availability not guaranteed).
+`python3 ${SKILL_DIR}/scripts/beautify_inventory.py <project_path>/analysis/beautify_inventory.json --verify <project_path>/exports/<output.pptx>` — every frozen string (paragraphs, table cells, chart categories and series names, SmartArt nodes) is present on its own page as whitespace-stripped containment, and the per-page count of characters absent from the source is printed (non-zero means added text, which the profile forbids); it exits 1 on any missing string. Beyond that read-back: slide count equals the source; charts/tables are native SVG in the effective palette; text and shapes use the effective colors and fonts; paste-back elements retain palette and font declarations (alignment and font availability not guaranteed).
 
 ```markdown
 ## ✅ Beautify Complete

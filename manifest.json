@@ -347,7 +347,7 @@
     },
     {
       "name": "ppt-master",
-      "version": "6.4.0",
+      "version": "6.7.2",
       "description": "PPT 大师：专业级演示文稿工作流——SVG 授权生成可编辑原生 PPTX（生成/美化/图转PPT/模板创建/原生编辑，含图标库与品牌模板；AI 生图风格图、视频音效等可选资源可用 scripts/fetch_optional_assets.py 从上游 Releases 按需补全）",
       "path": "skills/ppt-master"
     },
