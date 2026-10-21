@@ -77,10 +77,14 @@ def _patch_frontmatter(skill_md: Path, version: str) -> None:
     if not text.startswith("---\n") or end < 0:
         print("SKILL.md frontmatter 结构异常", file=sys.stderr)
         raise SystemExit(1)
+    # 去掉上游可能自带的顶层 version/triggers（overlay 会重新写）
     frontmatter = re.sub(r"(?m)^(version|triggers):.*\n", "", text[4:end])
-    addition = f'\nversion: "{version}"\ntriggers: {TRIGGERS}'
+    frontmatter = frontmatter.strip("\n")
+    addition = f'version: "{version}"\ntriggers: {TRIGGERS}'
+    # 关键：`---` 后必须有换行，否则拼成 `---name: ppt-master`，
+    # YAML 解析失败 → attribution_guard 报「完整性校验失败」（v6.7.2 踩过）
     skill_md.write_text(
-        f"---{frontmatter.rstrip()}{addition}{text[end:]}", encoding="utf-8")
+        f"---\n{frontmatter}\n{addition}{text[end:]}", encoding="utf-8")
 
 
 def _update_manifest(version: str) -> None:
