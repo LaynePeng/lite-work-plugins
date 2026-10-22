@@ -70,8 +70,8 @@
     },
     {
       "name": "pricing-plugin",
-      "version": "1.0.0",
-      "description": "官方定价数据源：DeepSeek 分时价（高峰/空闲半价）与 Kimi 国际站价，按模型指纹计费（自定义中转也能认出）。价格表在 pricing.json，手动同步、不自动联网。",
+      "version": "1.0.1",
+      "description": "官方定价数据源：DeepSeek 分时价（高峰/空闲半价），按模型指纹计费（自定义中转也能认出）。Kimi 已改用 models.dev 数据（上游 moonshotai 条目价格准确），不再单独维护官方源。支持出网代理（scope=meta）。价格表在 pricing.json，手动同步、不自动联网。",
       "path": "plugins/pricing-plugin",
       "tools": [],
       "permissions": {}
