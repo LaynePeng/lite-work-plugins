@@ -253,11 +253,14 @@ class FakeKernel:
 
 
 class FakeApp:
-    def __init__(self, jev_cfg=None):
+    def __init__(self, jev_cfg=None, config_dir=None):
         self.config = {"jev": dict(jev_cfg or {})}
-        self.config_dir = None      # None → 不镜像、不写盘（测试隔离）
+        # None（默认）= 不镜像、不写盘（测试隔离）；给路径时走完整镜像逻辑
+        self.config_dir = config_dir
+        self.saves = []                 # 每次 save_config 的记录（断言"没被偷写"）
 
     def save_config(self, updates):
+        self.saves.append(dict(updates))
         self.config.update(updates)
 
 
@@ -956,6 +959,174 @@ class TestGateAndTools(JevTestBase):
             await self.kernel.before_llm.run(self.kernel.ctx, turns)
         asyncio.run(go())
         self.assertIsNotNone(self.kernel.ctx.metadata.get("final_answer"))
+
+
+# ================================================================ 配置分层 / 写盘作用域（P2.4）
+class TestConfigLayering(JevTestBase):
+    """设计问题 2.4：三层兜底 + 自愈写盘 → 语义显式化 + 默认不写用户主配置。"""
+
+    def _kernel(self, app):
+        k = FakeKernel()
+        k.ctx.services["app"] = app
+        return k
+
+    def test_layer_priority_memory_wins(self):
+        """设置页有值 → 后面的层不覆盖它。"""
+        jevplugin._read_disk_jev = lambda d: {"api_key": "from-disk", "model": "disk-m"}
+        app = FakeApp({"api_key": "from-memory", "model": "mem-m"}, config_dir="/tmp/x")
+        cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+        self.assertEqual(cfg.api_key, "from-memory")
+        self.assertEqual(cfg.model, "mem-m")
+        self.assertEqual(sources["api_key"], "memory")
+
+    def test_layer_disk_fills_empty_keys(self):
+        jevplugin._read_disk_jev = lambda d: {"base_url": "https://gw.local", "model": "disk-m"}
+        app = FakeApp({"api_key": "memory-key"}, config_dir="/tmp/x")
+        cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+        self.assertEqual(cfg.base_url, "https://gw.local")
+        self.assertEqual(sources["base_url"], "disk")
+        self.assertEqual(sources["api_key"], "memory", "内存层不被覆盖")
+
+    def test_layer_env_fills_what_config_lacks(self):
+        os.environ["JEV_BASE_URL"] = "https://env.local"
+        try:
+            app = FakeApp({"api_key": "memory-key"}, config_dir="/tmp/x")
+            cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+            self.assertEqual(cfg.base_url, "https://env.local")
+            self.assertEqual(sources["base_url"], "env")
+        finally:
+            os.environ.pop("JEV_BASE_URL", None)
+
+    def test_layer_private_mirror_is_last_resort(self):
+        """主配置被抹空时，私有镜像仍能让插件启动（原事故的读侧解法）。"""
+        jevplugin._read_private = lambda: {"api_key": "mirror-key", "model": "mirror-m"}
+        app = FakeApp({}, config_dir="/tmp/x")
+        cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+        self.assertTrue(cfg.ready)
+        self.assertEqual(cfg.api_key, "mirror-key")
+        self.assertEqual(sources["api_key"], "private")
+
+    def test_empty_values_do_not_shadow_lower_layers(self):
+        """内存层里的 None/""/{}/[] 等同于"没配"，不该挡住下层。"""
+        jevplugin._read_disk_jev = lambda d: {"api_key": "disk-key"}
+        app = FakeApp({"api_key": "", "headers": {}, "model": None}, config_dir="/tmp/x")
+        cfg = jevplugin.read_config(self._kernel(app))
+        self.assertEqual(cfg.api_key, "disk-key")
+
+    def test_lower_layer_empty_value_cannot_clobber_higher_layer(self):
+        """反向防护：低层带空值不得抹掉高层的真值。
+
+        真实场景：设置页填了 key，而磁盘/私有镜像里残留 `"api_key": ""`
+        （例如用户清空过设置页）——低层的空值必须被忽略。
+        变异测试暴露过这个缺口：合并时若只看"高层已有值靠 raw.get 判断"，
+        低层的 "" 会覆盖 'good-key'，用户会看到"填了的 key 自己没了"。
+        """
+        jevplugin._read_private = lambda: {"api_key": "", "model": ""}
+        jevplugin._read_disk_jev = lambda d: {"api_key": ""}
+        app = FakeApp({"api_key": "good-key"}, config_dir="/tmp/x")
+        cfg = jevplugin.read_config(self._kernel(app))
+        self.assertEqual(cfg.api_key, "good-key", "低层空值不得覆盖高层真值")
+
+    def test_bool_false_is_a_real_value_not_empty(self):
+        """False 是有效值（如开关显式关掉），不能被当作"没配"而回落到下层默认。"""
+        raw: Dict[str, Any] = {}
+        sources: Dict[str, str] = {}
+        jevplugin._merge_layer(raw, sources, "memory", {"screen_enabled": False})
+        self.assertIn("screen_enabled", raw)
+        self.assertIs(raw["screen_enabled"], False)
+
+    def test_empty_values_are_never_written_into_result(self):
+        """空值连 key 都不该落进结果集（变异测试暴露的缺口）。
+
+        若合并只判断"高层是否已有值"而不判断"本层值是否为空"，
+        低层的 "" 会被原样写进 raw 并**虚报来源**（sources 说凭证来自私有镜像，
+        实际值是空字符串）——面板会显示"运行中：凭证来自插件私有镜像"，
+        而插件其实启动不了。契约：空值既不写 raw，也不记 sources。
+        """
+        raw: Dict[str, Any] = {}
+        sources: Dict[str, str] = {}
+        jevplugin._merge_layer(raw, sources, "disk", {"api_key": "", "model": "disk-m"})
+        jevplugin._merge_layer(raw, sources, "private", {"headers": "", "api_key": "  "})
+        self.assertNotIn("api_key", raw, "空串不应落进结果")
+        self.assertNotIn("api_key", sources, "空值不应虚报来源")
+        self.assertNotIn("headers", raw)
+        self.assertNotIn("headers", sources)
+        self.assertEqual(raw, {"model": "disk-m"})
+
+    def test_default_does_not_write_user_main_config(self):
+        """核心修复：默认**不得**回顾主配置写盘（用户看到的"配置残留"根因）。"""
+        jevplugin._read_private = lambda: {"api_key": "mirror-key"}
+        app = FakeApp({}, config_dir="/tmp/x")          # 主配置空，镜像有凭证
+        cfg = jevplugin.read_config(self._kernel(app))
+        self.assertTrue(cfg.ready, "仍应能启动（读侧兜底）")
+        self.assertEqual(app.saves, [], "不应调用 save_config 写用户配置")
+
+    def test_self_heal_opt_in_writes_with_warning(self):
+        """显式开启后才写回，且写回内容含凭证。"""
+        jevplugin._read_private = lambda: {"api_key": "mirror-key", "model": "mirror-m"}
+        app = FakeApp({"config_self_heal_enabled": True}, config_dir="/tmp/x")
+        cfg = jevplugin.read_config(self._kernel(app))
+        self.assertTrue(cfg.ready)
+        self.assertEqual(len(app.saves), 1, "开启后应写回一次")
+        self.assertEqual(app.saves[0]["jev"]["api_key"], "mirror-key")
+        self.assertTrue(cfg.config_self_heal, "显式开启时快照里应为 True")
+
+    def test_self_heal_defaults_off(self):
+        """默认必须为关（这是 0.9.1 的行为契约）。"""
+        self.assertFalse(jevplugin.JevConfig({"api_key": "k"}).config_self_heal)
+
+    def test_self_heal_disabled_leaves_empty_config_untouched(self):
+        jevplugin._read_private = lambda: {"api_key": "mirror-key"}
+        app = FakeApp({}, config_dir="/tmp/x")
+        jevplugin.read_config(self._kernel(app))
+        self.assertEqual(app.config["jev"], {}, "用户配置应保持原样")
+
+    def test_mirror_skipped_without_config_dir(self):
+        """测试替身 / 裸 Kernel（无 config_dir）→ 一律不写盘，避免污染。"""
+        written = []
+        jevplugin._write_private = lambda data: written.append(data)
+        app = FakeApp({"api_key": "k"})                 # config_dir=None
+        jevplugin.read_config(self._kernel(app))
+        self.assertEqual(written, [])
+
+    def test_mirror_writes_to_plugin_private_path_only(self):
+        """镜像只落到插件自己目录下的 config.local.json（不碰用户主配置）。"""
+        written = []
+        jevplugin._write_private = lambda data: written.append(data)
+        jevplugin._read_private = lambda: {}
+        app = FakeApp({"api_key": "k", "model": "m"}, config_dir="/tmp/x")
+        jevplugin.read_config(self._kernel(app))
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["api_key"], "k")
+
+    def test_read_config_signature_backward_compatible(self):
+        """老调用方（不传 with_sources）拿到的仍是 JevConfig，不是 tuple。"""
+        app = FakeApp({"api_key": "k"})
+        cfg = jevplugin.read_config(self._kernel(app))
+        self.assertIsInstance(cfg, jevplugin.JevConfig)
+        self.assertNotIsInstance(cfg, tuple)
+
+    def test_credential_source_reported_in_panel(self):
+        """面板应说明凭证来自哪一层（用户要能解释"值从哪来"）。"""
+        jevplugin._read_private = lambda: {"api_key": "mirror-key"}
+        app = FakeApp({}, config_dir="/tmp/x")
+        kernel = self._kernel(app)
+        plugin = jevplugin.JevPlugin()
+        plugin._kernel = kernel
+        data = json.loads(plugin.panel_content("judgements", app.config))
+        meta = " ".join(data["status"].get("meta") or [])
+        self.assertIn("插件私有镜像", meta, f"应展示凭证来源，实际 meta={meta}")
+
+    def test_heal_notification_flag_reset_for_test_isolation(self):
+        """_HEAL_NOTIFIED 是模块级一次性标记——测试需能重置（避免用例互相干扰）。"""
+        jevplugin._HEAL_NOTIFIED = False
+        self.assertFalse(jevplugin._HEAL_NOTIFIED)
+
+    def test_deleted_legacy_self_heal_symbol(self):
+        """旧入口 `_self_heal` 已被替换（避免有人误用旧路径写回主配置）。"""
+        self.assertFalse(hasattr(jevplugin, "_self_heal"))
+        self.assertTrue(hasattr(jevplugin, "_heal_main_config"))
+        self.assertTrue(hasattr(jevplugin, "_mirror_private"))
 
 
 # ================================================================ 装配 / 设置

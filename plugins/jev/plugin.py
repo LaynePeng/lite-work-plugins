@@ -43,6 +43,24 @@ auto_gate_enabled       false                自动门禁（每次写/执行类�
 `TOOL_NAMES_TTL`（60s）缓存约束，最长 60 秒进入模型工具表。手动复制插件目录需重启应用
 （`_ensure_local_plugins()` 缓存实例），经设置页安装则无需重启。
 
+配置优先级与写盘作用域（0.9.1 起，见 `read_config`）：
+
+```
+第 1 层  设置页（内存 app.config["jev"]）     ← 优先级最高
+第 2 层  <config_dir>/config.json 的 jev 段
+第 3 层  环境变量 JEV_BASE_URL / JEV_MODEL / JEV_HEADERS / TYPESAFE_API_KEY
+第 4 层  插件私有镜像 plugins/jev/config.local.json
+```
+
+**各层只补空缺**（前层有非空值即生效），右栏「判断」面板会显示凭证实际来自哪一层。
+写盘只发生在一处：把有效凭证镜像到**插件自己目录**下的 `config.local.json`（0600）。
+
+历史问题（0.9.0 及以前）：读配置的路径上会顺手 `app.save_config(...)` 把凭证**写回
+用户主配置**，代价是用户改了设置页却发现"改了又变回来"、"为什么有配置残留"。
+0.9.1 起该行为默认**关闭**，仅由 `config_self_heal_enabled=true` 显式开启，
+且每次写回都记 WARNING 日志（含写回键名）。关闭它不影响可用性——
+私有镜像 + 读侧兜底已足够让凭证在"被抹"后恢复。
+
 许可与治理（AGENTS.md §6）：本文件是**社区插件**源码（目标仓 laynepeng/lite-work-plugins，
 整体 MIT），因此**不添加任何 Apache SPDX 头**，与内置 office.py / ocr.py 同口径。
 
@@ -269,7 +287,7 @@ class JevConfig:
                  "compact_decider_batch", "compact_decider_min_keep_ratio",
                  "verify_timeout_ms", "max_attempts", "cache_ttl_s",
                  "max_concurrency", "async_screen", "screen_skip_self",
-                 "screen_max_per_turn",
+                 "screen_max_per_turn", "config_self_heal",
                  "reason")
 
     def __init__(self, raw: Dict[str, Any], env_key: str = "") -> None:
@@ -328,6 +346,8 @@ class JevConfig:
                 raw.get("max_concurrency") or DEFAULT_MAX_CONCURRENCY))
         except (TypeError, ValueError):
             self.max_concurrency = DEFAULT_MAX_CONCURRENCY
+        # 0.9.1：是否允许把凭证**写回用户主配置**（默认关；插件只写自己的镜像文件）
+        self.config_self_heal = bool(raw.get("config_self_heal_enabled", False))
         # #1 Jev 压缩判定器（opt-in，默认关）：核心 compact_session 调用
         self.compact_decider = bool(raw.get("compact_decider_enabled", False))
         try:
@@ -399,28 +419,99 @@ def _write_private(data: Dict[str, Any]) -> None:
 
 _CRED_KEYS = ("api_key", "base_url", "headers", "model", "direct_answer_enabled")
 
+#: 配置来源的可读名称（面板/日志用，让"凭证到底从哪来的"可解释）
+SOURCE_LABELS = {
+    "memory": "设置页（内存）",
+    "disk": "config.json（磁盘）",
+    "env": "环境变量",
+    "private": "插件私有镜像",
+}
 
-def _self_heal(app: Any, raw: Dict[str, Any]) -> None:
-    """把有效凭证镜像到私有文件；若主 config 被抹过，顺手修回来。"""
+#: 「空值」判定：这些值等同于"该层没配"
+_EMPTY = (None, "", {}, [])
+
+
+def _is_blank(value: Any) -> bool:
+    """该值是否等同于"这一层没配"。
+
+    除 `_EMPTY` 外，**纯空白字符串**（如 `"  "`）也算空：`JevConfig` 构造时会
+    `strip()` 凭证，所以 `"  "` 与 `""` 在语义上完全一样。若不在这里拦住它，
+    空白值会占住"已配置"的位置、挡住下层真正的凭证，而设置页看起来又是空的
+    ——用户会看到"填了却不生效（或生效的值来历不明）"。
+    """
+    if value in _EMPTY:
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
+def _merge_layer(raw: Dict[str, Any], sources: Dict[str, str],
+                 layer: str, values: Dict[str, Any]) -> None:
+    """按优先级合并一层配置：**已有非空值不覆盖**（前面的层优先）。
+
+    两个方向都要判空，各防一类真实事故：
+    - 本层值为空 → 不写、也不记来源（否则空值会覆盖高层真值，且面板虚报来源）；
+    - 高层已有非空值 → 本层不覆盖（分层优先级）。
+    """
+    for key, value in (values or {}).items():
+        if _is_blank(value):
+            continue
+        if not _is_blank(raw.get(key)):
+            continue
+        raw[key] = value
+        sources[key] = layer
+
+
+def _mirror_private(app: Any, raw: Dict[str, Any]) -> None:
+    """把当前有效凭证镜像到**插件自己的目录**（0600）。
+
+    注意作用域：这里只写 `plugins/jev/config.local.json`，**不碰用户主配置**。
+    目的是让插件在"主 config 被别的保存动作抹掉"时仍能启动（读侧兜底见
+    `read_config` 的 private 层）。
+
+    仅在有 `config_dir` 的真 app 上启用：没有它的（测试替身 / 裸 Kernel）
+    一律不写盘，避免污染。
+    """
     if app is None or not getattr(app, "config_dir", None):
-        return          # 没有 config_dir = 非真 app（测试替身）→ 不镜像，避免污染
-    snapshot = {k: raw[k] for k in _CRED_KEYS if raw.get(k)}
+        return
+    snapshot = {k: raw[k] for k in _CRED_KEYS if raw.get(k) not in _EMPTY}
     if not snapshot:
         return
     priv = _read_private()
     if any(priv.get(k) != snapshot[k] for k in snapshot):
         _write_private({**priv, **snapshot})
-    # 主 config 缺 api_key 而我们有 → 修回（让设置页也正常）
-    # 自限：修回成功后 cur 就有 api_key，下次不再进入，不会形成写盘循环
-    if app is None or not snapshot.get("api_key"):
+
+
+#: 「已修回主配置」只报一次，避免每条消息刷日志
+_HEAL_NOTIFIED = False
+
+
+def _heal_main_config(app: Any, raw: Dict[str, Any], sources: Dict[str, str]) -> None:
+    """**可选**地把有效凭证修回用户主配置（默认关闭，见 `config_self_heal_enabled`）。
+
+    0.9.1 起默认**不写**用户配置：历史实现会在读配置的路径上顺手
+    `app.save_config(...)`，于是"改过的键又回来了"——用户无法解释的配置残留。
+    现在改为显式 opt-in，且每次写入都留 WARNING 级日志（含写回了哪些键）。
+    注意：关掉它**不影响插件可用性**——私有镜像 + 读侧兜底已让凭证可恢复，
+    只是设置页不会自动显示回来。
+    """
+    global _HEAL_NOTIFIED
+    if app is None or raw.get("api_key") in _EMPTY:
         return
     try:
-        cur = dict(getattr(app, "config", {}).get(PLUGIN_NAME) or {})
-        if not cur.get("api_key"):
-            app.save_config({PLUGIN_NAME: {**cur, **snapshot}})
-            logger.info("[jev] 已用私有快照修复被抹掉的配置")
+        if not bool(raw.get("config_self_heal_enabled", False)):
+            return
+        current = dict(getattr(app, "config", {}).get(PLUGIN_NAME) or {})
+        if current.get("api_key") not in _EMPTY:
+            return                                   # 主配置有值 → 不需要修
+        snapshot = {k: raw[k] for k in _CRED_KEYS if raw.get(k) not in _EMPTY}
+        app.save_config({PLUGIN_NAME: {**current, **snapshot}})
+        if not _HEAL_NOTIFIED:
+            _HEAL_NOTIFIED = True
+            logger.warning("[jev] 已按 config_self_heal_enabled=true 修回主配置的键：%s"
+                           "（如不想让插件写你的 config.json，请关闭该开关）",
+                           sorted(snapshot))
     except Exception:  # noqa: BLE001
-        logger.debug("[jev] 自愈写回失败", exc_info=True)
+        logger.debug("[jev] 修回主配置失败", exc_info=True)
 
 
 def _read_disk_jev(config_dir: str) -> Dict[str, Any]:
@@ -444,45 +535,54 @@ def _read_disk_jev(config_dir: str) -> Dict[str, Any]:
     return data
 
 
-def read_config(kernel: Kernel) -> JevConfig:
-    """读配置：内存 `app.config["jev"]` 为主，**磁盘 config.json 兜底**，环境变量再兜底。
+def read_config(kernel: Kernel, *, with_sources: bool = False) -> Any:
+    """读配置，优先级链**显式且可解释**（前者优先，各层只补空缺）：
 
-    为什么要有磁盘/环境兜底：app 的配置只在启动时读一次，内存是一份可能过期的快照；
-    实测事故：用户配好的凭证被其他保存动作从内存抹掉后，插件一直报「缺少凭证」。
-    这里对**内存缺失的键**用磁盘补齐（内存有值仍以内存为准），环境变量则永远有效。
+        1. `memory`  —— 设置页当前值（`app.config["jev"]`）
+        2. `disk`    —— `<config_dir>/config.json` 的 `jev` 段（按 mtime 缓存）
+        3. `env`     —— `JEV_BASE_URL` / `JEV_MODEL` / `JEV_HEADERS` / `TYPESAFE_API_KEY`
+        4. `private` —— 插件私有镜像 `plugins/jev/config.local.json`
+
+    为什么要有后三层：app 的配置只在启动时读一次，内存是**可能过期或被杀掉**的
+    快照；实测事故是"配好的凭证被别的保存动作从内存抹掉后，插件一直报缺少凭证"。
+    读侧兜底让这种抹除**不会**导致插件停摆，同时**不再需要写回用户主配置**。
+
+    读盘只发生在内存缺键时；私有镜像带 mtime 缓存。`with_sources=True` 时额外
+    返回每层命中的键（供「判断」面板解释凭证来源），签名对老调用方保持不变。
     """
     raw: Dict[str, Any] = {}
+    sources: Dict[str, str] = {}
     app = None
     if kernel.has_service("app"):
         try:
             app = kernel.get_service("app")
             cfg = getattr(app, "config", None)
             if isinstance(cfg, dict):
-                raw = dict(cfg.get(PLUGIN_NAME) or {})
+                _merge_layer(raw, sources, "memory", dict(cfg.get(PLUGIN_NAME) or {}))
         except Exception:  # noqa: BLE001
             logger.debug("[jev] 读取 app.config 失败", exc_info=True)
-            raw = {}
-    if app is not None:
-        cfg_dir = getattr(app, "config_dir", None)
-        if cfg_dir:
-            for k, v in _read_disk_jev(str(cfg_dir)).items():
-                if k not in raw or raw.get(k) in (None, "", {}, []):
-                    raw[k] = v
-    # 环境变量兜底：配置被抹也不受影响
-    if os.environ.get("JEV_BASE_URL") and not raw.get("base_url"):
-        raw["base_url"] = os.environ["JEV_BASE_URL"]
-    if os.environ.get("JEV_MODEL") and not raw.get("model"):
-        raw["model"] = os.environ["JEV_MODEL"]
-    if os.environ.get("JEV_HEADERS") and not raw.get("headers"):
-        raw["headers"] = os.environ["JEV_HEADERS"]
-    # 私有文件兜底（首配置成功后的镜像）：比内存/主 config 都更能扛"被抹"
-    priv = _read_private()
-    for k, v in priv.items():
-        if k not in raw or raw.get(k) in (None, "", {}, []):
-            raw[k] = v
-    # 自愈：镜像当前有效凭证 + 必要时修回主 config
-    _self_heal(app, raw)
-    return JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
+    cfg_dir = getattr(app, "config_dir", None) if app is not None else None
+    if cfg_dir:
+        _merge_layer(raw, sources, "disk", _read_disk_jev(str(cfg_dir)))
+    # 环境变量（永远有效：配置被抹也不受影响）
+    env_values = {
+        "base_url": os.environ.get("JEV_BASE_URL", ""),
+        "model": os.environ.get("JEV_MODEL", ""),
+        "headers": os.environ.get("JEV_HEADERS", ""),
+        "api_key": os.environ.get("TYPESAFE_API_KEY", ""),
+    }
+    _merge_layer(raw, sources, "env", {k: v for k, v in env_values.items() if v})
+    # 私有镜像兜底：比内存/主 config 都更能扛"被抹"
+    _merge_layer(raw, sources, "private", _read_private())
+
+    # 镜像当前有效凭证（只写插件自己的目录）；修回主配置是**显式 opt-in**
+    _mirror_private(app, raw)
+    _heal_main_config(app, raw, sources)
+
+    cfg = JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
+    if with_sources:
+        return cfg, sources
+    return cfg
 
 
 # ---------------------------------------------------------------- HTTP（可 mock）
@@ -688,7 +788,7 @@ def render_card(*, model: str, latency_ms: int, verdict: str, confidence: float,
 
 class JevPlugin(ToolPlugin):
     name = PLUGIN_NAME
-    version = "0.9.0"
+    version = "0.9.1"
     description = "Jev 判定层：System One 结构化判断（工具 + 工具执行前单向升级器）"
 
     #: 通用插件 UI 协议：设置页据此自动渲染表单（含自定义 Base URL 与请求头）
@@ -701,7 +801,9 @@ class JevPlugin(ToolPlugin):
              "hint": "格式 Key: Value 或 Key=Value（按第一个分隔符切分，值可含冒号）；"
                      "# 开头忽略；可覆盖默认 Authorization；这里带凭证也算已配置"},
             {"key": "api_key", "type": "secret", "label": "API Key",
-             "hint": "默认用于 Authorization: Bearer；也可留空、改把 key 放进自定义请求头"},
+             "hint": "默认用于 Authorization: Bearer；也可留空、改把 key 放进自定义请求头。"
+                     "留空的键会按「设置页 → config.json → 环境变量 → 插件私有镜像」"
+                     "逐层兜底（面板会显示当前生效的层）"},
             {"key": "model", "type": "str", "label": "模型版本", "default": DEFAULT_MODEL,
              "hint": "建议固定版本 ID，别名会移动"},
             {"key": "confidence_threshold", "type": "number", "label": "置信度阈值",
@@ -766,6 +868,11 @@ class JevPlugin(ToolPlugin):
             {"key": "max_concurrency", "type": "number",
              "label": "后台判定并发上限", "default": DEFAULT_MAX_CONCURRENCY,
              "hint": "同时最多几个后台判定；超出的直接丢弃（fail-open，宁可漏判不排队）"},
+            {"key": "config_self_heal_enabled", "type": "boolean",
+             "label": "允许插件写回主配置（不推荐）", "default": False,
+             "hint": "代价/风险：开启后，当设置页的凭证为空而插件能从别处读到有效凭证时，"
+                     "会把它写回你的 config.json（写回时会记一条 WARNING）。"
+                     "默认关——插件只写自己目录下的镜像文件；关闭不影响可用性"},
             {"key": "compact_decider_enabled", "type": "boolean",
              "label": "Jev 压缩判定器", "default": False,
              "hint": "代价：仅在上下文压缩时批量判定（每批 1 次请求）。"
@@ -845,10 +952,26 @@ class JevPlugin(ToolPlugin):
         logger.info("[jev] 已启动（tools=%s, auto_gate=%s, model=%s）",
                     cfg.tools_enabled, cfg.auto_gate_enabled, cfg.model)
 
+    def _effective_config(self, config: Any) -> "JevConfig":
+        """面板/状态用的配置快照：按**完整分层链**解析，而不是只看传进来的内存快照。
+
+        为什么必须分层：凭证可能来自 config.json / 环境变量 / 插件私有镜像。
+        若面板只读内存快照，就会出现"插件实际在运行、面板却显示未启动"的矛盾
+        （正是 0.9.1 修掉的那个不一致）。有 kernel 时委托 `read_config`；
+        没有时（纯函数式调用）退回传入的裸配置。
+        """
+        kernel = getattr(self, "_kernel", None)
+        if kernel is not None:
+            try:
+                return read_config(kernel)
+            except Exception:  # noqa: BLE001 - 面板是只读展示，失败就退回裸配置
+                logger.debug("[jev] 面板读分层配置失败，退回传入快照", exc_info=True)
+        raw = dict((config or {}).get(PLUGIN_NAME) or {}) if isinstance(config, dict) else {}
+        return JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
+
     def status_from_config(self, config):
         """设置页显示「运行中 / 未启动 + 原因」（纯读：不发网络、不写盘）。"""
-        raw = dict(config.get(PLUGIN_NAME) or {}) if isinstance(config, dict) else {}
-        cfg = JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
+        cfg = self._effective_config(config)
         if not cfg.ready:
             return {"state": "not_started", "reason": cfg.reason}
         return {"state": "running", "reason": ""}
@@ -1710,12 +1833,35 @@ class JevPlugin(ToolPlugin):
 
     # -------------------------------------------------- 右栏「判断」面板
 
+    def _credential_source(self, raw: Dict[str, Any]) -> str:
+        """说明**凭证（api_key / 自定义头）到底来自哪一层**——配置语义可解释化的关键。
+
+        历史问题：用户改了设置页却发现"改了又变回来"，因为插件会在读配置时
+        顺手写回主配置。现在写回默认关闭，但"值来自哪里"仍需说清：
+        面板直接展示命中的层，用户一眼能判断该去改内存/磁盘/环境变量/镜像。
+        """
+        kernel = getattr(self, "_kernel", None)
+        if kernel is not None:
+            try:
+                _cfg, sources = read_config(kernel, with_sources=True)
+            except Exception:  # noqa: BLE001 - 面板是只读展示，失败就退回简单推断
+                sources = {}
+            else:
+                if sources.get("api_key") or sources.get("headers"):
+                    layer = sources.get("api_key") or sources.get("headers")
+                    return SOURCE_LABELS.get(layer, layer)
+        # 无 kernel（或没读到）：按当前 raw 简单推断
+        if raw.get("api_key") or raw.get("headers"):
+            return SOURCE_LABELS["memory"]
+        return ""
+
     def panel_content(self, panel_id: str, config: Dict[str, Any]) -> str:
         """右栏「判断」面板：返回 JSON（前端渲染成 SVG 决策树）。"""
         if panel_id != "judgements":
             return ""
         raw = dict((config or {}).get(PLUGIN_NAME) or {}) if isinstance(config, dict) else {}
-        cfg = JevConfig(raw, os.environ.get("TYPESAFE_API_KEY", ""))
+        cfg = self._effective_config(config)
+        cred_source = self._credential_source(raw)
 
         status: Dict[str, Any] = {}
         if cfg.ready:
@@ -1726,8 +1872,11 @@ class JevPlugin(ToolPlugin):
                 chips.append("门禁")
             if cfg.direct_answer:
                 chips.append("直答")
+            meta = [cfg.model, f"阈值 {cfg.threshold:.2f}"]
+            if cred_source:
+                meta.append(f"凭证：{cred_source}")
             status = {"text": "运行中", "tone": "ok",
-                      "meta": [cfg.model, f"阈值 {cfg.threshold:.2f}"], "chips": chips}
+                      "meta": meta, "chips": chips}
         else:
             status = {"text": "未启动", "tone": "warn", "reason": cfg.reason}
 
