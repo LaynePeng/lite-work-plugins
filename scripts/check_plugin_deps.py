@@ -52,23 +52,54 @@ IMPORT_TO_DIST = {
 }
 
 
-def iter_import_roots(path: Path):
-    """ast 遍历全部 import（含函数体内的延迟导入），产出顶层模块名。"""
+def iter_import_roots(path: Path, local_modules: frozenset = frozenset()):
+    """ast 遍历全部 import（含函数体内的延迟导入），产出顶层模块名。
+
+    `local_modules`：同一插件目录内的兄弟模块名（如 jev 的 jev_config）。
+    这些是**插件自带的本地模块**（多文件插件），不算第三方依赖，需排除。
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                yield alias.name.split(".")[0]
+                root = alias.name.split(".")[0]
+                if root in local_modules:
+                    continue
+                yield root
         elif isinstance(node, ast.ImportFrom):
             # 排除相对导入（level > 0）
             if node.level == 0 and node.module:
-                yield node.module.split(".")[0]
+                root = node.module.split(".")[0]
+                if root in local_modules:
+                    continue
+                yield root
 
 
 def wheel_satisfies(whl_name: str, dist: str) -> bool:
     """wheel 文件名是否覆盖 dist（{dist}-{version}-{python}-{abi}-{platform}.whl）。"""
     norm = dist.lower().replace("-", "_").replace(".", "_")
     return whl_name.lower().startswith(norm + "-")
+
+
+def local_module_names(plugin_dir: Path, py_files: list) -> frozenset:
+    """同目录内的兄弟 `.py` 模块名（多文件插件的本地模块）。
+
+    宿主加载插件时会**把插件目录插入 sys.path**（litework/tools/plugin_loader.py
+    的 _load_module），因此插件里的裸 `import jev_config` 能解析到同目录文件。
+    这类名不是第三方依赖，审计必须排除，否则多文件插件会被误判为缺 wheels。
+
+    安全护栏：本地模块名**不得**与已捆绑包 / import→dist 映射 / 标准库重名。
+    否则插件可以用 `helpers.py` 之类的名字遮蔽真实依赖，让审计放行一个
+    实际缺失的包（审计被绕过的风险）。
+    """
+    stdlib = getattr(sys, "stdlib_module_names", frozenset())
+    names = {p.stem for p in py_files if p.name != "__init__.py"}
+    shadow = sorted(n for n in names
+                    if n in BUNDLED or n in IMPORT_TO_DIST or n in stdlib or n in HOST)
+    if shadow:
+        print(f"WARN {plugin_dir.name}: 本地模块名与现有依赖/标准库重名，已按依赖处理: {shadow}")
+        names -= set(shadow)
+    return frozenset(names)
 
 
 def main() -> int:
@@ -86,11 +117,14 @@ def main() -> int:
         if not py_files:
             continue
 
+        # 插件目录内的本地模块（多文件插件）：不算第三方依赖
+        local_modules = local_module_names(plugin_dir, py_files)
+
         # 收集未捆绑的第三方 import
         unresolved: set[str] = set()
         for py in py_files:
             try:
-                roots = list(iter_import_roots(py))
+                roots = list(iter_import_roots(py, local_modules))
             except SyntaxError as exc:
                 print(f"FAIL {plugin_dir.name}: {py.name} 语法错误 {exc}")
                 failures += 1

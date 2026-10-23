@@ -117,10 +117,22 @@ def _install_litework_stubs() -> None:
 _install_httpx_stub()
 _install_litework_stubs()
 
+# 拆分后 plugin.py 用裸 import 引兄弟模块（宿主/测试都要把插件目录放进 sys.path，
+# 这与 litework 的 _load_module 行为一致）。
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 _SPEC = importlib.util.spec_from_file_location(
     "jev_plugin_under_test", os.path.join(_HERE, "plugin.py"))
 jevplugin = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(jevplugin)  # type: ignore[union-attr]
+
+# 拆分后的**规范模块**：可变状态与可 patch 的函数住处（不是 plugin 的再导出）。
+# 测试一律 patch 到规范模块上——否则改的是 plugin 的副本，被测代码读的是原值
+# （这正是之前私有镜像被真实写盘的那类错误）。
+jevconfig = sys.modules["jev_config"]
+jevtransport = sys.modules["jev_transport"]
+jevrender = sys.modules["jev_render"]
 
 
 # ---------------------------------------------------------------- HTTP 替身
@@ -131,7 +143,7 @@ class _Resp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise jevplugin.httpx.HTTPStatusError(
+            raise jevtransport.httpx.HTTPStatusError(
                 f"status {self.status_code}",
                 request=types.SimpleNamespace(),
                 response=types.SimpleNamespace(status_code=self.status_code))
@@ -187,7 +199,7 @@ class FakeServer:
         self.calls.append({"payload": payload, "headers": headers})
         if self.errors > 0:
             self.errors -= 1
-            raise jevplugin.httpx.ConnectError("boom")
+            raise jevtransport.httpx.ConnectError("boom")
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.status is not None:
@@ -272,24 +284,24 @@ def make_cfg(**over):
     raw = {"api_key": "k", "model": "jev-test", "screen_enabled": True,
            "verify_enabled": True, "cache_ttl_s": 60}
     raw.update(over)
-    return jevplugin.JevConfig(raw)
+    return jevconfig.JevConfig(raw)
 
 
 # ---------------------------------------------------------------- 基类
 class JevTestBase(unittest.TestCase):
     def setUp(self):
-        jevplugin.cache_clear()
-        jevplugin._PENDING_NOTES.clear()
-        jevplugin._BG_TASKS.clear()
-        for key in jevplugin.STATS:
-            jevplugin.STATS[key] = 0
-        jevplugin._RECENT.clear()
+        jevtransport.cache_clear()
+        jevtransport._PENDING_NOTES.clear()
+        jevtransport._BG_TASKS.clear()
+        for key in jevtransport.STATS:
+            jevtransport.STATS[key] = 0
+        jevtransport._RECENT.clear()
         # 私有凭据文件与磁盘兜底一律隔离
-        jevplugin._read_private = lambda: {}
-        jevplugin._write_private = lambda data: None
-        jevplugin._read_disk_jev = lambda config_dir: {}
+        jevconfig._read_private = lambda: {}
+        jevconfig._write_private = lambda data: None
+        jevconfig._read_disk_jev = lambda config_dir: {}
         self.server = FakeServer()
-        jevplugin._client_factory = self.server.factory
+        jevtransport._client_factory = self.server.factory
         self.kernel = FakeKernel()
         # 默认把两个付费开关打开——单独测开关行为时各自覆盖配置
         self.app = FakeApp({"api_key": "k", "model": "jev-test",
@@ -299,14 +311,14 @@ class JevTestBase(unittest.TestCase):
     def tearDown(self):
         # 关键：取消仍在飞的后台判定任务——否则它的 await 会在下一条用例里
         # 解析到**新的** _client_factory，把请求记到下一个替身服务器上（跨用例污染）。
-        for task in list(jevplugin._BG_TASKS):
+        for task in list(jevtransport._BG_TASKS):
             task.cancel()
-        jevplugin._BG_TASKS.clear()
-        jevplugin._PENDING_NOTES.clear()
-        jevplugin.cache_clear()
+        jevtransport._BG_TASKS.clear()
+        jevtransport._PENDING_NOTES.clear()
+        jevtransport.cache_clear()
 
     async def _drain(self):
-        await jevplugin.wait_bg_tasks(timeout=2.0)
+        await jevtransport.wait_bg_tasks(timeout=2.0)
 
 
 # ================================================================ P0：不阻塞
@@ -338,10 +350,10 @@ class TestScreenAsync(JevTestBase):
             await self.kernel.after_tool.run(self.kernel.ctx, data)
             await self._drain()
         asyncio.run(go())
-        notes = jevplugin._drain_notes("s1")
+        notes = jevtransport._drain_notes("s1")
         self.assertEqual(len(notes), 1)
         self.assertIn("提示注入", notes[0])
-        self.assertTrue(any(e.get("kind") == "screen" for e in jevplugin._RECENT))
+        self.assertTrue(any(e.get("kind") == "screen" for e in jevtransport._RECENT))
 
     def test_sync_mode_still_isolates(self):
         """screen_async_enabled=false 时保留 0.8.x 的当场隔离语义。"""
@@ -366,7 +378,7 @@ class TestScreenAsync(JevTestBase):
             await self.kernel.after_tool.run(self.kernel.ctx, data)
             await self._drain()
         asyncio.run(go())
-        self.assertEqual(jevplugin.pending_note_count(), 0)
+        self.assertEqual(jevtransport.pending_note_count(), 0)
 
     def test_self_source_skipped(self):
         plugin = jevplugin.JevPlugin()
@@ -415,7 +427,7 @@ class TestScreenAsync(JevTestBase):
     def test_bg_concurrency_cap_drops_instead_of_queueing(self):
         self.server.delay = 0.2
         self.app.config["jev"]["max_concurrency"] = 2
-        jevplugin._BG_MAX_INFLIGHT = 2
+        jevtransport._BG_MAX_INFLIGHT = 2
         try:
             plugin = jevplugin.JevPlugin()
             plugin._install_screen(self.kernel)
@@ -427,9 +439,9 @@ class TestScreenAsync(JevTestBase):
                                           "result": f"body{i} " * 200})
                 await self._drain()
             asyncio.run(go())
-            self.assertLessEqual(jevplugin.STATS["dropped"], 2)
+            self.assertLessEqual(jevtransport.STATS["dropped"], 2)
         finally:
-            jevplugin._BG_MAX_INFLIGHT = 8
+            jevtransport._BG_MAX_INFLIGHT = 8
 
 
 # ================================================================ P1：合并 + 缓存
@@ -514,7 +526,7 @@ class TestTurnGuardMerge(JevTestBase):
         """payload 里没有 system 消息时，结论前插为合成 system——绝不能静默丢掉。"""
         plugin = jevplugin.JevPlugin()
         plugin._install_turn_guard(self.kernel)
-        jevplugin._queue_note("s1", "结论-A")
+        jevtransport._queue_note("s1", "结论-A")
         turns = [msg("user", "只看这一条")]
 
         async def go():
@@ -522,7 +534,7 @@ class TestTurnGuardMerge(JevTestBase):
         out = asyncio.run(go())
         self.assertEqual(str(out[0].role), "system")
         self.assertIn("结论-A", out[0].content)
-        self.assertEqual(jevplugin.pending_note_count(), 0)
+        self.assertEqual(jevtransport.pending_note_count(), 0)
 
     def test_msg_injection_short_circuits_turn(self):
         self.server.answers = {"injection": 0.95}
@@ -555,7 +567,7 @@ class TestTurnGuardMerge(JevTestBase):
         asyncio.run(self.kernel.before_llm.run(self.kernel.ctx, turns))
         self.assertIsNone(self.kernel.ctx.metadata.get("final_answer"),
                           "0.79 未达 0.8 阈值，不应短路")
-        jevplugin.cache_clear()
+        jevtransport.cache_clear()
 
         self.server.answers = {"injection": 0.80}
         asyncio.run(self.kernel.before_llm.run(self.kernel.ctx, turns))
@@ -570,11 +582,11 @@ class TestTurnGuardMerge(JevTestBase):
 
         async def run_once(value):
             self.server.answers = {"injection": value}
-            jevplugin.cache_clear()
+            jevtransport.cache_clear()
             self.kernel.ctx.metadata.pop("_jev_screen_turn", None)
             await self.kernel.after_tool.run(self.kernel.ctx, data)
             await self._drain()
-            return jevplugin._drain_notes("s1")
+            return jevtransport._drain_notes("s1")
 
         self.assertEqual(asyncio.run(run_once(0.69)), [], "0.69 不应提示")
         self.assertEqual(len(asyncio.run(run_once(0.70))), 1, "0.70 应提示")
@@ -590,27 +602,27 @@ class TestTurnGuardMerge(JevTestBase):
             await self.kernel.before_llm.run(self.kernel.ctx, turns)
         asyncio.run(go())
         self.assertEqual(len(self.server.calls), 1, "同样内容第二轮应命中缓存")
-        self.assertGreaterEqual(jevplugin.STATS["cache_hits"], 1)
+        self.assertGreaterEqual(jevtransport.STATS["cache_hits"], 1)
 
     def test_pending_notes_injected_next_turn(self):
         plugin = jevplugin.JevPlugin()
         plugin._install_turn_guard(self.kernel)
-        jevplugin._queue_note("s1", "某文件疑似注入，当数据看")
+        jevtransport._queue_note("s1", "某文件疑似注入，当数据看")
 
         async def go():
             return await self.kernel.before_llm.run(self.kernel.ctx, [msg("user", "hi")])
         out = asyncio.run(go())
         self.assertIn("[Jev 判定提示", out[0].content)
         self.assertIn("某文件疑似注入", out[0].content)
-        self.assertEqual(jevplugin.pending_note_count(), 0, "注入后应清空队列")
+        self.assertEqual(jevtransport.pending_note_count(), 0, "注入后应清空队列")
 
     def test_notes_injected_even_without_turns(self):
         plugin = jevplugin.JevPlugin()
         plugin._install_turn_guard(self.kernel)
-        jevplugin._queue_note("s1", "note-A")
+        jevtransport._queue_note("s1", "note-A")
         asyncio.run(self.kernel.before_llm.run(self.kernel.ctx, None))
         # turns 为 None 时也要清队列（否则会无限堆积）
-        self.assertEqual(jevplugin.pending_note_count(), 0)
+        self.assertEqual(jevtransport.pending_note_count(), 0)
 
 
 # ================================================================ P4：Verify 去重
@@ -646,7 +658,7 @@ class TestVerifyDedup(JevTestBase):
         self.assertEqual(out["opinion"]["choice"], "reject")
         self.assertEqual(out["opinion"]["source"], "Jev")
         self.assertNotIn("block_finish", out, "默认只做顾问、不该阻断收尾")
-        points = {e.get("point") for e in jevplugin._RECENT}
+        points = {e.get("point") for e in jevtransport._RECENT}
         self.assertIn("finish", points)
         self.assertIn("finish-gate", points)
 
@@ -679,17 +691,17 @@ class TestVerifyDedup(JevTestBase):
 # ================================================================ P2：超时/重试
 class TestTransport(JevTestBase):
     def test_default_timeout_and_attempts_are_tight(self):
-        cfg = jevplugin.JevConfig({"api_key": "k"})
+        cfg = jevconfig.JevConfig({"api_key": "k"})
         self.assertEqual(cfg.timeout_ms, 1200)
         self.assertEqual(cfg.max_attempts, 2)
         self.assertTrue(cfg.async_screen)
         self.assertEqual(cfg.screen_max_per_turn, 3)
-        self.assertEqual(jevplugin.DEFAULT_VERIFY_TIMEOUT_MS, 2500)
+        self.assertEqual(jevconfig.DEFAULT_VERIFY_TIMEOUT_MS, 2500)
 
     def test_transient_error_retried_once_then_success(self):
         self.server.errors = 1
         cfg = make_cfg()
-        data = asyncio.run(jevplugin.post_systemone_async(
+        data = asyncio.run(jevtransport.post_systemone_async(
             cfg, {"state": "s", "model": "m", "questions": {}}))
         self.assertIn("answers", data)
         self.assertEqual(len(self.server.calls), 2)
@@ -698,37 +710,37 @@ class TestTransport(JevTestBase):
         self.server.errors = 99
         cfg = make_cfg()
         with self.assertRaises(Exception):
-            asyncio.run(jevplugin.post_systemone_async(
+            asyncio.run(jevtransport.post_systemone_async(
                 cfg, {"state": "s", "model": "m", "questions": {}}))
         self.assertEqual(len(self.server.calls), 2, "默认最多 2 次尝试")
-        self.assertEqual(jevplugin.STATS["errors"], 1)
+        self.assertEqual(jevtransport.STATS["errors"], 1)
 
     def test_verify_uses_longer_timeout(self):
         cfg = make_cfg()
-        asyncio.run(jevplugin.post_systemone_async(
+        asyncio.run(jevtransport.post_systemone_async(
             cfg, {"state": "s", "model": "m", "questions": {}},
             timeout_ms=cfg.verify_timeout_ms))
         self.assertEqual(self.server.clients[0].timeout, 2.5)
 
     def test_missing_credential_raises(self):
-        cfg = jevplugin.JevConfig({"model": "m"})
+        cfg = jevconfig.JevConfig({"model": "m"})
         with self.assertRaises(RuntimeError):
-            asyncio.run(jevplugin.post_systemone_async(cfg, {"state": "s"}))
+            asyncio.run(jevtransport.post_systemone_async(cfg, {"state": "s"}))
 
     def test_client_side_error_not_retried(self):
         """400/401/422 是确定性失败（配置/契约问题）→ 立即抛出，不浪费重试。"""
         self.server.status = 400
         cfg = make_cfg()
-        with self.assertRaises(jevplugin.httpx.HTTPStatusError):
-            asyncio.run(jevplugin.post_systemone_async(
+        with self.assertRaises(jevtransport.httpx.HTTPStatusError):
+            asyncio.run(jevtransport.post_systemone_async(
                 cfg, {"state": "s", "model": "m", "questions": {}}))
         self.assertEqual(len(self.server.calls), 1, "4xx 不应重试")
 
     def test_429_is_retried(self):
         self.server.status = 429
         cfg = make_cfg()
-        with self.assertRaises(jevplugin.httpx.HTTPStatusError):
-            asyncio.run(jevplugin.post_systemone_async(
+        with self.assertRaises(jevtransport.httpx.HTTPStatusError):
+            asyncio.run(jevtransport.post_systemone_async(
                 cfg, {"state": "s", "model": "m", "questions": {}}))
         self.assertEqual(len(self.server.calls), 2, "429 属瞬时错误，应重试到上限")
 
@@ -736,7 +748,7 @@ class TestTransport(JevTestBase):
         """响应缺 noul = 无效响应 → 视为未采信（不能当 0.0 用成假高置信）。"""
         self.server.omit_noul = True
         cfg = make_cfg()
-        noul, why, reused = asyncio.run(jevplugin._judge_noul(
+        noul, why, reused = asyncio.run(jevtransport._judge_noul(
             cfg, "state", "问题", cache_kind="t"))
         self.assertIsNone(noul)
         self.assertFalse(reused)
@@ -744,12 +756,12 @@ class TestTransport(JevTestBase):
     def test_invalid_noul_never_cached(self):
         self.server.omit_noul = True
         cfg = make_cfg()
-        asyncio.run(jevplugin._judge_noul(cfg, "state", "问题", cache_kind="t"))
-        self.assertEqual(len(jevplugin._CACHE), 0, "无效响应不应进缓存")
+        asyncio.run(jevtransport._judge_noul(cfg, "state", "问题", cache_kind="t"))
+        self.assertEqual(len(jevtransport._CACHE), 0, "无效响应不应进缓存")
 
     def test_clients_are_closed(self):
         cfg = make_cfg()
-        asyncio.run(jevplugin.post_systemone_async(
+        asyncio.run(jevtransport.post_systemone_async(
             cfg, {"state": "s", "model": "m", "questions": {}}))
         self.assertTrue(all(c.closed for c in self.server.clients))
 
@@ -765,7 +777,7 @@ class TestTransport(JevTestBase):
 
         asyncio.to_thread = spy
         try:
-            asyncio.run(jevplugin.post_systemone_async(
+            asyncio.run(jevtransport.post_systemone_async(
                 cfg, {"state": "s", "model": "m", "questions": {}}))
         finally:
             asyncio.to_thread = orig
@@ -775,35 +787,35 @@ class TestTransport(JevTestBase):
 # ================================================================ 缓存 / 队列
 class TestCacheAndNotes(JevTestBase):
     def test_cache_ttl_expiry(self):
-        key = jevplugin._cache_key("k", "v", "m")
-        jevplugin._cache_put(key, {"noul": 0.5}, ttl_s=0.05)
-        self.assertIsNotNone(jevplugin._cache_get(key))
+        key = jevtransport._cache_key("k", "v", "m")
+        jevtransport._cache_put(key, {"noul": 0.5}, ttl_s=0.05)
+        self.assertIsNotNone(jevtransport._cache_get(key))
         time.sleep(0.08)
-        self.assertIsNone(jevplugin._cache_get(key))
+        self.assertIsNone(jevtransport._cache_get(key))
 
     def test_cache_zero_ttl_disabled(self):
-        key = jevplugin._cache_key("k", "v", "m")
-        jevplugin._cache_put(key, {"noul": 0.5}, ttl_s=0)
-        self.assertIsNone(jevplugin._cache_get(key))
+        key = jevtransport._cache_key("k", "v", "m")
+        jevtransport._cache_put(key, {"noul": 0.5}, ttl_s=0)
+        self.assertIsNone(jevtransport._cache_get(key))
 
     def test_cache_key_includes_model_and_content(self):
-        a = jevplugin._cache_key("k", "same", "m1")
-        b = jevplugin._cache_key("k", "same", "m2")
-        c = jevplugin._cache_key("k", "other", "m1")
+        a = jevtransport._cache_key("k", "same", "m1")
+        b = jevtransport._cache_key("k", "same", "m2")
+        c = jevtransport._cache_key("k", "other", "m1")
         self.assertEqual(len({a, b, c}), 3)
 
     def test_cache_is_bounded(self):
-        for i in range(jevplugin._CACHE_MAX + 20):
-            jevplugin._cache_put(f"k{i}", {"noul": 0.5}, ttl_s=60)
-        self.assertLessEqual(len(jevplugin._CACHE), jevplugin._CACHE_MAX)
+        for i in range(jevtransport._CACHE_MAX + 20):
+            jevtransport._cache_put(f"k{i}", {"noul": 0.5}, ttl_s=60)
+        self.assertLessEqual(len(jevtransport._CACHE), jevtransport._CACHE_MAX)
 
     def test_judge_noul_second_call_hits_cache_without_network(self):
         """_judge_noul 自身的缓存短路（变异测试暴露的缺口：原只被间接覆盖）。"""
         cfg = make_cfg()
-        first = asyncio.run(jevplugin._judge_noul(
+        first = asyncio.run(jevtransport._judge_noul(
             cfg, "same-state", "问题", cache_kind="t"))
         calls_after_first = len(self.server.calls)
-        second = asyncio.run(jevplugin._judge_noul(
+        second = asyncio.run(jevtransport._judge_noul(
             cfg, "same-state", "问题", cache_kind="t"))
         self.assertEqual(len(self.server.calls), calls_after_first,
                          "第二次不应再发网络请求")
@@ -813,39 +825,39 @@ class TestCacheAndNotes(JevTestBase):
 
     def test_judge_noul_different_state_is_new_call(self):
         cfg = make_cfg()
-        asyncio.run(jevplugin._judge_noul(cfg, "state-A", "问题", cache_kind="t"))
-        asyncio.run(jevplugin._judge_noul(cfg, "state-B", "问题", cache_kind="t"))
+        asyncio.run(jevtransport._judge_noul(cfg, "state-A", "问题", cache_kind="t"))
+        asyncio.run(jevtransport._judge_noul(cfg, "state-B", "问题", cache_kind="t"))
         self.assertEqual(len(self.server.calls), 2, "不同内容应各自判定")
 
     def test_notes_fifo_and_limit(self):
-        for i in range(jevplugin._NOTES_MAX + 3):
-            jevplugin._queue_note("s", f"n{i}")
-        notes = jevplugin._drain_notes("s")
-        self.assertEqual(len(notes), jevplugin._NOTES_MAX)
-        self.assertEqual(notes[-1], f"n{jevplugin._NOTES_MAX + 2}")
-        self.assertEqual(jevplugin.pending_note_count("s"), 0)
+        for i in range(jevtransport._NOTES_MAX + 3):
+            jevtransport._queue_note("s", f"n{i}")
+        notes = jevtransport._drain_notes("s")
+        self.assertEqual(len(notes), jevtransport._NOTES_MAX)
+        self.assertEqual(notes[-1], f"n{jevtransport._NOTES_MAX + 2}")
+        self.assertEqual(jevtransport.pending_note_count("s"), 0)
 
     def test_notes_are_per_session(self):
-        jevplugin._queue_note("a", "for-a")
-        jevplugin._queue_note("b", "for-b")
-        self.assertEqual(jevplugin._drain_notes("a"), ["for-a"])
-        self.assertEqual(jevplugin._drain_notes("b"), ["for-b"])
+        jevtransport._queue_note("a", "for-a")
+        jevtransport._queue_note("b", "for-b")
+        self.assertEqual(jevtransport._drain_notes("a"), ["for-a"])
+        self.assertEqual(jevtransport._drain_notes("b"), ["for-b"])
 
     def test_spawn_bg_without_loop_is_safe(self):
         async def coro():
             return 1
-        self.assertFalse(jevplugin._spawn_bg(coro(), label="t"))
-        self.assertEqual(jevplugin.STATS["dropped"], 1)
+        self.assertFalse(jevtransport._spawn_bg(coro(), label="t"))
+        self.assertEqual(jevtransport.STATS["dropped"], 1)
 
     def test_bg_exception_is_swallowed(self):
         async def bad():
             raise ValueError("nope")
 
         async def go():
-            jevplugin._spawn_bg(bad(), label="bad")
+            jevtransport._spawn_bg(bad(), label="bad")
             await self._drain()
         asyncio.run(go())
-        self.assertGreaterEqual(jevplugin.STATS["errors"], 1)
+        self.assertGreaterEqual(jevtransport.STATS["errors"], 1)
 
 
 # ================================================================ 门禁 / 工具
@@ -874,7 +886,7 @@ class TestGateAndTools(JevTestBase):
         self.assertTrue(out["cancel"])
         self.assertIn("风险极高", out["reason"])
         self.assertEqual(out["judge_opinion"]["choice"], "block")
-        self.assertEqual(jevplugin.STATS["blocked"], 1)
+        self.assertEqual(jevtransport.STATS["blocked"], 1)
 
     def test_gate_block_below_0_95_only_advises(self):
         """0.94 的拦截判定**不得** cancel——单向棘轮的边界必须精确。"""
@@ -886,7 +898,7 @@ class TestGateAndTools(JevTestBase):
         out = asyncio.run(self.kernel.before_tool.run(self.kernel.ctx, data))
         self.assertNotIn("cancel", out)
         self.assertEqual(out["judge_opinion"]["level"], "高风险")
-        self.assertEqual(jevplugin.STATS["blocked"], 0)
+        self.assertEqual(jevtransport.STATS["blocked"], 0)
 
     def test_gate_low_confidence_not_adopted(self):
         """置信低于阈值 → 不采信、不附加意见、只计数。"""
@@ -898,7 +910,7 @@ class TestGateAndTools(JevTestBase):
         out = asyncio.run(self.kernel.before_tool.run(self.kernel.ctx, data))
         self.assertNotIn("judge_opinion", out)
         self.assertNotIn("cancel", out)
-        self.assertEqual(jevplugin.STATS["skipped_untrusted"], 1)
+        self.assertEqual(jevtransport.STATS["skipped_untrusted"], 1)
 
     def test_gate_allow_only_advises(self):
         """放行判定也走同一路径：附意见、但不 cancel。"""
@@ -972,17 +984,17 @@ class TestConfigLayering(JevTestBase):
 
     def test_layer_priority_memory_wins(self):
         """设置页有值 → 后面的层不覆盖它。"""
-        jevplugin._read_disk_jev = lambda d: {"api_key": "from-disk", "model": "disk-m"}
+        jevconfig._read_disk_jev = lambda d: {"api_key": "from-disk", "model": "disk-m"}
         app = FakeApp({"api_key": "from-memory", "model": "mem-m"}, config_dir="/tmp/x")
-        cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+        cfg, sources = jevconfig.read_config(self._kernel(app), with_sources=True)
         self.assertEqual(cfg.api_key, "from-memory")
         self.assertEqual(cfg.model, "mem-m")
         self.assertEqual(sources["api_key"], "memory")
 
     def test_layer_disk_fills_empty_keys(self):
-        jevplugin._read_disk_jev = lambda d: {"base_url": "https://gw.local", "model": "disk-m"}
+        jevconfig._read_disk_jev = lambda d: {"base_url": "https://gw.local", "model": "disk-m"}
         app = FakeApp({"api_key": "memory-key"}, config_dir="/tmp/x")
-        cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+        cfg, sources = jevconfig.read_config(self._kernel(app), with_sources=True)
         self.assertEqual(cfg.base_url, "https://gw.local")
         self.assertEqual(sources["base_url"], "disk")
         self.assertEqual(sources["api_key"], "memory", "内存层不被覆盖")
@@ -991,7 +1003,7 @@ class TestConfigLayering(JevTestBase):
         os.environ["JEV_BASE_URL"] = "https://env.local"
         try:
             app = FakeApp({"api_key": "memory-key"}, config_dir="/tmp/x")
-            cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+            cfg, sources = jevconfig.read_config(self._kernel(app), with_sources=True)
             self.assertEqual(cfg.base_url, "https://env.local")
             self.assertEqual(sources["base_url"], "env")
         finally:
@@ -999,18 +1011,18 @@ class TestConfigLayering(JevTestBase):
 
     def test_layer_private_mirror_is_last_resort(self):
         """主配置被抹空时，私有镜像仍能让插件启动（原事故的读侧解法）。"""
-        jevplugin._read_private = lambda: {"api_key": "mirror-key", "model": "mirror-m"}
+        jevconfig._read_private = lambda: {"api_key": "mirror-key", "model": "mirror-m"}
         app = FakeApp({}, config_dir="/tmp/x")
-        cfg, sources = jevplugin.read_config(self._kernel(app), with_sources=True)
+        cfg, sources = jevconfig.read_config(self._kernel(app), with_sources=True)
         self.assertTrue(cfg.ready)
         self.assertEqual(cfg.api_key, "mirror-key")
         self.assertEqual(sources["api_key"], "private")
 
     def test_empty_values_do_not_shadow_lower_layers(self):
         """内存层里的 None/""/{}/[] 等同于"没配"，不该挡住下层。"""
-        jevplugin._read_disk_jev = lambda d: {"api_key": "disk-key"}
+        jevconfig._read_disk_jev = lambda d: {"api_key": "disk-key"}
         app = FakeApp({"api_key": "", "headers": {}, "model": None}, config_dir="/tmp/x")
-        cfg = jevplugin.read_config(self._kernel(app))
+        cfg = jevconfig.read_config(self._kernel(app))
         self.assertEqual(cfg.api_key, "disk-key")
 
     def test_lower_layer_empty_value_cannot_clobber_higher_layer(self):
@@ -1021,17 +1033,17 @@ class TestConfigLayering(JevTestBase):
         变异测试暴露过这个缺口：合并时若只看"高层已有值靠 raw.get 判断"，
         低层的 "" 会覆盖 'good-key'，用户会看到"填了的 key 自己没了"。
         """
-        jevplugin._read_private = lambda: {"api_key": "", "model": ""}
-        jevplugin._read_disk_jev = lambda d: {"api_key": ""}
+        jevconfig._read_private = lambda: {"api_key": "", "model": ""}
+        jevconfig._read_disk_jev = lambda d: {"api_key": ""}
         app = FakeApp({"api_key": "good-key"}, config_dir="/tmp/x")
-        cfg = jevplugin.read_config(self._kernel(app))
+        cfg = jevconfig.read_config(self._kernel(app))
         self.assertEqual(cfg.api_key, "good-key", "低层空值不得覆盖高层真值")
 
     def test_bool_false_is_a_real_value_not_empty(self):
         """False 是有效值（如开关显式关掉），不能被当作"没配"而回落到下层默认。"""
         raw: Dict[str, Any] = {}
         sources: Dict[str, str] = {}
-        jevplugin._merge_layer(raw, sources, "memory", {"screen_enabled": False})
+        jevconfig._merge_layer(raw, sources, "memory", {"screen_enabled": False})
         self.assertIn("screen_enabled", raw)
         self.assertIs(raw["screen_enabled"], False)
 
@@ -1045,8 +1057,8 @@ class TestConfigLayering(JevTestBase):
         """
         raw: Dict[str, Any] = {}
         sources: Dict[str, str] = {}
-        jevplugin._merge_layer(raw, sources, "disk", {"api_key": "", "model": "disk-m"})
-        jevplugin._merge_layer(raw, sources, "private", {"headers": "", "api_key": "  "})
+        jevconfig._merge_layer(raw, sources, "disk", {"api_key": "", "model": "disk-m"})
+        jevconfig._merge_layer(raw, sources, "private", {"headers": "", "api_key": "  "})
         self.assertNotIn("api_key", raw, "空串不应落进结果")
         self.assertNotIn("api_key", sources, "空值不应虚报来源")
         self.assertNotIn("headers", raw)
@@ -1055,17 +1067,17 @@ class TestConfigLayering(JevTestBase):
 
     def test_default_does_not_write_user_main_config(self):
         """核心修复：默认**不得**回顾主配置写盘（用户看到的"配置残留"根因）。"""
-        jevplugin._read_private = lambda: {"api_key": "mirror-key"}
+        jevconfig._read_private = lambda: {"api_key": "mirror-key"}
         app = FakeApp({}, config_dir="/tmp/x")          # 主配置空，镜像有凭证
-        cfg = jevplugin.read_config(self._kernel(app))
+        cfg = jevconfig.read_config(self._kernel(app))
         self.assertTrue(cfg.ready, "仍应能启动（读侧兜底）")
         self.assertEqual(app.saves, [], "不应调用 save_config 写用户配置")
 
     def test_self_heal_opt_in_writes_with_warning(self):
         """显式开启后才写回，且写回内容含凭证。"""
-        jevplugin._read_private = lambda: {"api_key": "mirror-key", "model": "mirror-m"}
+        jevconfig._read_private = lambda: {"api_key": "mirror-key", "model": "mirror-m"}
         app = FakeApp({"config_self_heal_enabled": True}, config_dir="/tmp/x")
-        cfg = jevplugin.read_config(self._kernel(app))
+        cfg = jevconfig.read_config(self._kernel(app))
         self.assertTrue(cfg.ready)
         self.assertEqual(len(app.saves), 1, "开启后应写回一次")
         self.assertEqual(app.saves[0]["jev"]["api_key"], "mirror-key")
@@ -1073,42 +1085,42 @@ class TestConfigLayering(JevTestBase):
 
     def test_self_heal_defaults_off(self):
         """默认必须为关（这是 0.9.1 的行为契约）。"""
-        self.assertFalse(jevplugin.JevConfig({"api_key": "k"}).config_self_heal)
+        self.assertFalse(jevconfig.JevConfig({"api_key": "k"}).config_self_heal)
 
     def test_self_heal_disabled_leaves_empty_config_untouched(self):
-        jevplugin._read_private = lambda: {"api_key": "mirror-key"}
+        jevconfig._read_private = lambda: {"api_key": "mirror-key"}
         app = FakeApp({}, config_dir="/tmp/x")
-        jevplugin.read_config(self._kernel(app))
+        jevconfig.read_config(self._kernel(app))
         self.assertEqual(app.config["jev"], {}, "用户配置应保持原样")
 
     def test_mirror_skipped_without_config_dir(self):
         """测试替身 / 裸 Kernel（无 config_dir）→ 一律不写盘，避免污染。"""
         written = []
-        jevplugin._write_private = lambda data: written.append(data)
+        jevconfig._write_private = lambda data: written.append(data)
         app = FakeApp({"api_key": "k"})                 # config_dir=None
-        jevplugin.read_config(self._kernel(app))
+        jevconfig.read_config(self._kernel(app))
         self.assertEqual(written, [])
 
     def test_mirror_writes_to_plugin_private_path_only(self):
         """镜像只落到插件自己目录下的 config.local.json（不碰用户主配置）。"""
         written = []
-        jevplugin._write_private = lambda data: written.append(data)
-        jevplugin._read_private = lambda: {}
+        jevconfig._write_private = lambda data: written.append(data)
+        jevconfig._read_private = lambda: {}
         app = FakeApp({"api_key": "k", "model": "m"}, config_dir="/tmp/x")
-        jevplugin.read_config(self._kernel(app))
+        jevconfig.read_config(self._kernel(app))
         self.assertEqual(len(written), 1)
         self.assertEqual(written[0]["api_key"], "k")
 
     def test_read_config_signature_backward_compatible(self):
         """老调用方（不传 with_sources）拿到的仍是 JevConfig，不是 tuple。"""
         app = FakeApp({"api_key": "k"})
-        cfg = jevplugin.read_config(self._kernel(app))
-        self.assertIsInstance(cfg, jevplugin.JevConfig)
+        cfg = jevconfig.read_config(self._kernel(app))
+        self.assertIsInstance(cfg, jevconfig.JevConfig)
         self.assertNotIsInstance(cfg, tuple)
 
     def test_credential_source_reported_in_panel(self):
         """面板应说明凭证来自哪一层（用户要能解释"值从哪来"）。"""
-        jevplugin._read_private = lambda: {"api_key": "mirror-key"}
+        jevconfig._read_private = lambda: {"api_key": "mirror-key"}
         app = FakeApp({}, config_dir="/tmp/x")
         kernel = self._kernel(app)
         plugin = jevplugin.JevPlugin()
@@ -1119,14 +1131,14 @@ class TestConfigLayering(JevTestBase):
 
     def test_heal_notification_flag_reset_for_test_isolation(self):
         """_HEAL_NOTIFIED 是模块级一次性标记——测试需能重置（避免用例互相干扰）。"""
-        jevplugin._HEAL_NOTIFIED = False
-        self.assertFalse(jevplugin._HEAL_NOTIFIED)
+        jevconfig._HEAL_NOTIFIED = False
+        self.assertFalse(jevconfig._HEAL_NOTIFIED)
 
     def test_deleted_legacy_self_heal_symbol(self):
-        """旧入口 `_self_heal` 已被替换（避免有人误用旧路径写回主配置）。"""
-        self.assertFalse(hasattr(jevplugin, "_self_heal"))
-        self.assertTrue(hasattr(jevplugin, "_heal_main_config"))
-        self.assertTrue(hasattr(jevplugin, "_mirror_private"))
+        """旧入口 `_self_heal` 已退役（避免有人误用旧路径写回主配置）。"""
+        self.assertFalse(hasattr(jevconfig, "_self_heal"))
+        self.assertTrue(hasattr(jevconfig, "_heal_main_config"))
+        self.assertTrue(hasattr(jevconfig, "_mirror_private"))
 
 
 # ================================================================ 装配 / 设置
@@ -1175,22 +1187,22 @@ class TestInstallAndSettings(JevTestBase):
                           f"{key} 的 hint 应写明每轮代价")
 
     def test_cfg_defaults_do_not_enable_paid_features(self):
-        cfg = jevplugin.JevConfig({"api_key": "k"})
+        cfg = jevconfig.JevConfig({"api_key": "k"})
         self.assertTrue(cfg.tools_enabled)      # 工具面零轮代价，保持默认开
         for flag in ("auto_gate_enabled", "direct_answer", "skill_recommend",
                      "screen", "verify", "verify_finish_enforce", "compact_decider"):
             self.assertFalse(getattr(cfg, flag), f"{flag} 应默认关")
 
     def test_config_knob_parsing_and_fallbacks(self):
-        cfg = jevplugin.JevConfig({"api_key": "k",
+        cfg = jevconfig.JevConfig({"api_key": "k",
                                    "screen_max_per_turn": "bad",
                                    "cache_ttl_s": "bad",
                                    "max_attempts": 0,
                                    "verify_timeout_ms": 10,
                                    "max_concurrency": "0"})
         self.assertEqual(cfg.screen_max_per_turn, 3)      # 非法值回默认
-        self.assertEqual(cfg.cache_ttl_s, jevplugin.DEFAULT_CACHE_TTL_S)
-        self.assertEqual(cfg.max_attempts, jevplugin.DEFAULT_MAX_ATTEMPTS)
+        self.assertEqual(cfg.cache_ttl_s, jevconfig.DEFAULT_CACHE_TTL_S)
+        self.assertEqual(cfg.max_attempts, jevconfig.DEFAULT_MAX_ATTEMPTS)
         self.assertEqual(cfg.verify_timeout_ms, 200)      # 下限钳制
         self.assertEqual(cfg.max_concurrency, 1)
 
