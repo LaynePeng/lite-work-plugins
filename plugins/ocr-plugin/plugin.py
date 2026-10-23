@@ -1,3 +1,5 @@
+# 本仓库（lite-work-plugins）为源；需要作为 lite-work 内置时按需同步回
+# litework/tools/ocr.py（社区独立分发版）。
 """OCR 工具：把图片 / PDF 页面 / PPT 内嵌图片中的文字提取出来。
 
 - ocr_image   : 直接识别单张图片（png/jpg/bmp/tiff/webp 等）
@@ -7,54 +9,88 @@
 
 OCR 引擎：rapidocr-onnxruntime（纯 pip 安装、离线可用、内置中英文模型，
 无需系统级 Tesseract/poppler）。依赖缺失时返回可操作提示。
+v1.2.0：重库惰性导入——rapidocr（+onnxruntime/cv2，实测 import 约 157MB）
+与 pymupdf（约 31MB）只在首次调用 OCR 工具时加载。工具定义是纯数据，
+模块导入必须保持轻量：Agent 注册表构建（每个任务启动 + /api/tools）都会
+import 本模块，不惰性则每个进程无条件付出 ~190MB。访问器模式而非
+PEP 562 __getattr__：模块内部函数查全局名走 globals dict，不经过模块级
+__getattr__，惰性必须由函数调用承载。
 """
-# 本仓库（lite-work-plugins）为源；需要作为 lite-work 内置时按需同步回
-# litework/tools/ocr.py（社区独立分发版）。
 from __future__ import annotations
 
 import logging
 import os
 import re
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from litework.core.types import ToolDefinition
 
 logger = logging.getLogger("litework.tools.ocr")
 
-# ---------------------------------------------------------------- 依赖检查
+# ---------------------------------------------------------------- 依赖检查（惰性）
 
-_HAS_RAPIDOCR: bool = False
-_HAS_PYMUPDF: bool = False
+_RapidOCR: Any = None  # 类对象，首次 _get_engine() 时 import
+_pymupdf_mod: Any = None
+_pymupdf_probed = False
 
-try:
-    from rapidocr_onnxruntime import RapidOCR
 
-    _HAS_RAPIDOCR = True
-except ImportError:
-    pass
+def _rapidocr_available() -> bool:
+    """rapidocr 是否可导入（探测一次并缓存；不触发加载——真正加载在 _get_engine）。
 
-try:
-    import pymupdf  # 新版包名（旧名 fitz 已弃用）
+    import 一次即已付费，所以这里直接 import 探测：可用时 import 本身就是
+    「加载完成」，不可用时缓存失败结论不再重试。
+    """
+    global _RapidOCR
+    if _RapidOCR is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR as _cls
 
-    _HAS_PYMUPDF = True
-except ImportError:
-    try:
-        import fitz as pymupdf  # type: ignore[no-redef]
+            _RapidOCR = _cls
+        except ImportError:
+            _RapidOCR = False  # 哨兵：False = 已探测且缺失（与 None=未探测区分）
+    return bool(_RapidOCR)
 
-        _HAS_PYMUPDF = True
-    except ImportError:
-        pass
+
+def _pymupdf():
+    """按需加载 pymupdf（新版包名，旧名 fitz 是弃用别名），缓存探测结果。"""
+    global _pymupdf_mod, _pymupdf_probed
+    if not _pymupdf_probed:
+        _pymupdf_probed = True
+        try:
+            import pymupdf
+
+            _pymupdf_mod = pymupdf
+        except ImportError:
+            try:
+                import fitz as pymupdf  # type: ignore[no-redef]
+
+                _pymupdf_mod = pymupdf
+            except ImportError:
+                _pymupdf_mod = None
+    return _pymupdf_mod
 
 # 单例：RapidOCR 模型加载约数百 MB 内存，进程内复用
 _OCR_ENGINE: Any = None
 
 MAX_TEXT_LEN = 4000  # 单图识别结果截断长度（上下文保护）
 
+# 引擎串行锁：RapidOCR/onnxruntime session 非线程安全，并发使用同一
+# 单例会内部锁死（识别线程永久挂起，几百 MB 内存拿不回）——超时被
+# 遗弃的旧线程 + 重试的新线程并发进引擎是最典型的死锁场景
+_OCR_LOCK = threading.Lock()
+
+# 单次调用软截止（秒）：页循环的页级 checkpoint。外层 tool_timeout=120s
+# 硬超时后线程杀不掉（Python 无法杀线程），软截止让工具体自己停下并
+# 返回已识别的部分结果——留 20s 余量给收尾与结果截断
+_OCR_SOFT_DEADLINE_S = 100.0
+
 
 def _get_engine():
     global _OCR_ENGINE
     if _OCR_ENGINE is None:
-        _OCR_ENGINE = RapidOCR()
+        _OCR_ENGINE = _RapidOCR() if _RapidOCR else None
     return _OCR_ENGINE
 
 
@@ -73,21 +109,25 @@ def _missing_pdf_msg() -> str:
 # ---------------------------------------------------------------- 核心识别
 
 def _ocr_image_bytes(image_path: str) -> str:
-    """识别单张图片，返回文字（按行拼接）。"""
-    engine = _get_engine()
-    # RapidOCR 返回 [(box, text, score), ...]，按 top-left y 排序保持阅读顺序
-    result, _elapse = engine(image_path)
-    if not result:
-        return ""
-    lines = []
-    for box, text, _score in result:
-        try:
-            y = float(box[0][1])
-        except Exception:
-            y = 0.0
-        lines.append((y, text))
-    lines.sort(key=lambda t: t[0])
-    return "\n".join(text for _, text in lines if text and str(text).strip())
+    """识别单张图片，返回文字（按行拼接）。
+
+    整体持 _OCR_LOCK：引擎单例串行使用（非线程安全，见 _OCR_LOCK 注释）。
+    """
+    with _OCR_LOCK:
+        engine = _get_engine()
+        # RapidOCR 返回 [(box, text, score), ...]，按 top-left y 排序保持阅读顺序
+        result, _elapse = engine(image_path)
+        if not result:
+            return ""
+        lines = []
+        for box, text, _score in result:
+            try:
+                y = float(box[0][1])
+            except Exception:
+                y = 0.0
+            lines.append((y, text))
+        lines.sort(key=lambda t: t[0])
+        return "\n".join(text for _, text in lines if text and str(text).strip())
 
 
 # ---------------------------------------------------------------- OCRTools
@@ -156,6 +196,10 @@ class OCRTools:
                             "type": "string",
                             "description": "pptx 文件路径（相对工作区）",
                         },
+                        "max_pages": {
+                            "type": "number",
+                            "description": "最多识别页数（默认 20，上限 100）",
+                        },
                     },
                     "required": ["path"],
                 },
@@ -190,7 +234,7 @@ class OCRTools:
     # ------------------------------------------------------------ 图片
 
     def _ocr_image(self, args: Dict[str, Any]) -> str:
-        if not _HAS_RAPIDOCR:
+        if not _rapidocr_available():
             return _missing_ocr_msg()
         rel_path = str(args.get("path") or "").strip()
         if not rel_path:
@@ -213,9 +257,10 @@ class OCRTools:
     # ------------------------------------------------------------ PDF
 
     def _ocr_document(self, args: Dict[str, Any]) -> str:
-        if not _HAS_RAPIDOCR:
+        if not _rapidocr_available():
             return _missing_ocr_msg()
-        if not _HAS_PYMUPDF:
+        pymupdf = _pymupdf()
+        if pymupdf is None:
             return _missing_pdf_msg()
         rel_path = str(args.get("path") or "").strip()
         if not rel_path:
@@ -234,20 +279,34 @@ class OCRTools:
             return f"[OCR Error]: 无法打开 PDF: {exc}"
         total = len(doc)
         parts = [f"PDF 共 {total} 页，识别前 {min(max_pages, total)} 页"]
+        deadline = time.monotonic() + _OCR_SOFT_DEADLINE_S
+        stopped_early = False
         for i in range(min(max_pages, total)):
+            # 页级软截止：到点即停，已识别部分照常返回（外层硬超时杀不掉
+            # 线程，这里是唯一能「体面停下」的机会）
+            if time.monotonic() > deadline:
+                stopped_early = True
+                break
             try:
-                pix = doc[i].get_pixmap(dpi=200)
+                # dpi 150：A4 扫描件识别质量与 200 几乎无损，单页提速约 40%
+                pix = doc[i].get_pixmap(dpi=150)
                 text = _ocr_pixmap(pix)
             except Exception as exc:
                 text = f"[识别失败: {exc}]"
             parts.append(f"\n--- 第 {i + 1} 页 ---\n{text[:MAX_TEXT_LEN]}")
         doc.close()
+        if stopped_early:
+            done = len(parts) - 1
+            parts.append(
+                f"\n[软超时中止]: 已识别 {done}/{min(max_pages, total)} 页"
+                f"（单次调用超过 {_OCR_SOFT_DEADLINE_S:.0f}s）。"
+                f"如需继续，请用 max_pages 从第 {done + 1} 页分批识别。")
         return "\n".join(parts)
 
     # ------------------------------------------------------------ PPTX（带位置）
 
     def _ocr_pptx(self, args: Dict[str, Any]) -> str:
-        if not _HAS_RAPIDOCR:
+        if not _rapidocr_available():
             return _missing_ocr_msg()
         rel_path = str(args.get("path") or "").strip()
         if not rel_path:
@@ -272,8 +331,19 @@ class OCRTools:
 
         parts = [f"共 {len(prs.slides)} 页幻灯片"]
         total_images = 0
+        # 页数上限（与 ocr_document 对齐）+ 页级软截止：PPT 页数无上限时
+        # 几十页的 deck 一次能跑几十分钟，工具层必须自己设边界
+        max_pages = max(1, min(100, int(args.get("max_pages") or 20)))
+        deadline = time.monotonic() + _OCR_SOFT_DEADLINE_S
+        stopped_early = False
         with tempfile.TemporaryDirectory(prefix="litework-ocr-") as tmpdir:
             for idx, slide in enumerate(prs.slides, 1):
+                if idx > max_pages:
+                    break
+                # 页级软截止：到点即停，已识别部分照常返回
+                if time.monotonic() > deadline:
+                    stopped_early = True
+                    break
                 images = []
                 for shape in slide.shapes:
                     if shape.shape_type is None:
@@ -324,6 +394,13 @@ class OCRTools:
         if total_images == 0:
             return f"[OCR]: 演示文稿中没有找到内嵌图片（{len(prs.slides)} 页）"
         parts.insert(1, f"共识别 {total_images} 张图片中的文字")
+        if stopped_early:
+            parts.append(
+                f"\n[软超时中止]: 已识别到第 {idx - 1} 页"
+                f"（单次调用超过 {_OCR_SOFT_DEADLINE_S:.0f}s）。"
+                f"如需继续，请分批处理后续页面。")
+        if idx <= len(prs.slides) and not stopped_early and idx > max_pages:
+            parts.append(f"\n[页数上限]: 仅识别前 {max_pages} 页（共 {len(prs.slides)} 页）。")
         return "\n".join(parts)
 
 
@@ -343,6 +420,8 @@ def _ocr_pixmap(pix) -> str:
             pass
 
 
+
+
 # ---------------------------------------------------------------- 社区分发包装
 # 本仓库（lite-work-plugins）为源；需要作为 lite-work 内置时按需同步回
 # litework/tools/ocr.py。安装到 ~/.lite-work/plugins/ 后覆盖内置同名插件，
@@ -356,7 +435,7 @@ class OcrPlugin(ToolPlugin):
     """ocr-plugin 社区独立分发版。"""
 
     name = "ocr-plugin"
-    version = "1.0.0"
+    version = "1.2.0"
     description = "OCR 识别：图片/PDF 页面/PPT 内嵌图片中的文字提取"
 
     def __init__(self) -> None:
