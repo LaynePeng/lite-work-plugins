@@ -1,0 +1,1118 @@
+# 纯逻辑单测（离线，零网络）：市场规则 / 台账算账 / 提示引擎。
+#
+# 🚫 红线：不连任何行情接口。数据层用内存替身（`_fetch_stub`）替换，
+#   台账一律写到 tempfile 目录，绝不碰用户真实 .astock/ledger.sqlite。
+# 运行：python3 -m unittest plugins.astock-plugin.test_astock_plugin
+import importlib.util
+import os
+import sys
+import tempfile
+import types
+import unittest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+# ---------------------------------------------------------------- 桩
+def _install_litework_stubs() -> None:
+    """插件模块级 import litework.*；测试环境没有主程序包，按最小契约打桩。"""
+    if "litework" in sys.modules:
+        return
+
+    class _Plugin:
+        name = "plugin"
+        contributes = {}
+
+        def install(self, kernel):
+            pass
+
+    class _ToolPlugin(_Plugin):
+        version = ""
+        description = ""
+        removed_tools = []
+
+        def get_tools(self):
+            return []
+
+        async def execute(self, name, args):
+            return ""
+
+    class _ToolDefinition:
+        def __init__(self, name="", description="", parameters=None):
+            self.name = name
+            self.description = description
+            self.parameters = parameters or {}
+
+    mods = {
+        "litework": types.ModuleType("litework"),
+        "litework.core": types.ModuleType("litework.core"),
+        "litework.core.types": types.ModuleType("litework.core.types"),
+        "litework.tools": types.ModuleType("litework.tools"),
+        "litework.tools.plugin": types.ModuleType("litework.tools.plugin"),
+    }
+    mods["litework.core.types"].ToolDefinition = _ToolDefinition
+    mods["litework.tools.plugin"].ToolPlugin = _ToolPlugin
+    for k, m in mods.items():
+        sys.modules.setdefault(k, m)
+
+
+_install_litework_stubs()
+sys.path.insert(0, _HERE)      # 与宿主一致：插件目录插入 sys.path（裸 import 兄弟模块）
+
+_SPEC = importlib.util.spec_from_file_location(
+    "astock_plugin_under_test", os.path.join(_HERE, "plugin.py"))
+astock = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(astock)  # type: ignore[union-attr]
+
+mkt = astock.mkt
+ledger_mod = astock.Ledger
+hints = astock.hints
+
+
+# ---------------------------------------------------------------- 市场规则
+
+
+class TestCodeNormalize(unittest.TestCase):
+    def test_plain_and_prefixed(self):
+        self.assertEqual(mkt.normalize_code("600000"), ("600000", "sh"))
+        self.assertEqual(mkt.normalize_code("sh600000"), ("600000", "sh"))
+        self.assertEqual(mkt.normalize_code("SH600000"), ("600000", "sh"))
+        self.assertEqual(mkt.normalize_code("000001"), ("000001", "sz"))
+        self.assertEqual(mkt.normalize_code("000001.sz"), ("000001", "sz"))
+        self.assertEqual(mkt.normalize_code("sz.000001"), ("000001", "sz"))
+        self.assertEqual(mkt.normalize_code("430047"), ("430047", "bj"))
+        self.assertEqual(mkt.normalize_code("510300"), ("510300", "sh"))
+
+    def test_index_kind_overrides_same_code(self):
+        # 000001 既是个股（平安银行，深市）也是上证指数（沪市）
+        self.assertEqual(mkt.normalize_code("000001"), ("000001", "sz"))
+        self.assertEqual(mkt.normalize_code("000001", "index"), ("000001", "sh"))
+
+    def test_mismatched_venue_rejected(self):
+        # sh300750 是典型手误（创业板在深市），必须报错而不是静默取错数据
+        with self.assertRaises(ValueError):
+            mkt.normalize_code("sh300750")
+
+    def test_empty_rejected(self):
+        with self.assertRaises(ValueError):
+            mkt.normalize_code("")
+
+
+class TestLimitUpDown(unittest.TestCase):
+    def test_main_board_10pct(self):
+        up, down, pct = mkt.limit_prices(10.00, "600000", "浦发银行")
+        self.assertEqual(pct, 10.0)
+        self.assertAlmostEqual(up, 11.00)
+        self.assertAlmostEqual(down, 9.00)
+
+    def test_gem_and_star_20pct(self):
+        for code in ("300750", "688981"):
+            up, down, pct = mkt.limit_prices(10.00, code, "某股票")
+            self.assertEqual(pct, 20.0, code)
+            self.assertAlmostEqual(up, 12.00)
+            self.assertAlmostEqual(down, 8.00)
+
+    def test_bj_30pct(self):
+        up, _, pct = mkt.limit_prices(10.00, "430047", "诺思兰德")
+        self.assertEqual(pct, 30.0)
+        self.assertAlmostEqual(up, 13.00)
+
+    def test_st_5pct(self):
+        for name in ("ST德豪", "*ST海航", "SST前锋", "S*ST天发"):
+            up, down, pct = mkt.limit_prices(10.00, "600000", name)
+            self.assertEqual(pct, 5.0, name)
+            self.assertAlmostEqual(up, 10.50)
+            self.assertAlmostEqual(down, 9.50)
+
+    def test_rounding_to_cent(self):
+        # 9.53 * 1.1 = 10.483 → 10.48；不能算成 10.49 或 10.483
+        up, down, _ = mkt.limit_prices(9.53, "600000", "浦发银行")
+        self.assertEqual(up, 10.48)
+        self.assertEqual(down, 8.58)      # 9.53*0.9 = 8.577 → 8.58
+
+    def test_no_prev_close(self):
+        up, down, pct = mkt.limit_prices(0, "600000", "浦发银行")
+        self.assertIsNone(up)
+        self.assertIsNone(down)
+        self.assertEqual(pct, 10.0)
+
+    def test_index_has_no_limit(self):
+        up, down, pct = mkt.limit_prices(3000, "000001", "上证指数", kind="index")
+        self.assertEqual(pct, 0.0)
+        self.assertIsNone(up)
+
+
+class TestFees(unittest.TestCase):
+    def test_min_commission_applied(self):
+        # 小额买入：佣金按最低 5 元
+        bd = mkt.calc_fee(1000.0, "buy")
+        self.assertAlmostEqual(bd.commission, 5.0)
+        self.assertAlmostEqual(bd.stamp_tax, 0.0)       # 买入无印花税
+
+    def test_rate_commission_applied(self):
+        bd = mkt.calc_fee(1_000_000.0, "buy")
+        self.assertAlmostEqual(bd.commission, 250.0)    # 万 2.5
+        self.assertAlmostEqual(bd.transfer_fee, 10.0)   # 0.001%
+
+    def test_sell_has_stamp_tax(self):
+        bd = mkt.calc_fee(100_000.0, "sell")
+        self.assertAlmostEqual(bd.stamp_tax, 50.0)      # 0.05%
+        self.assertAlmostEqual(bd.commission, 25.0)
+
+    def test_etf_no_stamp_no_transfer(self):
+        bd = mkt.calc_fee(100_000.0, "sell", board=mkt.BOARD_ETF)
+        self.assertAlmostEqual(bd.stamp_tax, 0.0)
+        self.assertAlmostEqual(bd.transfer_fee, 0.0)
+        self.assertAlmostEqual(bd.commission, 25.0)
+
+    def test_total_is_sum(self):
+        bd = mkt.calc_fee(100_000.0, "sell")
+        self.assertAlmostEqual(bd.total, bd.commission + bd.stamp_tax +
+                               bd.transfer_fee + bd.other, places=6)
+
+
+class TestLotSize(unittest.TestCase):
+    def test_star_200_min(self):
+        self.assertEqual(mkt.lot_size("688981"), 200)
+        self.assertEqual(mkt.round_lot(350, "688981"), 200)
+        self.assertEqual(mkt.round_lot(199, "688981"), 0)
+
+    def test_main_100(self):
+        self.assertEqual(mkt.round_lot(199, "600000"), 100)
+        self.assertEqual(mkt.round_lot(99, "600000"), 0)
+
+    def test_buy_must_be_lot(self):
+        self.assertIsNotNone(mkt.check_order_size(150, "600000", "buy"))
+        self.assertIsNone(mkt.check_order_size(200, "600000", "buy"))
+
+    def test_sell_odd_lot_only_when_clearing(self):
+        # 持仓 150 股，卖 150 合法（一次性清掉零股）
+        self.assertIsNone(mkt.check_order_size(150, "600000", "sell", holding=150))
+        # 持仓 250 股，卖 150 不合法（会留下 100 股但本次是零股申报）
+        self.assertIsNotNone(mkt.check_order_size(150, "600000", "sell", holding=250))
+
+    def test_sell_more_than_holding_rejected(self):
+        self.assertIsNotNone(mkt.check_order_size(500, "600000", "sell", holding=100))
+
+
+class TestTradingStatus(unittest.TestCase):
+    def test_morning_session(self):
+        import datetime as dt
+        now = dt.datetime(2026, 10, 23, 10, 0)      # 周五 10:00
+        st = mkt.trading_status(now)
+        self.assertTrue(st["open"])
+        self.assertIn("上午", st["phase"])
+
+    def test_lunch_break(self):
+        import datetime as dt
+        st = mkt.trading_status(dt.datetime(2026, 10, 23, 12, 0))
+        self.assertFalse(st["open"])
+        self.assertEqual(st["phase"], "午间休市")
+
+    def test_weekend(self):
+        import datetime as dt
+        st = mkt.trading_status(dt.datetime(2026, 10, 24, 10, 0))   # 周六
+        self.assertFalse(st["open"])
+        self.assertIn("非交易日", st["phase"])
+
+    def test_after_close(self):
+        import datetime as dt
+        st = mkt.trading_status(dt.datetime(2026, 10, 23, 15, 30))
+        self.assertFalse(st["open"])
+        self.assertEqual(st["phase"], "已收盘")
+
+
+# ---------------------------------------------------------------- 台账
+
+
+class LedgerTestBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="astock-test-")
+        self.path = os.path.join(self.tmp, "ledger.sqlite")
+        self.ledger = ledger_mod(self.path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def pos(self, code):
+        for p in self.ledger.list_positions():
+            if p["code"] == code:
+                return p
+        return None
+
+
+class TestLedgerPosition(LedgerTestBase):
+    def test_buy_creates_position_with_fee_in_cost(self):
+        r = self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date="2026-10-20")
+        p = self.pos("600000")
+        self.assertIsNotNone(p)
+        self.assertEqual(p["shares"], 1000)
+        # 成本含买入费用：金额 10000 + 费用（5 元佣金 + 0.1 元过户费）
+        expected = (10000 + r["fee"]) / 1000
+        self.assertAlmostEqual(p["cost_price"], expected, places=4)
+        self.assertGreater(p["cost_price"], 10.0)      # 费用让成本高于成交价
+
+    def test_weighted_average_cost(self):
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date="2026-10-20")
+        self.ledger.record_trade("600000", "buy", 12.0, 1000, trade_date="2026-10-20")
+        p = self.pos("600000")
+        self.assertEqual(p["shares"], 2000)
+        # 均价必须在 10 与 12 之间且贴近 11（含费用略高）
+        self.assertTrue(10.9 < p["cost_price"] < 11.1, p["cost_price"])
+
+    def test_sell_keeps_cost_price(self):
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date="2026-10-20")
+        cost_before = self.pos("600000")["cost_price"]
+        r = self.ledger.record_trade("600000", "sell", 12.0, 500, trade_date="2026-10-22")
+        p = self.pos("600000")
+        self.assertEqual(p["shares"], 500)
+        self.assertAlmostEqual(p["cost_price"], cost_before, places=4)
+        # 已实现盈亏 = (12 - 成本) * 500 - 费用
+        expect = (12.0 - cost_before) * 500 - r["fee"]
+        self.assertAlmostEqual(r["realized_pnl"], expect, places=2)
+        self.assertGreater(r["realized_pnl"], 0)
+
+    def test_full_sell_removes_position(self):
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date="2026-10-20")
+        self.ledger.record_trade("600000", "sell", 11.0, 1000, trade_date="2026-10-22")
+        self.assertIsNone(self.pos("600000"))
+        rp = self.ledger.realized_pnl()
+        self.assertGreater(rp["realized_pnl"], 0)
+        self.assertEqual(rp["sell_count"], 1)
+
+    def test_sell_without_position_rejected(self):
+        with self.assertRaises(ledger_mod.__init__.__globals__["LedgerError"]):
+            self.ledger.record_trade("600000", "sell", 10.0, 100)
+
+
+class TestLedgerT1(LedgerTestBase):
+    def test_today_buy_not_sellable(self):
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date=today)
+        p = self.pos("600000")
+        self.assertEqual(p["available_today"], 0)      # T+1 锁定
+        with self.assertRaises(Exception) as ctx:
+            self.ledger.record_trade("600000", "sell", 10.5, 500, trade_date=today)
+        self.assertIn("T+1", str(ctx.exception))
+
+    def test_yesterday_buy_is_sellable(self):
+        import datetime as dt
+        yday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date=yday)
+        p = self.pos("600000")
+        self.assertEqual(p["available_today"], 1000)
+        r = self.ledger.record_trade("600000", "sell", 10.5, 500, trade_date=today)
+        self.assertEqual(r["shares_after"], 500)
+
+    def test_mixed_buy_availability(self):
+        import datetime as dt
+        yday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date=yday)
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date=today)
+        p = self.pos("600000")
+        self.assertEqual(p["shares"], 2000)
+        self.assertEqual(p["available_today"], 1000)   # 只有昨日那笔可卖
+
+
+class TestLedgerValidation(LedgerTestBase):
+    def test_future_date_rejected(self):
+        import datetime as dt
+        future = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+        with self.assertRaises(Exception) as ctx:
+            self.ledger.record_trade("600000", "buy", 10.0, 100, trade_date=future)
+        self.assertIn("未来", str(ctx.exception))
+
+    def test_bad_date_format_rejected(self):
+        with self.assertRaises(Exception) as ctx:
+            self.ledger.record_trade("600000", "buy", 10.0, 100, trade_date="2026/10/20")
+        self.assertIn("YYYY-MM-DD", str(ctx.exception))
+
+    def test_buy_not_lot_rejected(self):
+        with self.assertRaises(Exception):
+            self.ledger.record_trade("600000", "buy", 10.0, 150)
+
+    def test_negative_price_rejected(self):
+        with self.assertRaises(Exception):
+            self.ledger.record_trade("600000", "buy", -1, 100)
+
+    def test_bad_side_rejected(self):
+        with self.assertRaises(Exception):
+            self.ledger.record_trade("600000", "short", 10.0, 100)
+
+
+class TestLedgerRepair(LedgerTestBase):
+    def test_delete_trade_rebuilds_position(self):
+        r1 = self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date="2026-10-20")
+        self.ledger.record_trade("600000", "buy", 12.0, 1000, trade_date="2026-10-21")
+        rows = self.ledger.trades("600000")
+        first_id = min(r["id"] for r in rows)
+        self.ledger.delete_trade(first_id)
+        p = self.pos("600000")
+        self.assertEqual(p["shares"], 1000)
+        # 剩下的是 12 元那笔，成本应接近 12（含费用）
+        self.assertTrue(11.99 < p["cost_price"] < 12.05, p["cost_price"])
+
+    def test_rebuild_matches_sequential(self):
+        self.ledger.record_trade("600000", "buy", 10.0, 1000, trade_date="2026-10-20")
+        self.ledger.record_trade("600000", "buy", 11.0, 500, trade_date="2026-10-21")
+        before = self.pos("600000")
+        self.ledger.rebuild_position("600000")
+        after = self.pos("600000")
+        self.assertEqual(before["shares"], after["shares"])
+        self.assertAlmostEqual(before["cost_price"], after["cost_price"], places=4)
+
+
+class TestLedgerCashAndWatch(LedgerTestBase):
+    def test_cash_set_and_add(self):
+        self.assertEqual(self.ledger.get_cash()["balance"], 0.0)
+        self.ledger.set_cash(50000)
+        self.assertEqual(self.ledger.get_cash()["balance"], 50000.0)
+        self.ledger.add_cash(-2000)
+        self.assertEqual(self.ledger.get_cash()["balance"], 48000.0)
+        with self.assertRaises(Exception):
+            self.ledger.set_cash(-1)
+
+    def test_watch_add_remove(self):
+        self.ledger.add_watch("600000", "浦发银行", "观察")
+        self.assertEqual(len(self.ledger.list_watch()), 1)
+        self.assertTrue(self.ledger.remove_watch("600000"))
+        self.assertEqual(self.ledger.list_watch(), [])
+        self.assertFalse(self.ledger.remove_watch("600000"))
+
+    def test_nothing_recorded_stays_empty(self):
+        self.assertEqual(self.ledger.list_positions(), [])
+        self.assertEqual(self.ledger.trades(), [])
+        self.assertEqual(self.ledger.realized_pnl()["realized_pnl"], 0.0)
+
+
+# ---------------------------------------------------------------- 提示引擎
+
+
+def _quote(price, prev_close, name="测试股", limit_up=None, limit_down=None,
+           chg=None, vr=None):
+    from astock_data import Quote
+    q = Quote(code="600000", venue="sh", name=name, price=price,
+              prev_close=prev_close, limit_up=limit_up, limit_down=limit_down,
+              change_pct=chg if chg is not None else
+              (round((price - prev_close) / prev_close * 100, 2) if prev_close else None),
+              volume_ratio=vr)
+    return q.as_dict()
+
+
+class TestHints(unittest.TestCase):
+    def setUp(self):
+        self.cfg = hints.HintsConfig()
+
+    def test_stop_loss_triggered(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(9.0, 9.2), self.cfg)
+        kinds = [h.kind for h in hs]
+        self.assertIn("stop_loss", kinds)
+        sl = next(h for h in hs if h.kind == "stop_loss")
+        self.assertEqual(sl.shares, 1000)        # 止损建议清仓
+        self.assertIn("%", sl.basis)              # 依据可核对（不是空话）
+
+    def test_no_hint_when_within_range(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(10.2, 10.1), self.cfg)
+        self.assertEqual([h.kind for h in hs], [])
+
+    def test_take_profit_suggests_half(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(12.0, 11.9), self.cfg)
+        tp = next(h for h in hs if h.kind == "take_profit")
+        self.assertEqual(tp.shares, 500)         # 减半
+
+    def test_take_profit_odd_shares_rounded_to_lot(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 150, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(12.0, 11.9), self.cfg)
+        tp = next(h for h in hs if h.kind == "take_profit")
+        # 150 股减半会拆出非法零股（5 股/50 股）——必须给合规数量
+        self.assertIn(tp.shares, (100, 150))
+
+    def test_take_profit_odd_shares_suggests_lot(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 300, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(12.0, 11.9), self.cfg)
+        tp = next(h for h in hs if h.kind == "take_profit")
+        self.assertEqual(tp.shares, 100)      # 300/2=150 → 向下取整到 100
+
+    def test_limit_up_short_circuits(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(
+            pos, _quote(11.0, 10.0, limit_up=11.0, limit_down=9.0, chg=10.0), self.cfg)
+        self.assertEqual(len(hs), 1)
+        self.assertEqual(hs[0].kind, "limit_up")
+
+    def test_limit_down_short_circuits(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(
+            pos, _quote(9.0, 10.0, limit_up=11.0, limit_down=9.0, chg=-10.0), self.cfg)
+        self.assertEqual(hs[0].kind, "limit_down")
+        self.assertEqual(hs[0].severity, "urgent")
+
+    def test_trailing_drawdown(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(10.6, 10.7), self.cfg,
+                                        highest_price=12.0)
+        self.assertIn("trailing", [h.kind for h in hs])
+
+    def test_position_cap(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 5000, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(10.1, 10.0), self.cfg,
+                                        total_market_value=100000)
+        cap = [h for h in hs if h.kind == "position_cap"]
+        self.assertTrue(cap)
+        # 5 万元 / 10 万元 = 50% > 25% 上限
+        self.assertGreater(cap[0].meta["weight_pct"], 25)
+
+    def test_add_disabled_by_default(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(9.6, 9.7), self.cfg)
+        self.assertNotIn("add_position", [h.kind for h in hs])
+        cfg2 = hints.HintsConfig(enable_add=True)
+        # 成本 10、现价 9.4 → 浮亏 6%，落在第一档（每跌 5% 一档）
+        hs2 = hints.build_position_hints(pos, _quote(9.4, 9.5), cfg2)
+        self.assertIn("add_position", [h.kind for h in hs2])
+
+    def test_t1_hint(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000}
+        h = hints.build_t1_hint(pos, available=0)
+        self.assertIsNotNone(h)
+        self.assertIn("T+1", h.title + h.detail)
+        self.assertIsNone(hints.build_t1_hint(pos, available=1000))
+
+
+class TestSuggest(unittest.TestCase):
+    def test_buy_respects_cash(self):
+        est = hints.suggest_buy("600000", "测试股", 10.0, cash=10000,
+                                cfg=hints.HintsConfig())
+        self.assertLessEqual(est["suggest_amount"], 10000)
+        self.assertEqual(est["suggest_shares"] % 100, 0)
+        self.assertGreater(est["suggest_shares"], 0)
+
+    def test_buy_respects_position_cap(self):
+        est = hints.suggest_buy("600000", "测试股", 10.0, cash=1_000_000,
+                                cfg=hints.HintsConfig(position_cap_pct=25.0),
+                                total_market_value=300000)
+        # 组合 130 万 × 25% = 32.5 万上限，远小于 100 万现金
+        self.assertLessEqual(est["suggest_amount"], 325000)
+        self.assertIn("单票占比", est["reason"])
+
+    def test_buy_star_lot_200(self):
+        est = hints.suggest_buy("688981", "科创板股", 50.0, cash=100000,
+                                cfg=hints.HintsConfig())
+        self.assertEqual(est["suggest_shares"] % 200, 0)
+
+    def test_sell_all_and_half(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        all_in = hints.suggest_sell(pos, 12.0, available=1000, ratio=1.0)
+        self.assertEqual(all_in["suggest_shares"], 1000)
+        half = hints.suggest_sell(pos, 12.0, available=1000, ratio=0.5)
+        self.assertEqual(half["suggest_shares"], 500)
+        self.assertGreater(half["est_realized_pnl"], 0)
+
+    def test_sell_limited_by_available(self):
+        pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
+        est = hints.suggest_sell(pos, 12.0, available=0, ratio=1.0)
+        self.assertEqual(est["sellable"], 0)
+        self.assertNotIn("suggest_shares", est)
+
+    def test_sell_no_position(self):
+        with self.assertRaises(ValueError):
+            hints.suggest_sell({"code": "600000", "shares": 0}, 10.0, available=0)
+
+
+# ---------------------------------------------------------------- 插件工具面
+
+
+class TestPluginSurface(unittest.TestCase):
+    def setUp(self):
+        self.plugin = astock.AstockPlugin()
+
+    def test_tool_names_match_manifest(self):
+        names = {t.name for t in self.plugin.get_tools()}
+        self.assertEqual(names, {
+            "astock_quote", "astock_kline", "astock_search", "astock_screen",
+            "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
+            "astock_sentiment", "astock_watch",
+        })
+
+    def test_all_tools_have_schema(self):
+        for t in self.plugin.get_tools():
+            self.assertEqual(t.parameters.get("type"), "object", t.name)
+            self.assertIn("properties", t.parameters, t.name)
+            self.assertTrue(t.description, t.name)
+
+    def test_unknown_tool_reports_error(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            out = loop.run_until_complete(self.plugin.execute("astock_nope", {}))
+        finally:
+            loop.close()
+        self.assertIn("未知工具", out)
+
+    def test_no_order_capability(self):
+        """红线回归：工具面不得出现下单/委托类能力（用户自己在券商下单）。"""
+        names = [t.name for t in self.plugin.get_tools()]
+        for bad in ("order", "trade_submit", "buy", "sell", "cancel"):
+            for n in names:
+                self.assertNotIn(bad, n.replace("astock_", "").split("_")[0],
+                                 f"{n} 疑似含下单能力")
+
+    def test_watch_source_metadata(self):
+        w = astock.AStockWatch()
+        self.assertEqual(w.source_kind, "astock")
+        self.assertTrue(w.display_name)
+        self.assertTrue(w.config_schema.get("codes"))
+        self.assertIn("stop_loss", w.DEFAULT_KINDS)
+        # 旧宿主降级时 describe() 由真实 WatchSource 基类提供，这里只校验自身字段
+        if hasattr(w, "describe"):
+            self.assertEqual(w.describe()["name"], "astock-watch")
+
+
+class TestPanelRender(unittest.TestCase):
+    """右栏面板：两种形态都要能渲染，且失败时降级而不是崩。"""
+
+    def setUp(self):
+        import tempfile
+        import datetime as dt
+        self.tmp = tempfile.mkdtemp(prefix="astock-panel-")
+        self.path = os.path.join(self.tmp, "ledger.sqlite")
+        lg = ledger_mod(self.path)
+        yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        lg.record_trade("600000", "buy", 10.0, 1000, trade_date=yday, name="浦发银行")
+        lg.set_cash(30000)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _plugin(self, style="markdown"):
+        pl = astock.AstockPlugin()
+        pl._app = types.SimpleNamespace(
+            workspace=self.tmp,
+            config={"astock-plugin": {"panel_style": style}})
+        return pl
+
+    def _snapshot_stub(self, pl):
+        """替换 _snapshot，避免联网（面板逻辑才是测试目标）。"""
+        quote = {"price": 9.53, "prev_close": 9.62, "change_pct": -0.94,
+                 "limit_up": 10.58, "limit_down": 8.66}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.005, "available_today": 1000, "board": "main",
+                "cost_amount": 10005.0, "opened_at": "2026-10-20",
+                "updated_at": "2026-10-20", "note": ""}]
+        pl._snapshot = lambda: {"data": {
+            "positions": pos, "quotes": {"600000": quote},
+            "total_market_value": 9530.0, "equity": 39530.0, "cash": 30000.0,
+            "float_pnl": -475.1, "today_pnl": -90.0, "realized_pnl": 0.0}}
+        return pl
+
+    def test_unknown_panel_returns_empty(self):
+        self.assertEqual(self._plugin().panel_content("nope", {}), "")
+
+    def test_markdown_has_table_and_no_json(self):
+        pl = self._snapshot_stub(self._plugin("markdown"))
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("| 名称 |", out)
+        self.assertIn("浦发银行", out)
+        self.assertNotIn("lite-tree", out)
+
+    def test_tree_is_valid_litetree_json(self):
+        import json
+        pl = self._snapshot_stub(self._plugin("tree"))
+        out = pl.panel_content("portfolio", {})
+        data = json.loads(out)               # 必须是合法 JSON，否则前端降级成代码块
+        self.assertEqual(data["type"], "lite-tree")
+        self.assertEqual(data["total"], 1)
+        card = data["trees"][0]
+        self.assertIn("浦发银行", card["title"])
+        # 卡片必须带"当前建议动作"，且不伪造概率（单选项恒 1.0）
+        self.assertEqual(len(card["options"]), 1)
+        self.assertEqual(card["options"][0]["prob"], 1.0)
+        self.assertTrue(card["options"][0]["chosen"])
+
+    def test_tree_card_shows_triggered_rule(self):
+        import json
+        pl = self._plugin("tree")
+        quote = {"price": 8.0, "prev_close": 9.5, "change_pct": -15.8,
+                 "limit_up": 10.45, "limit_down": 8.55}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda: {"data": {
+            "positions": pos, "quotes": {"600000": quote},
+            "total_market_value": 8000.0, "equity": 38000.0, "cash": 30000.0,
+            "float_pnl": -2000.0, "today_pnl": -1500.0, "realized_pnl": 0.0}}
+        data = json.loads(pl.panel_content("portfolio", {}))
+        card = data["trees"][0]
+        # 浮亏 20% 触发止损 → 卡片应是 danger 且写明止损
+        self.assertEqual(card["options"][0]["tone"], "danger")
+        self.assertIn("止损", card["question"])
+
+    def test_empty_portfolio_message(self):
+        pl = self._plugin("tree")
+        pl._snapshot = lambda: {"data": {
+            "positions": [], "quotes": {}, "total_market_value": 0.0,
+            "equity": 0.0, "cash": 0.0, "float_pnl": 0.0,
+            "today_pnl": 0.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("空仓", out)
+
+    def test_broken_ledger_degrades_gracefully(self):
+        pl = self._plugin()
+        pl._snapshot = lambda: (_ for _ in ()).throw(RuntimeError("台账炸了"))
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("台账读取失败", out)     # 不能把面板打空白或抛异常
+        self.assertIn("台账炸了", out)
+
+    def test_sentiment_failure_does_not_blank_panel(self):
+        """舆情接口挂了，面板仍要显示持仓（舆情只是附加信息）。"""
+        from unittest.mock import patch
+        import astock_sentiment_data as sd
+        pl = self._snapshot_stub(self._plugin("markdown"))
+        with patch.object(sd, "collect", side_effect=RuntimeError("舆情挂了")):
+            out = pl.panel_content("portfolio", {})
+        self.assertIn("浦发银行", out)
+        self.assertNotIn("舆情挂了", out)
+
+
+class TestWatchProbe(unittest.TestCase):
+    """盯梢源 probe()：此前从未验证过（漏测风险最高的一处）。
+
+    全程离线：行情用内存替身替换 `astock_data.fetch_quotes`，台账写临时目录。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="astock-watch-")
+        self.ledger_path = os.path.join(self.tmp, "ledger.sqlite")
+        # 建一只持仓（昨日买入 → 可卖）
+        lg = ledger_mod(self.ledger_path)
+        import datetime as dt
+        yday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        lg.record_trade("600000", "buy", 10.0, 1000, trade_date=yday, name="浦发银行")
+        lg.add_watch("688256", "寒武纪")
+        self.watch = astock.AStockWatch()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ctx(self, config=None):
+        return types.SimpleNamespace(
+            config=config or {"astock-plugin": {"ledger_path": self.ledger_path}},
+            workspace=self.tmp)
+
+    def _run(self, quotes, cfg=None, config=None):
+        import asyncio
+        from unittest.mock import patch
+        import astock_data as d
+
+        def fake_fetch(items, use_cache=True):
+            return [q for q in quotes
+                    if any(q.code == c for c, _v, _k in items)]
+        with patch.object(d, "fetch_quotes", fake_fetch):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    self.watch.probe(cfg or {}, self._ctx(config)))
+            finally:
+                loop.close()
+
+    def _quote(self, code, price, prev, limit_up=None, limit_down=None,
+               chg=None):
+        from astock_data import Quote
+        return Quote(code=code, venue="sh", name="测试", price=price,
+                     prev_close=prev, limit_up=limit_up, limit_down=limit_down,
+                     change_pct=chg if chg is not None else
+                     round((price - prev) / prev * 100, 2))
+
+    def test_no_positions_reports_error(self):
+        """空台账要明确报"先录入"，而不是静默 ok。"""
+        import tempfile
+        empty = os.path.join(tempfile.mkdtemp(), "e.sqlite")
+        ledger_mod(empty)  # 建空库
+        res = self._run([], config={"astock-plugin": {"ledger_path": empty}})
+        self.assertFalse(res.ok)
+        self.assertIn("没有持仓或自选股", res.error)
+
+    def test_no_change_gives_empty_snapshot(self):
+        """无异动时 snapshot 必须为空——否则每次探测都被判为"有变化"。"""
+        res = self._run([self._quote("600000", 10.1, 10.0),
+                         self._quote("688256", 100.0, 100.0)])
+        self.assertTrue(res.ok)
+        self.assertEqual(res.snapshot, "")
+        self.assertIn("无异动", res.summary)
+
+    def test_stop_loss_signal_detected(self):
+        # 成本 10，现价 8.8 → 浮亏 12% 触发止损
+        res = self._run([self._quote("600000", 8.8, 9.0)])
+        self.assertTrue(res.ok)
+        self.assertIn("600000:stop_loss", res.snapshot)
+        self.assertIn("止损", res.changed_hint)
+
+    def test_price_change_alone_is_not_a_signal(self):
+        """关键回归：只有价格变、没触发规则 → 不得产生变化（否则高频误唤醒）。"""
+        a = self._run([self._quote("600000", 10.05, 10.0)])
+        b = self._run([self._quote("600000", 10.08, 10.0)])
+        self.assertEqual(a.snapshot, b.snapshot)
+        self.assertEqual(a.snapshot, "")
+
+    def test_watchlist_limit_up_flagged(self):
+        """自选股（无持仓）也要能报涨跌停。"""
+        res = self._run([self._quote("688256", 11.0, 10.0, limit_up=11.0,
+                                     limit_down=9.0, chg=10.0)])
+        self.assertTrue(res.ok)
+        self.assertIn("688256:limit_up", res.snapshot)
+
+    def test_kinds_filter(self):
+        res = self._run([self._quote("600000", 8.8, 9.0)],
+                        cfg={"kinds": "limit_up"})
+        self.assertEqual(res.snapshot, "")     # 只要涨停，止损被过滤
+
+    def test_extra_codes_from_config(self):
+        res = self._run([self._quote("000001", 12.0, 11.0, limit_up=12.1,
+                                     limit_down=9.9, chg=9.09)],
+                        cfg={"codes": "000001"})
+        self.assertIn("000001", res.snapshot + res.summary)
+
+    def test_quote_failure_returns_error_not_change(self):
+        import asyncio
+        from unittest.mock import patch
+        import astock_data as d
+        with patch.object(d, "fetch_quotes",
+                          side_effect=d.DataError("模拟网络故障")):
+            loop = asyncio.new_event_loop()
+            try:
+                res = loop.run_until_complete(self.watch.probe({}, self._ctx()))
+            finally:
+                loop.close()
+        self.assertFalse(res.ok)
+        self.assertEqual(res.snapshot, "")
+        self.assertIn("行情获取失败", res.error)
+
+    def test_snapshot_is_stable_for_same_signals(self):
+        """同一组信号多次探测 → 指纹必须一致（否则盯梢永远在触发）。"""
+        q = [self._quote("600000", 8.8, 9.0)]
+        a = self._run(q)
+        b = self._run(q)
+        self.assertEqual(a.fingerprint(), b.fingerprint())
+
+    def test_string_false_is_not_true(self):
+        """config 里写字符串 "false" 不能被当成 True（bool() 陷阱）。"""
+        self.assertFalse(astock._as_bool("false"))
+        self.assertFalse(astock._as_bool("0"))
+        self.assertFalse(astock._as_bool(""))
+        self.assertFalse(astock._as_bool(None))
+        self.assertTrue(astock._as_bool("true"))
+        self.assertTrue(astock._as_bool(True))
+        self.assertTrue(astock._as_bool(1))
+
+
+class TestWatchOnlyHints(unittest.TestCase):
+    """自选股（无持仓）的提示：只出与仓位无关的信号。"""
+
+    def setUp(self):
+        self.cfg = hints.HintsConfig()
+
+    def test_limit_up_without_position(self):
+        hs = hints.build_position_hints(
+            {}, {"code": "600000", "name": "测试", "price": 11.0,
+                 "prev_close": 10.0, "change_pct": 10.0,
+                 "limit_up": 11.0, "limit_down": 9.0}, self.cfg)
+        self.assertEqual([h.kind for h in hs], ["limit_up"])
+
+    def test_no_pnl_hints_without_position(self):
+        """无持仓不该出现止损/止盈/加仓/仓位占比（那些要有成本才有意义）。"""
+        hs = hints.build_position_hints(
+            {}, {"code": "600000", "name": "测试", "price": 11.0,
+                 "prev_close": 10.0, "change_pct": 10.0,
+                 "limit_up": 12.0, "limit_down": 9.0}, self.cfg)
+        kinds = [h.kind for h in hs]
+        for bad in ("stop_loss", "take_profit", "add_position", "reduce",
+                    "position_cap", "trailing"):
+            self.assertNotIn(bad, kinds)
+
+    def test_drop_event_without_position(self):
+        hs = hints.build_position_hints(
+            {}, {"code": "600000", "name": "测试", "price": 9.0,
+                 "prev_close": 10.0, "change_pct": -10.0,
+                 "limit_up": 11.0, "limit_down": 9.0}, self.cfg)
+        self.assertIn("event", [h.kind for h in hs])
+
+    def test_holding_still_gets_all_hints(self):
+        pos = {"code": "600000", "name": "测试", "shares": 1000, "cost_price": 10.0}
+        hs = hints.build_position_hints(
+            pos, {"code": "600000", "name": "测试", "price": 8.8,
+                  "prev_close": 9.0, "change_pct": -2.2,
+                  "limit_up": 9.9, "limit_down": 8.1}, self.cfg)
+        self.assertIn("stop_loss", [h.kind for h in hs])
+
+
+class TestSentiment(unittest.TestCase):
+
+    @staticmethod
+    def _ev(cat, title, direction="unknown", as_of="2026-10-20",
+            reliability="hard_fact", meta=None):
+        from astock_sentiment_data import Evidence
+        return Evidence(category=cat, title=title, reliability=reliability,
+                        direction=direction, as_of=as_of, source="test",
+                        meta=meta or {})
+
+    def test_direction_keywords(self):
+        from astock_sentiment_data import judge_direction
+        self.assertEqual(judge_direction("公司公告：拟增持股份"), "positive")
+        self.assertEqual(judge_direction("收到证监会立案告知书"), "negative")
+        self.assertEqual(judge_direction("关于召开股东大会的通知"), "unknown")
+        # 正负同现 → neutral（保守，不硬判）
+        self.assertEqual(judge_direction("拟增持但存在诉讼风险"), "neutral")
+
+    def test_news_relevance(self):
+        """标题为准：只在正文提到的公司名不算直接相关（踩过的坑）。"""
+        from astock_sentiment_data import _news_relevance
+        self.assertEqual(
+            _news_relevance("浦发银行菏泽分行被罚30万", "", "浦发银行"), "direct")
+        self.assertEqual(
+            _news_relevance("银行行业资金流出榜：招商银行等8股", "浦发银行也在列",
+                            "浦发银行"), "industry")
+        self.assertEqual(
+            _news_relevance("各大银行围猎iPhone", "提及浦发银行", "浦发银行"), "industry")
+        self.assertEqual(
+            _news_relevance("营收翻倍！688256遭减持", "", "寒武纪", "688256"), "direct")
+        self.assertEqual(_news_relevance("无关的新闻", "", "浦发银行"), "weak")
+
+    def test_unknown_dominates_category(self):
+        """10 条公告里 1 条含负面词，不能总结成"公告整体偏负面"。"""
+        from astock_sentiment import summarize
+        items = [self._ev("announce", f"常规公告 {i}") for i in range(9)]
+        items.append(self._ev("announce", "关于终止某合同的公告", "negative"))
+        rep = summarize(items, "600000", "测试")
+        ann = next(c for c in rep.categories if c.category == "announce")
+        self.assertEqual(ann.direction, "unknown")
+        self.assertEqual(ann.negative, 1)
+
+    def test_expired_event_not_counted(self):
+        """过期的事件型证据不进方向判断，但要留在 stale_items 里。"""
+        from astock_sentiment import summarize
+        items = [
+            self._ev("lhb", "2026-04-30 上榜", "positive", as_of="2026-04-30"),
+            self._ev("margin", "融资余额下降", "negative", as_of="2026-10-23"),
+        ]
+        rep = summarize(items, "600000", "测试")
+        cats = {c.category for c in rep.categories}
+        self.assertIn("margin", cats)
+        self.assertNotIn("lhb", cats)      # 过期 → 不计入归集
+        self.assertTrue(rep.stale_items)   # 但要说出来
+
+    def test_conflict_report_vs_margin(self):
+        from astock_sentiment import summarize
+        items = [
+            self._ev("report", "买入评级：业绩高增", "positive",
+                     reliability="official_view"),
+            self._ev("margin", "融资余额下降 5%", "negative",
+                     meta={"trend": {"delta_pct": -5.0, "window": "a → b"}}),
+            self._ev("lhb", "净买入", "positive"),
+        ]
+        rep = summarize(items, "600000", "测试")
+        kinds = [c.kind for c in rep.conflicts]
+        self.assertIn("report_vs_margin", kinds)
+        high = [c for c in rep.conflicts if c.severity == "high"]
+        self.assertTrue(high)
+        self.assertEqual(rep.tone, "conflicted")
+        self.assertIn("客观数据", rep.tone_text)
+
+    def test_thin_evidence(self):
+        from astock_sentiment import summarize
+        rep = summarize([self._ev("news", "一条新闻", "positive",
+                                  reliability="media")], "600000", "测试")
+        self.assertEqual(rep.tone, "thin")
+        self.assertIn("不足以形成舆情判断", rep.tone_text)
+
+    def test_aligned_positive(self):
+        from astock_sentiment import summarize
+        items = [self._ev("report", f"买入评级 {i}", "positive",
+                          reliability="official_view") for i in range(2)]
+        items += [self._ev("news", f"业绩增长 {i}", "positive", reliability="media")
+                  for i in range(3)]
+        rep = summarize(items, "600000", "测试")
+        self.assertEqual(rep.tone, "aligned_positive")
+        self.assertGreater(rep.weight_score, 0)
+
+    def test_hot_vs_flow_conflict(self):
+        from astock_sentiment import summarize
+        items = [
+            self._ev("hot", "人气榜第 3 名", "positive",
+                     reliability="crowd", meta={"rank": 3, "heat": 100000}),
+            self._ev("margin", "融资余额下降", "negative",
+                     meta={"trend": {"delta_pct": -3.0, "window": "a → b"}}),
+        ]
+        rep = summarize(items, "600000", "测试")
+        self.assertIn("hot_vs_flow", [c.kind for c in rep.conflicts])
+
+    def test_render_has_disclaimer_and_facts_first(self):
+        from astock_sentiment import summarize
+        import astock_sentiment_tool as tool
+        items = [
+            self._ev("announce", "季度报告", as_of="2026-10-20"),
+            self._ev("report", "买入评级", "positive", reliability="official_view"),
+            self._ev("margin", "融资余额下降", "negative",
+                     meta={"trend": {"delta_pct": -5.0, "window": "a → b"}}),
+        ]
+        rep = summarize(items, "600000", "测试股", {"holder": "接口不可用"})
+        text = tool.render(rep, items, {})
+        self.assertIn("不构成投资建议", text)
+        self.assertIn("信号背离", text)
+        self.assertIn("数据质量", text)          # 缺数据必须显式列出
+        self.assertIn("接口不可用", text)
+        self.assertIn("【事实】", text)          # 每条证据带可靠度标签
+
+    def test_brief_render_is_short(self):
+        from astock_sentiment import summarize
+        import astock_sentiment_tool as tool
+        items = [self._ev("margin", "融资余额下降", "negative",
+                          meta={"trend": {"delta_pct": -5.0, "window": "a → b"}}),
+                 self._ev("report", "买入", "positive", reliability="official_view")]
+        rep = summarize(items, "600000", "测试股")
+        brief = tool.render_brief(rep)
+        self.assertIn("测试股", brief)
+        self.assertLess(len(brief), 200)
+
+    def test_collect_never_raises_on_failure(self):
+        """任一类接口失败都必须降级，而不是抛异常把工具打挂。"""
+        import astock_sentiment_data as sd
+        from unittest.mock import patch
+
+        def boom(*a, **k):
+            raise sd.DataError("模拟接口故障")
+        with patch.object(sd, "_http_get_json", boom), \
+             patch.object(sd, "_http_get", boom):
+            got = sd.collect("600000", "浦发银行")
+        self.assertIsInstance(got["items"], list)
+        self.assertTrue(got["errors"])       # 失败要如实记录
+
+
+class TestFormatting(unittest.TestCase):
+    def test_number_formatting_handles_none(self):
+        self.assertEqual(astock._f(None), "-")
+        self.assertEqual(astock._money(None), "-")
+        self.assertEqual(astock._money(2_500_000_000), "25.00亿")
+        self.assertEqual(astock._money(35_000), "3.50万")
+
+    def test_table_escapes_pipe(self):
+        out = astock._table(["A"], [["x|y"]])
+        self.assertIn("x\\|y", out)
+
+    def test_ratio_has_no_sign(self):
+        """换手率/占比不是涨跌幅——带 + 号会让人误读方向（踩过）。"""
+        self.assertEqual(astock._ratio(10.66), "10.66%")
+        self.assertEqual(astock._pct(10.66), "+10.66%")
+        self.assertEqual(astock._ratio(None), "-")
+
+
+class TestDataLayerOffline(unittest.TestCase):
+    """数据层纯逻辑（不联网）：限速器、缓存、解析函数、相关性判定。"""
+
+    def test_rate_limiter_bounds(self):
+        from astock_data import RateLimiter
+        rl = RateLimiter(rate_per_sec=1000, burst=2)
+        self.assertTrue(rl.acquire())
+        self.assertTrue(rl.acquire())
+
+    def test_ttl_cache_expiry(self):
+        from astock_data import TTLCache
+        import time as _t
+        c = TTLCache()
+        c.set("k", "v")
+        self.assertEqual(c.get("k", 10), "v")
+        self.assertIsNone(c.get("k", 0.0))     # TTL=0 → 立刻过期
+        c.set("k2", "v2")
+        _t.sleep(0.02)
+        self.assertIsNone(c.get("k2", 0.001))
+
+    def test_parse_tencent_line(self):
+        from astock_data import _parse_tencent_line
+        fields = ["1", "浦发银行", "600000", "9.53", "9.62", "9.69", "755926",
+                  "393482", "362445", "9.52"] + ["0"] * 20 + \
+                 ["20261023161458", "-0.09", "-0.94", "9.73", "9.52",
+                  "9.53/755926/726344396", "755926", "72634", "0.23", "6.20",
+                  "", "9.73", "9.52", "2.18", "3174.05", "3174.05", "0.42",
+                  "10.58", "8.66", "1.20"]
+        q = _parse_tencent_line('v_sh600000="' + "~".join(fields) + '";', "sh")
+        self.assertIsNotNone(q)
+        self.assertEqual(q.code, "600000")
+        self.assertEqual(q.name, "浦发银行")
+        self.assertAlmostEqual(q.price, 9.53)
+        self.assertAlmostEqual(q.change_pct, -0.94)
+        self.assertAlmostEqual(q.limit_up, 10.58)
+        self.assertAlmostEqual(q.limit_down, 8.66)
+        self.assertEqual(q.trade_time, "2026-10-23 16:14:58")
+
+    def test_parse_tencent_line_rejects_garbage(self):
+        from astock_data import _parse_tencent_line
+        self.assertIsNone(_parse_tencent_line("v_sh600000=\"\";", "sh"))
+        self.assertIsNone(_parse_tencent_line("garbage", "sh"))
+
+    def test_parse_sina_line(self):
+        from astock_data import _parse_sina_line
+        parts = ["浦发银行", "9.690", "9.620", "9.530", "9.730", "9.520"] + \
+                ["9.520", "9.530", "75592632", "726344396.000"] + ["0"] * 20 + \
+                ["2026-10-23", "15:00:00"]
+        q = _parse_sina_line('var hq_str_sh600000="' + ",".join(parts) + '";',
+                            "600000", "sh")
+        self.assertIsNotNone(q)
+        self.assertEqual(q.source, "sina")
+        self.assertAlmostEqual(q.price, 9.53)
+        self.assertAlmostEqual(q.change_pct, -0.94, places=2)
+
+    def test_sina_screen_normalizes_mcap_unit(self):
+        """新浪 mktcap 是万元，必须换算成元，否则市值过滤会差 1 万倍。"""
+        from astock_data import _screen_via_sina
+        import astock_data as d
+        from unittest.mock import patch
+        fake = ('[{"symbol":"sh600000","code":"600000","name":"浦发银行",'
+                '"trade":"9.53","pricechange":"-0.09","changepercent":"-0.94",'
+                '"open":"9.69","high":"9.73","low":"9.52","settlement":"9.62",'
+                '"volume":"75592632","amount":"726344396","turnoverratio":"0.23",'
+                '"per":"6.2","pb":"0.42","mktcap":"31740500","nmc":"30000000"}]')
+
+        def fake_get(url, headers=None, encoding="utf-8", retries=2, backoff=0.6):
+            return '"5576"' if "StockCount" in url else fake
+        with patch.object(d, "_http_get", fake_get):
+            rows, total = _screen_via_sina("all", "change_pct", False, 10,
+                                           None, None, None, None, None, None,
+                                           None, None, True)
+        self.assertEqual(total, 5576)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["total_mcap_yuan"], 31740500 * 1e4)
+        self.assertEqual(rows[0]["code"], "600000")
+
+    def test_sina_flow_leaves_unknown_fields_none(self):
+        """备源没有的字段必须是 None——不能塞 0（会让 Agent 讲成"零流入"）。"""
+        import astock_data as d
+        from unittest.mock import patch
+        fake = ('[{"opendate":"2026-10-23","netamount":"30867750.62",'
+                '"r0_net":"-39701734.84"}]')
+        with patch.object(d, "_http_get",
+                          lambda *a, **k: fake):
+            rows = d._flow_via_sina("sh600000", 5)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["main_net"])
+        self.assertIsNone(rows[0]["large_net"])
+        self.assertEqual(rows[0]["source"], "sina")
+
+    def test_to_float_handles_placeholders(self):
+        from astock_market import to_float
+        self.assertIsNone(to_float("", None))
+        self.assertIsNone(to_float("-", None))
+        self.assertIsNone(to_float(None, None))
+        self.assertEqual(to_float("1,234.5", None), 1234.5)
+        self.assertIsNone(astock.mkt.to_float("abc", None))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
