@@ -70,8 +70,8 @@
     },
     {
       "name": "pricing-plugin",
-      "version": "1.0.1",
-      "description": "官方定价数据源：DeepSeek 分时价（高峰/空闲半价），按模型指纹计费（自定义中转也能认出）。Kimi 已改用 models.dev 数据（上游 moonshotai 条目价格准确），不再单独维护官方源。支持出网代理（scope=meta）。价格表在 pricing.json，手动同步、不自动联网。",
+      "version": "1.0.2",
+      "description": "官方定价数据源：DeepSeek 分时价（高峰/空闲半价），按模型指纹计费（自定义中转也能认出）。Kimi 已改用 models.dev 数据（上游 moonshotai 条目价格准确），不再单独维护官方源，指纹也不得再引用它（残留会读到旧同步缓存并恒报「定价数据已过期」）。支持出网代理（scope=meta）。价格表在 pricing.json，手动同步、不自动联网。",
       "path": "plugins/pricing-plugin",
       "tools": [],
       "permissions": {}
@@ -282,6 +282,38 @@
         "email_reply",
         "email_forward"
       ]
+    },
+    {
+      "name": "astock-plugin",
+      "version": "1.0.0",
+      "description": "A 股助手：行情/K线/选股/资金流 + 手工交易台账（移动加权成本·T+1 可卖·已实现盈亏，SQLite 落盘）+ 下单提示（止损止盈/回撤/涨跌停/异动触发，按资金与单票上限估算买卖股数）。**你自己在券商下单，插件只记账与提示，不含任何委托/撤单/券商对接通道**。行情腾讯为主源、新浪与东财为备源（含限流重试与自动换源）；零第三方依赖（纯标准库 urllib/sqlite3）；含盯梢源（自选股异动才唤醒）与右栏持仓面板；数据落盘 <workspace>/.astock/ledger.sqlite，可改绝对路径",
+      "path": "plugins/astock-plugin",
+      "tools": [
+        "astock_quote",
+        "astock_kline",
+        "astock_search",
+        "astock_screen",
+        "astock_flow",
+        "astock_record",
+        "astock_portfolio",
+        "astock_hint",
+        "astock_watch"
+      ],
+      "permissions": {
+        "network": [
+          "qt.gtimg.cn",
+          "web.ifzq.gtimg.cn",
+          "ifzq.gtimg.cn",
+          "hq.sinajs.cn",
+          "vip.stock.finance.sina.com.cn",
+          "searchapi.eastmoney.com",
+          "push2.eastmoney.com",
+          "push2his.eastmoney.com"
+        ],
+        "fs_write": [
+          "**/.astock/**"
+        ]
+      }
     }
   ],
   "skills": [
