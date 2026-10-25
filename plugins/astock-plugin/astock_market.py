@@ -249,8 +249,64 @@ def is_trading_day(day: Optional[_dt.date] = None) -> bool:
     return day.weekday() < 5
 
 
+def should_watch_now(now: Optional[_dt.datetime] = None,
+                     lead_minutes: int = 5,
+                     lag_minutes: int = 5) -> Tuple[bool, str]:
+    """盯盘时刻判断：现在该不该让盯梢源真的去查行情。
+
+    **这个函数是"何时开始盯"的答案**，也是省 token 的关键：非交易时段直接
+    返回 False，盯梢源立刻返回"无变化"，不会唤醒 LLM。
+
+    返回 (是否盯, 原因说明)。
+
+    口径：
+    - 只在**交易日**盯（周末不算；法定节假日靠行情返回的 trade_time 兜底，
+      这里宁可多跑一次也不擅自 skip——漏报比多一次请求更糟）；
+    - 时段覆盖 09:15–15:00 并各留 `lead/lag` 分钟缓冲：集合竞价（9:15）与
+      尾盘（14:57–15:00）正是条件单容易触发的时刻，掐掉会漏报；
+    - 午休 11:30–13:00 不盯（价格不动，盯了纯浪费）。
+    """
+    now = now or _now_cn()
+    day = now.date()
+    if day.weekday() >= 5:
+        return False, "周末休市，无需盯盘"
+    hhmm = now.strftime("%H:%M")
+    # 边界：集合竞价 09:15 开始（提前量只在"刚好卡点"时生效，不能把 9:10
+    # 也算成盘中——那是错误信号，会让用户在开盘前收到"盘中异动"）；
+    # 收盘 15:00 之后一律不盯（尾盘集合竞价到 15:00 结束，15:00 后价格冻结）。
+    start = f"{9:02d}:{max(0, 15 - max(0, lead_minutes)):02d}"
+    if hhmm < start:
+        return False, f"开盘前（早于 {start}）"
+    if hhmm >= "15:00":
+        return False, "已收盘（15:00 后价格不再变动）"
+    if "11:30" <= hhmm < "13:00":
+        return False, "午间休市"
+    st = trading_status(now)
+    return True, f"{st['phase']}"
+
+
+def next_watch_window(now: Optional[_dt.datetime] = None) -> str:
+    """下一次该盯盘的时间（给人看的说明，用于面板/状态展示）。"""
+    now = now or _now_cn()
+    today = now.date()
+    hhmm = now.strftime("%H:%M")
+    if is_trading_day(today):
+        if hhmm < "09:15":
+            return f"今天 09:15"
+        if "11:30" <= hhmm < "13:00":
+            return "今天 13:00"
+        if hhmm < "15:00":
+            return "现在（盘中）"
+    # 找下一个工作日
+    d = today + _dt.timedelta(days=1)
+    for _ in range(10):
+        if d.weekday() < 5:
+            return f"{d.isoformat()} 09:15"
+        d += _dt.timedelta(days=1)
+    return "下一个交易日 09:15"
+
+
 def trading_status(now: Optional[_dt.datetime] = None) -> Dict[str, object]:
-    """当前交易状态：{open, phase, now, next_open}（给 Agent 解释"为什么价格不动"）。"""
     now = now or _now_cn()
     hhmm = now.strftime("%H:%M")
     phase = "休市"

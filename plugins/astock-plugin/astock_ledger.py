@@ -75,6 +75,35 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
 );
+
+-- 建议计划：astock_hint 给出的"可在券商照抄的委托参数" + 条件单三件套。
+--
+-- 两个用途：
+--   ① 成交回单自动匹配到当初那条建议 → 校价（计划价 vs 实际成交价）；
+--   ② 存下**条件单参数**（止损/止盈/跟踪回撤），因为用户的真实约束是
+--      「没时间盯盘」：算出该挂的价位、晚上挂好，白天不用看盘。
+--      券商条件单在触发前不占资金、不需要盯，是这类需求的正解。
+--
+-- 本插件永不下单——这张表只存"建议"，实际委托由用户在券商 App 完成。
+CREATE TABLE IF NOT EXISTS plans (
+    plan_id     TEXT PRIMARY KEY,        -- 如 P20261025-1
+    created_at  TEXT NOT NULL,
+    code        TEXT NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',
+    side        TEXT NOT NULL,           -- buy / sell
+    price       REAL NOT NULL DEFAULT 0, -- 建议买入/卖出参考价
+    price_low   REAL,
+    price_high  REAL,
+    shares      INTEGER NOT NULL DEFAULT 0,
+    stop_loss   REAL,                    -- 建议挂的止损触发价
+    take_profit REAL,                    -- 建议挂的止盈触发价
+    trailing    REAL,                    -- 跟踪止盈回撤百分比（券商支持时用）
+    reason      TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL DEFAULT '',-- 触发该建议的信号类型
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending/filled/expired/cancelled
+    note        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_plans_code ON plans(code, status);
 """
 
 
@@ -406,8 +435,89 @@ class Ledger:
             row = conn.execute(sql, params).fetchone()
         return round(float(row["total"] or 0), 2)
 
+    # -------------------------------------------------- 建议计划（条件单参数）
+
+    def next_plan_id(self) -> str:
+        """生成当日递增计划号：P20261025-1 / -2 …（人可读、便于口头对账）。"""
+        prefix = "P" + _dt.date.today().strftime("%Y%m%d") + "-"
+        with self._lock, self._db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM plans WHERE plan_id LIKE ?",
+                (prefix + "%",)).fetchone()
+        return prefix + str(int(row["n"] or 0) + 1)
+
+    def save_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """保存一条建议计划（由 astock_hint 生成，用户照此在券商挂单）。"""
+        code, _ = normalize_code(str(plan.get("code") or ""))
+        side = str(plan.get("side") or "buy").lower()
+        if side not in ("buy", "sell"):
+            raise LedgerError("计划方向只能是 buy / sell")
+        plan_id = str(plan.get("plan_id") or "").strip() or self.next_plan_id()
+        with self._lock, self._db() as conn:
+            conn.execute(
+                "INSERT INTO plans(plan_id, created_at, code, name, side, price,"
+                " price_low, price_high, shares, stop_loss, take_profit, trailing,"
+                " reason, kind, status, note) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(plan_id) DO UPDATE SET price=excluded.price,"
+                " shares=excluded.shares, stop_loss=excluded.stop_loss,"
+                " take_profit=excluded.take_profit, trailing=excluded.trailing,"
+                " status=excluded.status, note=excluded.note",
+                (plan_id, _now(), code, str(plan.get("name") or ""), side,
+                 float(plan.get("price") or 0), plan.get("price_low"),
+                 plan.get("price_high"), int(plan.get("shares") or 0),
+                 plan.get("stop_loss"), plan.get("take_profit"),
+                 plan.get("trailing"), str(plan.get("reason") or ""),
+                 str(plan.get("kind") or ""),
+                 str(plan.get("status") or "pending"), str(plan.get("note") or "")))
+        return self.get_plan(plan_id) or {"plan_id": plan_id}
+
+    def get_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._db() as conn:
+            row = conn.execute("SELECT * FROM plans WHERE plan_id=?",
+                               (str(plan_id),)).fetchone()
+        return dict(row) if row else None
+
+    def list_plans(self, status: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM plans"
+        params: List[Any] = []
+        if status:
+            sql += " WHERE status=?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC, plan_id DESC LIMIT ?"
+        params.append(max(1, min(int(limit or 50), 300)))
+        with self._lock, self._db() as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    def match_plan(self, code: str, side: str,
+                   keep_days: int = 10) -> Optional[Dict[str, Any]]:
+        """给一笔成交找最可能对应的待执行计划（同标的 + 同方向 + 近期）。
+
+        只取 pending 且创建于 keep_days 内的计划；没有就返回 None（正常：
+        用户可能是自主交易而非照建议操作）。**不猜**：宁可返回 None 让上层
+        标注"无对应建议"，也不要硬配一个错误计划去算校价。
+        """
+        code, _ = normalize_code(code)
+        cutoff = (_dt.date.today() - _dt.timedelta(days=max(1, keep_days))).isoformat()
+        with self._lock, self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM plans WHERE code=? AND side=? AND status='pending'"
+                " AND created_at>=? ORDER BY created_at DESC, plan_id DESC LIMIT 1",
+                (code, side.lower(), cutoff + " 00:00:00")).fetchone()
+        return dict(row) if row else None
+
+    def mark_plan(self, plan_id: str, status: str,
+                  note: str = "") -> Dict[str, Any]:
+        """更新计划状态（filled / cancelled / expired）。"""
+        status = str(status or "").strip().lower()
+        if status not in ("pending", "filled", "cancelled", "expired"):
+            raise LedgerError(f"未知计划状态 {status!r}")
+        with self._lock, self._db() as conn:
+            conn.execute("UPDATE plans SET status=?, note=? WHERE plan_id=?",
+                         (status, str(note or ""), str(plan_id)))
+        return self.get_plan(plan_id) or {}
+
     def export_rows(self) -> Dict[str, List[Dict[str, Any]]]:
-        """整表导出（用于备份 / 让用户拿 Excel 自己看）。"""
         with self._lock, self._db() as conn:
             return {
                 "positions": [dict(r) for r in conn.execute(

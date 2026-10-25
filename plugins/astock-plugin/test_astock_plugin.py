@@ -65,6 +65,7 @@ astock = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(astock)  # type: ignore[union-attr]
 
 mkt = astock.mkt
+orders_mod = astock.orders
 ledger_mod = astock.Ledger
 hints = astock.hints
 
@@ -538,7 +539,7 @@ class TestPluginSurface(unittest.TestCase):
         self.assertEqual(names, {
             "astock_quote", "astock_kline", "astock_search", "astock_screen",
             "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
-            "astock_sentiment", "astock_watch",
+            "astock_sentiment", "astock_sync", "astock_watch",
         })
 
     def test_all_tools_have_schema(self):
@@ -575,8 +576,365 @@ class TestPluginSurface(unittest.TestCase):
             self.assertEqual(w.describe()["name"], "astock-watch")
 
 
+class TestWatchControl(unittest.TestCase):
+    """盯盘开关：设置页按钮 + 工具自带 start/stop + 面板状态行。"""
+
+    def setUp(self):
+        import tempfile, datetime as dt
+        self.tmp = tempfile.mkdtemp(prefix="astock-watchctl-")
+        self.path = os.path.join(self.tmp, "l.sqlite")
+        lg = ledger_mod(self.path)
+        yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        lg.record_trade("600000", "buy", 10.0, 1000, trade_date=yday, name="浦发银行")
+        self.saved = {}
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _app(self, watch=True):
+        saved = self.saved
+
+        class App:
+            workspace = self.tmp
+            config = {"astock-plugin": {"ledger_path": self.path,
+                                        "watch_enabled": watch,
+                                        "watch_only_trading_hours": False}}
+
+            def save_config(self, upd):
+                for k, v in upd.items():
+                    App.config.setdefault(k, {}).update(v)
+                    saved.update(v)
+        return App()
+
+    def test_settings_action_toggles(self):
+        pl = astock.AstockPlugin()
+        app = self._app(watch=True)
+        pl._app = app
+        res = pl.settings_action("watch_toggle", app.config)
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["watch_enabled"])
+        self.assertIn("已暂停", res["message"])
+        # 再点一次恢复
+        res2 = pl.settings_action("watch_toggle", app.config)
+        self.assertTrue(res2["watch_enabled"])
+        self.assertIn("已启动", res2["message"])
+
+    def test_settings_action_rejects_unknown(self):
+        pl = astock.AstockPlugin()
+        app = self._app()
+        pl._app = app
+        res = pl.settings_action("nope", app.config)
+        self.assertFalse(res["ok"])
+
+    def test_start_message_mentions_host_plan(self):
+        """插件无权建宿主计划，必须如实告知用户还要建一次。"""
+        pl = astock.AstockPlugin()
+        app = self._app(watch=False)
+        pl._app = app
+        res = pl.settings_action("watch_toggle", app.config)
+        self.assertIn("盯梢", res["message"])
+
+    def test_panel_shows_watch_state(self):
+        pl = astock.AstockPlugin()
+        pl._app = self._app(watch=False)
+        pl._snapshot = lambda: {"data": {
+            "positions": [], "quotes": {}, "total_market_value": 0.0,
+            "equity": 0.0, "cash": 0.0, "float_pnl": 0.0,
+            "today_pnl": 0.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("盯盘已暂停", out)
+        self.assertIn("设置", out)      # 告诉用户去哪儿点
+
+    def test_tool_watch_start_stop(self):
+        import asyncio
+        pl = astock.AstockPlugin()
+        app = self._app(watch=True)
+        pl._app = app
+        loop = asyncio.new_event_loop()
+        try:
+            out = loop.run_until_complete(
+                pl.execute("astock_watch", {"action": "stop"}))
+            self.assertIn("已暂停", out)
+            self.assertFalse(app.config["astock-plugin"]["watch_enabled"])
+            out2 = loop.run_until_complete(
+                pl.execute("astock_watch", {"action": "status"}))
+            self.assertIn("盯盘状态", out2)
+        finally:
+            loop.close()
+
+    def test_probe_respects_disabled_switch(self):
+        """暂停后探针直接返回空快照（不唤醒 Agent）。"""
+        import asyncio
+        w = astock.AStockWatch()
+        ctx = types.SimpleNamespace(
+            config={"astock-plugin": {"ledger_path": self.path,
+                                      "watch_enabled": False}},
+            workspace=self.tmp)
+        loop = asyncio.new_event_loop()
+        try:
+            res = loop.run_until_complete(w.probe({}, ctx))
+        finally:
+            loop.close()
+        self.assertEqual(res.snapshot, "")
+        self.assertIn("暂停", res.summary)
+
+    def test_probe_respects_trading_hours_gate(self):
+        """开启时段自律时，非交易时段探针不产生信号。"""
+        import asyncio
+        from unittest.mock import patch
+        import astock_data as d
+        w = astock.AStockWatch()
+        ctx = types.SimpleNamespace(
+            config={"astock-plugin": {"ledger_path": self.path,
+                                      "watch_enabled": True,
+                                      "watch_only_trading_hours": True}},
+            workspace=self.tmp)
+        with patch.object(mkt, "should_watch_now", return_value=(False, "已收盘")):
+            loop = asyncio.new_event_loop()
+            try:
+                res = loop.run_until_complete(w.probe({}, ctx))
+            finally:
+                loop.close()
+        self.assertEqual(res.snapshot, "")
+        self.assertIn("不盯盘", res.summary)
+
+
+class TestWatchWindow(unittest.TestCase):
+    """“什么时候开始盯”：交易时段判断（这是省 token 的关键闸门）。"""
+
+    def _at(self, y, mo, d, h, mi):
+        import datetime as dt
+        return dt.datetime(y, mo, d, h, mi)
+
+    def test_weekend_never_watches(self):
+        ok, why = mkt.should_watch_now(self._at(2026, 10, 24, 10, 30))   # 周六
+        self.assertFalse(ok)
+        self.assertIn("周末", why)
+
+    def test_before_open_not_watched(self):
+        ok, _ = mkt.should_watch_now(self._at(2026, 10, 23, 9, 5))
+        self.assertFalse(ok)
+
+    def test_auction_and_continuous_sessions(self):
+        for h, m in ((9, 15), (9, 26), (10, 30), (14, 58)):
+            ok, _ = mkt.should_watch_now(self._at(2026, 10, 23, h, m))
+            self.assertTrue(ok, f"{h}:{m} 应盯盘")
+
+    def test_lunch_break_skipped(self):
+        ok, why = mkt.should_watch_now(self._at(2026, 10, 23, 12, 0))
+        self.assertFalse(ok)
+        self.assertIn("午间", why)
+
+    def test_after_close_skipped(self):
+        for h, m in ((15, 0), (15, 3), (20, 0)):
+            ok, why = mkt.should_watch_now(self._at(2026, 10, 23, h, m))
+            self.assertFalse(ok)
+            self.assertIn("已收盘", why)
+
+    def test_next_window_text(self):
+        self.assertIn("今天 13:00",
+                      mkt.next_watch_window(self._at(2026, 10, 23, 12, 0)))
+        # 周五盘后 → 下周一
+        self.assertIn("2026-10-26",
+                      mkt.next_watch_window(self._at(2026, 10, 23, 16, 0)))
+
+
+class TestReceiptParse(unittest.TestCase):
+    """成交回单解析：这是“买完怎么同步回系统”的入口，宁可少记也不能记错。"""
+
+    def test_csv_with_header(self):
+        import astock_receipt as r
+        txt = ("证券代码,证券名称,买卖标志,成交价格,成交数量,成交金额,手续费,成交日期\n"
+               "600000,浦发银行,买入,9.53,2000,19060.00,5.10,2026-10-24")
+        res = r.parse(txt)
+        self.assertEqual(res["method"], "csv")
+        t = res["usable"][0]
+        self.assertEqual((t.code, t.side, t.price, t.shares), ("600000", "buy", 9.53, 2000))
+        self.assertAlmostEqual(t.fee, 5.10)
+        self.assertEqual(t.trade_date, "2026-10-24")
+
+    def test_line_format_price_vs_amount(self):
+        """陷阱：`9.53 2000 19060 5.10` 里 5.10 是费用、19060 是金额，
+        不能把它们当成价格/股数（早期实现就错在这里）。"""
+        import astock_receipt as r
+        res = r.parse("600000 浦发银行 买入 9.53 2000 19060 5.10 2026-10-24")
+        t = res["usable"][0]
+        self.assertEqual(t.price, 9.53)
+        self.assertEqual(t.shares, 2000)
+
+    def test_line_format_sell(self):
+        import astock_receipt as r
+        res = r.parse("000001 平安银行 卖出 11.20 500 5600.00 5.00")
+        t = res["usable"][0]
+        self.assertEqual(t.side, "sell")
+        self.assertEqual(t.price, 11.20)
+        self.assertEqual(t.shares, 500)
+
+    def test_fullwidth_and_thousand_sep(self):
+        import astock_receipt as r
+        txt = "证券代码\t证券名称\t买卖\t成交价\t数量\n600000\t浦发银行\t买入\t9.53\t2,000"
+        t = r.parse(txt)["usable"][0]
+        self.assertEqual(t.shares, 2000)
+
+    def test_duplicate_rows_removed(self):
+        import astock_receipt as r
+        line = "600000 买入 9.53 2000 2026-10-24"
+        res = r.parse(line + "\n" + line)
+        self.assertEqual(len(res["trades"]), 1)
+        self.assertEqual(res["duplicates_removed"], 1)
+
+    def test_unparsed_reported_not_guessed(self):
+        """认不出的行必须显式列出——静默丢弃会少记一笔，对账全乱。"""
+        import astock_receipt as r
+        res = r.parse("600000 买入 9.53\n"          # 缺数量
+                      "000001 卖出 11.20 500 2026-10-24")
+        self.assertTrue(res["unparsed"])
+        self.assertEqual(len(res["usable"]), 1)
+
+    def test_amount_mismatch_flagged(self):
+        import astock_receipt as r
+        txt = ("证券代码,买卖标志,成交价格,成交数量,成交金额\n"
+               "600000,买入,9.53,2000,99999.00")
+        res = r.parse(txt)
+        bad = [t for t in res["trades"] if not t.ok]
+        self.assertTrue(bad)
+        self.assertIn("金额校验不符", bad[0].problems[0])
+
+    def test_empty_input(self):
+        import astock_receipt as r
+        self.assertEqual(r.parse("")["trades"], [])
+
+
+class TestConditionalOrders(unittest.TestCase):
+    """条件单参数：没时间盯盘的人靠这个替代盯盘，算错就是亏钱。"""
+
+    def test_stop_loss_avoids_round_number(self):
+        # 10 × (1-10%) = 9.00 → 必须挪开整数关口
+        p = orders_mod.stop_loss_price(10.0, 10, "600000")
+        self.assertNotEqual(p, 9.00)
+        self.assertLess(p, 9.00)
+
+    def test_take_profit_avoids_round_number(self):
+        p = orders_mod.take_profit_price(10.0, 10, "600000")
+        self.assertNotEqual(p, 11.00)
+        self.assertGreater(p, 11.00)
+
+    def test_stop_loss_respects_limit_down(self):
+        """止损百分比过大时不能低于跌停价（挂上去当天也成交不了）。"""
+        from astock_market import limit_prices
+        _up, down, _ = limit_prices(10.0, "600000")
+        p = orders_mod.stop_loss_price(10.0, 25, "600000")
+        self.assertGreater(p, down)
+
+    def test_take_profit_not_clipped_by_limit_up(self):
+        """止盈目标价不按涨停裁剪（涨停只约束当日成交，不约束目标价）。"""
+        from astock_market import limit_prices
+        up, _d, _ = limit_prices(10.0, "600000")
+        p = orders_mod.take_profit_price(10.0, 30, "600000")
+        # 13.00 是整数关口 → 避让成 13.01（不是精度问题）
+        self.assertAlmostEqual(p, 13.01, places=2)
+        self.assertGreater(p, up)          # 高于当日涨停是正常的
+        # 但必须被告知"今日不可达"
+        ok, why = orders_mod.reachable_today(p, 10.0, "600000")
+        self.assertFalse(ok)
+        self.assertIn("今日不可达", why)
+
+    def test_buy_order_whole_lots_and_fees(self):
+        o = orders_mod.build_buy_order("600000", "浦发银行", 9.53, 50000, 8, 15)
+        self.assertEqual(o.shares % 100, 0)
+        self.assertGreater(o.shares, 0)
+        self.assertLessEqual(o.est_amount, 50000)
+        self.assertGreater(o.est_fee, 0)
+        self.assertIsNotNone(o.stop_loss)
+        self.assertIsNotNone(o.take_profit)
+
+    def test_buy_insufficient_cash(self):
+        o = orders_mod.build_buy_order("688256", "寒武纪", 932.2, 5000, 8, 15)
+        self.assertEqual(o.shares, 0)
+        self.assertTrue(any("资金不足" in n for n in o.notes))
+
+    def test_sell_order_skips_already_breached_take_profit(self):
+        """已涨过止盈位时不能再给止盈价——否则条件单会立即成交，
+        用户以为是“设置止盈”实际是“立即卖出”（真实踩过的坑）。"""
+        o2 = orders_mod.build_sell_order("000001", "平安银行", 12.0, 500, 10.0, 8, 15)
+        self.assertIsNone(o2.take_profit)
+        self.assertTrue(any("已涨过止盈位" in n for n in o2.notes))
+
+    def test_sell_order_keeps_valid_take_profit(self):
+        """成本 10、止盈 15% → 目标 11.50；现价 11.2 尚未到，必须保留。
+
+        注意：11.50 高于当日涨停（11.0×1.1=12.1 时无影响；这里按现价 11.2
+        算涨停 12.32 可达），所以不该被裁掉——涨停只约束当日成交价，
+        不约束"目标价"这个数字（早期实现把目标价裁到涨停附近导致
+        止盈价 < 现价，条件单一挂就成交）。"""
+        o = orders_mod.build_sell_order("000001", "平安银行", 11.20, 500, 10.0, 8, 15)
+        self.assertIsNotNone(o.take_profit)
+        self.assertAlmostEqual(o.take_profit, 11.50, places=2)
+        self.assertGreater(o.take_profit, 11.20)
+
+    def test_sell_order_skips_breached_stop_loss(self):
+        o = orders_mod.build_sell_order("600000", "浦发银行", 8.5, 1000, 10.0, 8, 15)
+        self.assertIsNone(o.stop_loss)
+        self.assertTrue(any("已高于现价" in n for n in o.notes))
+
+    def test_order_block_is_copyable(self):
+        o = orders_mod.build_buy_order("600000", "浦发银行", 9.53, 50000, 8, 15)
+        block = o.order_block()
+        self.assertIn("浦发银行", block)
+        self.assertIn("止损触发价", block)
+        self.assertIn("止盈触发价", block)
+
+
+class TestPlanStore(unittest.TestCase):
+    """建议计划：让成交回单能匹配回当初的建议。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="astock-plan-")
+        self.ledger = ledger_mod(os.path.join(self.tmp, "l.sqlite"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_save_and_get(self):
+        p = self.ledger.save_plan({"code": "600000", "name": "浦发银行",
+                                  "side": "buy", "price": 9.53, "shares": 2000,
+                                  "stop_loss": 8.77, "take_profit": 10.96})
+        self.assertTrue(p["plan_id"].startswith("P"))
+        got = self.ledger.get_plan(p["plan_id"])
+        self.assertEqual(got["stop_loss"], 8.77)
+        self.assertEqual(got["status"], "pending")
+
+    def test_incrementing_ids(self):
+        a = self.ledger.save_plan({"code": "600000", "side": "buy"})
+        b = self.ledger.save_plan({"code": "000001", "side": "buy"})
+        self.assertNotEqual(a["plan_id"], b["plan_id"])
+
+    def test_match_only_same_code_and_side(self):
+        p = self.ledger.save_plan({"code": "600000", "side": "buy", "price": 9.5})
+        self.assertEqual(self.ledger.match_plan("600000", "buy")["plan_id"],
+                         p["plan_id"])
+        self.assertIsNone(self.ledger.match_plan("600000", "sell"))
+        self.assertIsNone(self.ledger.match_plan("000001", "buy"))
+
+    def test_filled_plan_not_rematched(self):
+        p = self.ledger.save_plan({"code": "600000", "side": "buy"})
+        self.ledger.mark_plan(p["plan_id"], "filled")
+        self.assertIsNone(self.ledger.match_plan("600000", "buy"))
+
+    def test_bad_status_rejected(self):
+        p = self.ledger.save_plan({"code": "600000", "side": "buy"})
+        with self.assertRaises(Exception):
+            self.ledger.mark_plan(p["plan_id"], "whatever")
+
+    def test_bad_side_rejected(self):
+        with self.assertRaises(Exception):
+            self.ledger.save_plan({"code": "600000", "side": "short"})
+
+
 class TestPanelRender(unittest.TestCase):
-    """右栏面板：两种形态都要能渲染，且失败时降级而不是崩。"""
 
     def setUp(self):
         import tempfile
@@ -704,9 +1062,15 @@ class TestWatchProbe(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _ctx(self, config=None):
+        # watch_only_trading_hours=False：这些用例测的是**信号识别**，
+        # 若受交易时段闸门影响，跑测试时（常常是夜间/周末）会全部变"无异动"。
+        # 时段闸门本身由 TestWatchWindow 专门覆盖。
+        cfg = {"ledger_path": self.ledger_path,
+               "watch_enabled": True, "watch_only_trading_hours": False}
+        if config:
+            cfg.update((config.get("astock-plugin") or {}))
         return types.SimpleNamespace(
-            config=config or {"astock-plugin": {"ledger_path": self.ledger_path}},
-            workspace=self.tmp)
+            config={"astock-plugin": cfg}, workspace=self.tmp)
 
     def _run(self, quotes, cfg=None, config=None):
         import asyncio

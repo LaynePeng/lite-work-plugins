@@ -4,7 +4,7 @@
 提示该不该动手、动多少」，**完全不接触任何委托通道**（没有下单、撤单、
 券商登录、也不生成委托文件）。
 
-工具面（10 个）
+工具面（11 个）
     astock_quote      实时行情快照（涨跌停价、量比、换手、市值；自动补交易时段说明）
     astock_kline      K 线 + 技术摘要（均线、区间高低、量能变化）
     astock_search     按代码/名称/拼音检索标的
@@ -14,6 +14,7 @@
     astock_portfolio  持仓总览（实时浮盈、占比、当日盈亏）＋ 资金/已实现盈亏/流水/纠错
     astock_hint       下单提示（T+1 可卖、止损止盈、加减仓档位、买卖股数估算、舆情背离）
     astock_sentiment  投资舆情分析（公告/研报/新闻/热度/龙虎榜/两融/股东户数）
+    astock_sync       成交回单同步（粘贴回单→解析多笔→匹配计划→校价→落账）
     astock_watch      自选股增删查
 
 扩展点
@@ -35,6 +36,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -86,9 +88,12 @@ except ImportError:  # 旧宿主降级
 
     ProbeContext = None  # type: ignore[assignment,misc]
 
+import astock_board as board
 import astock_data as data
 import astock_hints as hints
 import astock_market as mkt
+import astock_orders as orders
+import astock_receipt as receipt
 import astock_sentiment as senti
 import astock_sentiment_data as senti_data
 import astock_sentiment_tool as senti_tool
@@ -263,6 +268,22 @@ class AStockWatch(WatchSource):
     async def probe(self, cfg: Dict[str, Any], ctx: Any) -> Any:
         own = (ctx.config or {}).get(PLUGIN_NAME) if isinstance(ctx.config, dict) else {}
         own = own if isinstance(own, dict) else {}
+
+        # ① 盯盘总开关：设置页「启动/暂停盯盘」写的就是这个键。
+        #    关掉时直接返回空快照（= 无变化），不会唤醒 Agent。
+        if not _as_bool(own.get("watch_enabled"), True):
+            return ProbeResult(snapshot="", summary="盯盘已暂停（设置页可启动）")
+
+        # ② 交易时段自律：非交易时段不查行情、不产生信号。
+        #    **这是"什么时候开始盯"的真正答案**——不用你设闹钟，也不用
+        #    24 小时常驻：工作日 9:10 起、15:00 止，午休自动跳过。
+        if _as_bool(own.get("watch_only_trading_hours"), True):
+            ok_now, why = mkt.should_watch_now()
+            if not ok_now:
+                return ProbeResult(
+                    snapshot="",
+                    summary=f"当前不盯盘：{why}（下次 {mkt.next_watch_window()}）")
+
         workspace = str(getattr(ctx, "workspace", "") or "")
         path = str(own.get("ledger_path") or "").strip() or default_ledger_path(workspace)
         try:
@@ -352,7 +373,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.1.0"
+    version = "1.2.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -409,6 +430,20 @@ class AstockPlugin(ToolPlugin):
              "hint": "markdown＝紧凑表格（横向数值对齐，适合盘后核对）；"
                      "tree＝一只股一张卡，卡内写触发规则与建议动作并按严重度着色"
                      "（适合盘中扫一眼）。两者数据完全相同，只是排版不同"},
+            {"key": "watch_enabled", "type": "boolean", "label": "启用盯盘",
+             "default": True,
+             "hint": "关掉后盯梢探针直接返回「无变化」，不会再唤醒你。"
+                     "也可用 astock_watch action=start/stop 切换"},
+            {"key": "watch_toggle", "type": "action", "label": "启动 / 暂停盯盘",
+             "hint": "点一下切换盯盘开关；结果与当前状态会显示在按钮旁"},
+            {"key": "watch_only_trading_hours", "type": "boolean",
+             "label": "仅交易时段盯盘（推荐）", "default": True,
+             "hint": "开启后只在工作日 9:10–15:00 盯，午休与收盘后自动静默——"
+                     "非交易时段零 token。关掉会全天盯，纯浪费"},
+            {"key": "sync_price_tolerance_pct", "type": "number",
+             "label": "回单校价容差（%）", "default": 2.0,
+             "hint": "成交价与建议计划价偏差超过该比例时标黄提醒。"
+                     "只是提示，不会阻断落账（成交价由市场决定）"},
         ],
         "panels": [
             {"id": "portfolio", "title": "持仓"},
@@ -639,6 +674,29 @@ class AstockPlugin(ToolPlugin):
                 },
             ),
             ToolDefinition(
+                name="astock_sync",
+                description=(
+                    "**成交回单同步**（你在券商下单后用它）：把券商 App 的成交明细"
+                    "粘贴进来，或传导出的 CSV/TSV 内容，一次解析多笔 → 自动匹配"
+                    "之前的建议计划 → 校价（成交价与计划价偏差）→ 落账更新成本与 T+1。"
+                    "默认 dry_run 只预览不落账。识别不出的行会明确列出，不猜。"),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": ("回单原文。支持：带表头的 CSV/TSV（列名自动识别）；"
+                                            "或每行一笔 `600000 买入 9.53 2000 2026-10-24`"),
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "默认 true＝只预览校验，确认后再用 false 落账",
+                        },
+                    },
+                    "required": ["text"],
+                },
+            ),
+            ToolDefinition(
                 name="astock_sentiment",
                 description=(
                     "**投资舆情分析**（重要参考）：按七类证据归集——公司公告、机构研报、"
@@ -667,11 +725,20 @@ class AstockPlugin(ToolPlugin):
             ),
             ToolDefinition(
                 name="astock_watch",
-                description="自选股管理：查看 / 添加 / 删除。自选股会被行情快照与盯梢源自动纳入。",
+                description=(
+                    "盯盘与自选股管理。action=list 看自选；add/remove 增删自选；"
+                    "**status 看盯盘状态**（是否在盯、当前时段、下次开始时间）；"
+                    "**start 启动盯盘**（开启定时探测，非交易时段自动跳过不耗 token）；"
+                    "**stop 暂停盯盘**。盯盘按 A 股交易时段自律：工作日 9:10–15:00、"
+                    "午休跳过、收盘自动停。"),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["list", "add", "remove"], "description": "默认 list"},
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "add", "remove", "status", "start", "stop"],
+                            "description": "默认 list",
+                        },
                         "code": code_prop,
                         "name": {"type": "string", "description": "名称（可选）"},
                         "note": {"type": "string", "description": "备注（可选）"},
@@ -694,6 +761,7 @@ class AstockPlugin(ToolPlugin):
             "astock_portfolio": self._tool_portfolio,
             "astock_hint": self._tool_hint,
             "astock_sentiment": self._tool_sentiment,
+            "astock_sync": self._tool_sync,
             "astock_watch": self._tool_watch,
         }
         handler = handlers.get(name)
@@ -1063,7 +1131,38 @@ class AstockPlugin(ToolPlugin):
                     f"并按剩余流水重算：持仓 {res['shares']} 股，"
                     f"成本价 {res['cost_price']:.4f}")
         # list / summary 都返回总览（summary 只是语义别名，便于模型表达意图）
+        # 看板版式：聊天区宽度足够三栏，且含 ```board 围栏的结果会被宿主
+        # 自动展开渲染（右栏 331px 只够 1 栏，故右栏保持简表）。
+        if action in ("list", "summary"):
+            board_text = await self._render_board_text()
+            if board_text:
+                return board_text
         return ledger_snapshot["text"]
+
+    async def _render_board_text(self) -> str:
+        """持仓 → 聊天内三栏看板（含空列占位与文字兜底）。"""
+        try:
+            snap = await asyncio.to_thread(self._snapshot)
+            data_ = snap["data"]
+            ledger = self._get_ledger()
+            watch = await asyncio.to_thread(ledger.list_watch)
+            spec = board.build_board(
+                data_, self._hints_cfg(),
+                hints.build_position_hints, hints.build_t1_hint,
+                watch_codes=[w["code"] for w in watch])
+        except Exception:
+            logger.warning("[astock] 看板渲染失败，回退文字版", exc_info=True)
+            return ""
+        if not spec:
+            return ""
+        lines = [board.render_board_json(spec), ""]
+        # 看板是"扫一眼"的视图，明细数字仍需可核对 → 附一行口径说明
+        lines.append(
+            f"共 {len(data_['positions'])} 只持仓、"
+            f"{len(watch)} 只自选；卡片首行＝现价/涨跌幅，次行为"
+            f"股数·成本·浮盈·今日可卖，箭头后为该做什么。"
+            f"完整数值用 `astock_portfolio action=trades` 或右栏「持仓」面板核对。")
+        return "\n".join(lines)
 
     def _snapshot(self) -> Dict[str, Any]:
         """同步取台账 + 实时行情，返回 {'text':..., 'data':...}。"""
@@ -1271,8 +1370,87 @@ class AstockPlugin(ToolPlugin):
                 lines.append("### 舆情参考（背离信号优先）")
                 lines += flags
                 lines.append("")
+        # 条件单参数块：没时间盯盘的人真正需要的部分——照着挂一次，白天不用看
+        plan_lines, plan_ids = await self._build_order_plans(
+            codes, pos_by_code, quotes, snap["data"], want_buy)
+        if plan_lines:
+            lines.append("")
+            lines.append("### 可照抄的条件单（挂一次，不用盯盘）")
+            lines += plan_lines
+            if plan_ids:
+                lines.append("")
+                lines.append(f"_计划号：{'、'.join(plan_ids)}。成交后用 astock_sync "
+                             f"把回单粘回来即可自动匹配这条计划。_")
         lines.append(hints.DISCLAIMER)
         return "\n".join(lines)
+
+    async def _build_order_plans(self, codes: List[str],
+                                 pos_by_code: Dict[str, Dict[str, Any]],
+                                 quotes: Dict[str, Dict[str, Any]],
+                                 data_: Dict[str, Any],
+                                 want_buy: bool) -> Tuple[List[str], List[str]]:
+        """为持仓/自选生成条件单参数，并落库为"建议计划"。
+
+        只对**已经触发信号**或用户明确问买入的标的生成——不然每只持仓都挂一张
+        计划会把 plans 表塞满，反而找不到该执行哪一条。
+        """
+        cfg = self._hints_cfg()
+        fee = self._get_ledger().fee
+        cash = float(data_.get("cash") or 0)
+        total_mv = float(data_.get("total_market_value") or 0)
+        cap_amount = ((total_mv + cash) * cfg.position_cap_pct / 100.0
+                      if (total_mv + cash) > 0 else 0)
+        out: List[str] = []
+        ids: List[str] = []
+        ledger = self._get_ledger()
+
+        for code in codes[:6]:
+            q = quotes.get(code) or {}
+            price = q.get("price")
+            if not price:
+                continue
+            pos = pos_by_code.get(code)
+            name = q.get("name") or (pos or {}).get("name") or code
+            order = None
+            if pos:
+                # 有持仓 → 卖出侧条件单（止损/止盈），数量=今日可卖
+                avail = int(pos.get("available_today") or 0)
+                order = orders.build_sell_order(
+                    code, name, float(price), avail,
+                    float(pos.get("cost_price") or 0),
+                    cfg.stop_loss_pct, cfg.take_profit_pct, cfg.trailing_pct,
+                    fee_cfg=fee)
+            elif want_buy:
+                order = orders.build_buy_order(
+                    code, name, float(price), cash, cfg.stop_loss_pct,
+                    cfg.take_profit_pct, cfg.trailing_pct,
+                    cap_amount=cap_amount, fee_cfg=fee)
+            if order is None or order.shares <= 0:
+                if order is not None and order.notes:
+                    out.append(order.order_block())
+                continue
+            # 落库：让成交回单能匹配回这条建议
+            try:
+                plan = await asyncio.to_thread(
+                    ledger.save_plan, {
+                        "code": code, "name": name, "side": order.side,
+                        "price": order.price, "shares": order.shares,
+                        "stop_loss": order.stop_loss,
+                        "take_profit": order.take_profit,
+                        "trailing": order.trailing_pct,
+                        "reason": "条件单参数（由 astock_hint 生成）",
+                        "kind": "conditional_order",
+                    })
+                pid = plan.get("plan_id") or ""
+            except Exception:
+                logger.warning("[astock] 计划落库失败 %s", code, exc_info=True)
+                pid = ""
+            block = order.order_block()
+            if pid:
+                block += f"\n  计划号  {pid}"
+                ids.append(pid)
+            out.append(block)
+        return out, ids
 
     async def _sentiment_flags(self, codes: List[str],
                               limit: int = 3) -> List[str]:
@@ -1332,8 +1510,139 @@ class AstockPlugin(ToolPlugin):
                 continue
         return out
 
-    # -------------------------------------------------- 舆情
+    # -------------------------------------------------- 成交回单同步
 
+    async def _tool_sync(self, args: Dict[str, Any]) -> str:
+        """把券商成交回单同步进台账（解析 → 匹配计划 → 校价 → 落账）。
+
+        这是"我自己买了怎么同步回系统"的答案：不用逐笔手抄，把回单**粘贴**
+        或把 CSV 内容传进来即可，一次处理一整天的成交。
+        """
+        text = str(args.get("text") or args.get("receipt") or "").strip()
+        if not text:
+            return ("[Error] 需要 text（券商成交回单）。可直接粘贴 App 里的成交明细，"
+                    "或传导出的 CSV/TSV 内容。一行一笔也可以。")
+        parsed = receipt.parse(text)
+        if not parsed["trades"]:
+            return ("[Error] 没能从这段内容里识别出成交记录。\n"
+                    "支持的格式：\n"
+                    "· 带表头的 CSV/TSV（粘贴券商导出文件内容）\n"
+                    "· 每行一笔：`600000 买入 9.53 2000 2026-10-24`\n"
+                    "也可以只用 astock_record 手工录单笔。")
+        dry = bool(args.get("dry_run", True))
+        entries = parsed["usable"]
+        if not entries:
+            return self._render_sync_preview(parsed, [], [], dry=True,
+                                            reason="所有行都缺少关键字段")
+
+        ledger = self._get_ledger()
+        results: List[Dict[str, Any]] = []
+        for t in entries:
+            date = t.trade_date or dt.date.today().isoformat()
+            match = await asyncio.to_thread(ledger.match_plan, t.code, t.side)
+            item: Dict[str, Any] = {"trade": t, "plan": match, "status": "ok",
+                                    "message": ""}
+            # 校价：与计划建议价比较（只提示，不阻断——成交价由市场决定）
+            if match and match.get("price"):
+                plan_price = float(match["price"])
+                if plan_price > 0 and t.price:
+                    dev = (t.price - plan_price) / plan_price * 100.0
+                    item["deviation_pct"] = round(dev, 2)
+                    limit = float(_num(self._app, "sync_price_tolerance_pct", 2.0))
+                    if abs(dev) > limit:
+                        item["status"] = "warn"
+                        item["message"] = (f"成交价 {t.price:.2f} 与计划价 "
+                                           f"{plan_price:.2f} 偏差 {dev:+.2f}%"
+                                           f"（阈值 ±{limit:g}%）")
+                    shares_plan = int(match.get("shares") or 0)
+                    if shares_plan and t.shares and t.shares != shares_plan:
+                        item["status"] = "warn"
+                        item["message"] = (item["message"] + "；" if item["message"] else "") \
+                            + f"数量与计划不符（计划 {shares_plan} 股，成交 {t.shares} 股）"
+            if not dry:
+                try:
+                    rec = await asyncio.to_thread(
+                        ledger.record_trade,
+                        code=t.code, side=t.side, price=float(t.price or 0),
+                        shares=int(t.shares or 0), trade_date=date,
+                        name=t.name or "", note=f"回单同步({t.confidence})",
+                        fee_override=t.fee)
+                    item["recorded"] = rec
+                    if match:
+                        await asyncio.to_thread(
+                            ledger.mark_plan, match["plan_id"], "filled",
+                            f"回单同步：成交 {t.shares} 股 @ {t.price}")
+                except LedgerError as exc:
+                    item["status"] = "error"
+                    item["message"] = str(exc)
+            results.append(item)
+
+        return self._render_sync_preview(parsed, results, [], dry)
+
+    def _render_sync_preview(self, parsed: Dict[str, Any],
+                             results: List[Dict[str, Any]],
+                             _unused: List[Any], dry: bool,
+                             reason: str = "") -> str:
+        trades = parsed["trades"]
+        ok_n = sum(1 for r in results if r["status"] == "ok")
+        warn_n = sum(1 for r in results if r["status"] == "warn")
+        err_n = sum(1 for r in results if r["status"] == "error")
+        head = ("**成交回单预览**（未落账）" if dry else "**成交已同步**")
+        lines = [head, ""]
+        lines.append(f"识别 {len(trades)} 笔"
+                     + (f"（格式：{parsed['method']}）" if parsed.get("method") else "")
+                     + (f"｜重复去掉 {parsed['duplicates_removed']} 笔"
+                        if parsed.get("duplicates_removed") else ""))
+        if reason:
+            lines += ["", f"⚠️ {reason}"]
+        lines.append("")
+        rows = []
+        for r in results:
+            t = r["trade"]
+            plan = r.get("plan") or {}
+            dev = r.get("deviation_pct")
+            rows.append([
+                t.code, (t.name or "-")[:8],
+                "买入" if t.side == "buy" else "卖出",
+                _f(t.price), t.shares or "-",
+                _f(t.fee) if t.fee else "自动算",
+                t.trade_date or "今天",
+                plan.get("plan_id") or "无对应计划",
+                f"{dev:+.2f}%" if dev is not None else "-",
+                {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(r["status"], "?"),
+            ])
+        if rows:
+            lines.append(_table(
+                ["代码", "名称", "方向", "成交价", "数量", "费用", "日期",
+                 "匹配计划", "校价", "状态"], rows))
+            lines.append("")
+        warns = [r for r in results if r["message"]]
+        if warns:
+            lines.append("**需要你确认**：")
+            for r in warns:
+                mark = "⚠️" if r["status"] == "warn" else "❌"
+                t = r["trade"]
+                lines.append(f"- {mark} {t.code} {t.name or ''}：{r['message']}")
+            lines.append("")
+        if parsed.get("unparsed"):
+            lines.append(f"**未能识别（{len(parsed['unparsed'])} 笔，未计入）**：")
+            for raw in parsed["unparsed"][:8]:
+                lines.append(f"- `{raw[:80]}`")
+            lines.append("")
+        if dry:
+            if err_n:
+                lines.append("❌ 有解析/校验错误，修正后重试（或改用 astock_record 手工录）。")
+            else:
+                lines.append(f"确认无误后用 `dry_run=false` 重新调用即落账"
+                             f"（✅{ok_n} / ⚠️{warn_n}）。")
+        else:
+            lines.append(f"落账结果：成功 {ok_n} 笔"
+                         + (f"，警告 {warn_n} 笔" if warn_n else "")
+                         + (f"，失败 {err_n} 笔" if err_n else "") + "。")
+            lines.append("对应计划已标记为已执行；台账成本价与 T+1 可卖已同步更新。")
+        return "\n".join(lines)
+
+    # -------------------------------------------------- 舆情
     async def _tool_sentiment(self, args: Dict[str, Any]) -> str:
         code_raw = str(args.get("code") or "").strip()
         if not code_raw:
@@ -1386,9 +1695,106 @@ class AstockPlugin(ToolPlugin):
 
     # -------------------------------------------------- 自选股
 
+    async def _watch_control(self, action: str) -> str:
+        """盯盘状态查询 / 启动 / 暂停。
+
+        「开始盯盘」的两层含义，这里都覆盖到并如实说明：
+        ① **插件侧开关**（`watch_enabled`）：关掉时探针直接返回空快照，不产生信号；
+        ② **宿主调度计划**：真正让探针被周期性调用的是 lite-work 的「盯梢/定时」
+           计划（source=astock）。**插件无权创建它**（宿主没开放该 API 给插件），
+           所以启动时明确告诉你还需要在盯梢页建一次计划（只是建一次，长期有效）。
+        """
+        st = mkt.trading_status()
+        ok_now, why = mkt.should_watch_now()
+        enabled = _as_bool(_cfg(self._app, "watch_enabled", True), True)
+        only_hours = _as_bool(_cfg(self._app, "watch_only_trading_hours", True), True)
+
+        if action in ("start", "stop"):
+            want = action == "start"
+            err = self._save_plugin_config({"watch_enabled": want})
+            if err:
+                return (f"[Error] 无法写入盯盘开关：{err}\n"
+                        f"请手动在设置页把「启用盯盘」设为 {str(want).lower()}。")
+            enabled = want
+            if not want:
+                return "⏸ 盯盘已暂停。探针将直接返回「无变化」，不会再唤醒你。\n" \
+                       "（用 `astock_watch action=start` 恢复）"
+
+        lines = []
+        if action == "status":
+            lines.append("## 盯盘状态")
+            lines.append("")
+        else:
+            lines.append("## 已启动盯盘")
+            lines.append("")
+        lines.append(_table(["项目", "状态"], [
+            ["插件盯盘开关", "✅ 开启" if enabled else "⏸ 已暂停"],
+            ["当前时刻", f"{st['now']}（{st['phase']}）"],
+            ["现在是否在盯", ("✅ 是" if ok_now else f"❌ 否 —— {why}")],
+            ["下次开始", mkt.next_watch_window()],
+            ["时段自律", ("✅ 仅工作日 9:10–15:00，午休跳过"
+                          if only_hours else "⚠️ 已关闭（全天盯，会消耗 token）")],
+        ]))
+        lines.append("")
+        lines.append("**盯盘按 A 股交易时段自动作息**：开盘前 5 分钟开始，"
+                     "午休自动跳过，15:00 收盘自动停。非交易时段探针直接返回"
+                     "「无变化」，**不消耗 token**。")
+        lines.append("")
+        lines.append("### 还需要你做一次（只需一次）")
+        lines.append("插件无权创建宿主的盯梢计划，请在 **右栏「盯梢」页 → 新建计划** 中：")
+        lines.append("- 数据源选 **A股持仓/自选异动**（source_kind = `astock`）")
+        lines.append("- 间隔填 **300 秒**（5 分钟）；或选 cron `*/5 9-14 * * 1-5`")
+        lines.append("- 权限档保持 **read**（无人值守，不需要写权限）")
+        lines.append("")
+        lines.append("建好后它会长期生效，你不需要每天启动——"
+                     "时段判断在插件侧做，收盘后自动静默。")
+        return "\n".join(lines)
+
+    def settings_action(self, key: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """设置页动作按钮：启动 / 暂停盯盘。
+
+        为什么盯盘开关放在**设置页**而不是右栏看板：宿主的面板协议只支持
+        Markdown 与 lite-tree 两种**只读**渲染，卡片/Markdown 都点不了；
+        插件唯一能提供的可点击控件是设置页的 `type: "action"` 按钮。
+        右栏持仓面板会显示当前盯盘状态并指向这里（见 `_panel_markdown`）。
+        """
+        if key != "watch_toggle":
+            return {"ok": False, "message": f"未知动作 {key}"}
+        own = (config or {}).get(PLUGIN_NAME) if isinstance(config, dict) else {}
+        own = own if isinstance(own, dict) else {}
+        cur = _as_bool(own.get("watch_enabled"), True)
+        want = not cur
+        err = self._save_plugin_config({"watch_enabled": want})
+        if err:
+            return {"ok": False, "message": f"写入失败：{err}"}
+        st = mkt.trading_status()
+        ok_now, why = mkt.should_watch_now()
+        if want:
+            tail = (f"现在在盯着（{st['phase']}）" if ok_now
+                    else f"现在不盯：{why}；下次 {mkt.next_watch_window()}")
+            msg = f"已启动盯盘。{tail}"
+            # 提醒仍需建宿主盯梢计划（插件无权创建）
+            msg += "。注意：还需在右栏「盯梢」页建一次 source=astock 的计划（间隔 300 秒），它才会被周期调用"
+        else:
+            msg = "已暂停盯盘：探针将直接返回「无变化」，不会再唤醒你。"
+        return {"ok": True, "message": msg, "watch_enabled": want}
+
+    def _save_plugin_config(self, updates: Dict[str, Any]) -> str:
+        app = self._app
+        if app is None or not hasattr(app, "save_config"):
+            return "宿主未提供 save_config"
+        try:
+            app.save_config({PLUGIN_NAME: dict(updates)})
+            return ""
+        except Exception as exc:            # 权限/校验失败都要可读
+            logger.warning("[astock] 写配置失败: %s", exc)
+            return f"{type(exc).__name__}: {exc}"
+
     async def _tool_watch(self, args: Dict[str, Any]) -> str:
         action = str(args.get("action") or "list")
         ledger = self._get_ledger()
+        if action in ("status", "start", "stop"):
+            return await self._watch_control(action)
         if action == "add":
             code = str(args.get("code") or "").strip()
             if not code:
@@ -1489,9 +1895,10 @@ class AstockPlugin(ToolPlugin):
 
     def _panel_markdown(self, d: Dict[str, Any], flag: str) -> str:
         head = self._panel_head(d)
+        watch_line = self._panel_watch_line()
         if not d["positions"]:
             return head + ("\n\n当前空仓。录入成交："
-                           "`astock_record side=buy code=... price=... shares=...`")
+                           "`astock_record side=buy code=... price=... shares=...`") + watch_line
         rows = []
         for p in d["positions"][:MAX_ROWS]:
             q = d["quotes"].get(p["code"]) or {}
@@ -1503,7 +1910,27 @@ class AstockPlugin(ToolPlugin):
                          f"{_f(pnl)}（{_pct(mkt.pct_change(price, p['cost_price']))}）",
                          _money(mv)])
         body = _table(["名称", "股数", "成本", "现价", "浮盈", "市值"], rows)
-        return head + "\n\n" + body + (f"\n\n{flag}" if flag else "")
+        return head + "\n\n" + body + watch_line + (f"\n\n{flag}" if flag else "")
+
+    def _panel_watch_line(self) -> str:
+        """面板里的盯盘状态行（含"去哪儿点按钮"的指引）。
+
+        宿主面板是**只读**的（Markdown / lite-tree 都点不了），按钮只能放
+        设置页——所以这里必须明确告诉用户点哪里，否则他会以为看板上能点。
+        """
+        try:
+            enabled = _as_bool(_cfg(self._app, "watch_enabled", True), True)
+            ok_now, why = mkt.should_watch_now()
+            st = mkt.trading_status()
+        except Exception:
+            return ""
+        if not enabled:
+            return ("\n\n⏸ **盯盘已暂停**　到「设置 → 插件 → A股助手」点"
+                    "「启动 / 暂停盯盘」恢复")
+        if ok_now:
+            return f"\n\n🟢 **正在盯盘**（{st['phase']}）"
+        return (f"\n\n⚪ **当前不盯盘**：{why}　下次 {mkt.next_watch_window()}"
+                f"\n\n　时段自律：工作日 9:10–15:00，午休跳过，收盘自动停")
 
     def _panel_tree(self, d: Dict[str, Any], flag: str) -> str:
         """lite-tree 决策树形态：一只股一张卡，卡内写触发规则与建议动作。
@@ -1517,7 +1944,8 @@ class AstockPlugin(ToolPlugin):
         positions = d["positions"][:MAX_ROWS]
         if not positions:
             return ("**0 只持仓**｜当前空仓\n\n"
-                    "录入成交：`astock_record side=buy code=... price=... shares=...`")
+                    "录入成交：`astock_record side=buy code=... price=... shares=...`\n\n"
+                    + self._panel_watch_line())
         cfg = self._hints_cfg()
         total_mv = d["total_market_value"] or 0
         cards: List[Dict[str, Any]] = []
@@ -1562,7 +1990,9 @@ class AstockPlugin(ToolPlugin):
                          f"今日 {_f(d['today_pnl'])}",
                          f"可用 {_money(d['cash'])}"],
                 "chips": ([flag.split("：")[0].replace("*", "").strip()]
-                          if flag else []) + ["每 5 秒刷新"],
+                          if flag else []) + [
+                    "盯盘中" if mkt.should_watch_now()[0] else mkt.next_watch_window(),
+                    "每 5 秒刷新"],
             },
             "trees": cards,
             "total": len(cards),
