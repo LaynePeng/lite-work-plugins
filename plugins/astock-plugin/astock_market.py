@@ -242,6 +242,11 @@ def _now_cn() -> _dt.datetime:
         _dt.timezone(_dt.timedelta(hours=8)))
 
 
+def now_cn() -> _dt.datetime:
+    """公共版：北京时间。盯梢等外部模块需要"当前 A 股时间"时用它。"""
+    return _now_cn()
+
+
 def is_trading_day(day: Optional[_dt.date] = None) -> bool:
     """粗判交易日：仅排除周六日。法定节假日/调休需要外部日历，
     因此行情返回的 `trade_time` 才是"是否最新"的最终依据（见 astock_data）。"""

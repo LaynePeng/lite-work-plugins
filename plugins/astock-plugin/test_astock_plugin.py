@@ -934,7 +934,146 @@ class TestPlanStore(unittest.TestCase):
             self.ledger.save_plan({"code": "600000", "side": "short"})
 
 
+class TestWatchOptimizations(unittest.TestCase):
+    """盯梢的炒股场景优化：分级 / 条件单去重 / A 股时段信号。"""
+
+    def setUp(self):
+        import tempfile, datetime as dt
+        self.tmp = tempfile.mkdtemp(prefix="astock-wopt-")
+        self.path = os.path.join(self.tmp, "l.sqlite")
+        self.ledger = ledger_mod(self.path)
+        yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        self.ledger.record_trade("600000", "buy", 10.0, 1000,
+                                 trade_date=yday, name="浦发银行")
+        self.watch = astock.AStockWatch()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ctx(self, extra=None):
+        cfg = {"ledger_path": self.path, "watch_enabled": True,
+               "watch_only_trading_hours": False}
+        if extra:
+            cfg.update(extra)
+        return types.SimpleNamespace(
+            config={"astock-plugin": cfg}, workspace=self.tmp)
+
+    def _quote(self, price=8.8, prev=9.9, open_=9.0, chg=None):
+        from astock_data import Quote
+        return Quote(code="600000", venue="sh", name="浦发银行", price=price,
+                     prev_close=prev, open=open_,
+                     limit_up=round(prev * 1.1, 2), limit_down=round(prev * 0.9, 2),
+                     change_pct=chg if chg is not None else
+                     round((price - prev) / prev * 100, 2))
+
+    def _probe(self, quotes, extra=None):
+        import asyncio
+        from unittest.mock import patch
+        import astock_data as d
+        with patch.object(d, "fetch_quotes", lambda items, use_cache=True: quotes):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(self.watch.probe({}, self._ctx(extra)))
+            finally:
+                loop.close()
+
+    # ---------- 条件单去重：已挂的止损不该再催 ----------
+
+    def test_stop_loss_reported_without_plan(self):
+        res = self._probe([self._quote()])
+        self.assertIn("stop_loss", res.snapshot)
+
+    def test_stop_loss_silenced_when_plan_has_stop(self):
+        """挂了止损条件单后，券商会自动执行，插件再喊等于重复催办。"""
+        self.ledger.save_plan({"code": "600000", "side": "sell", "price": 9.5,
+                               "shares": 1000, "stop_loss": 9.2})
+        res = self._probe([self._quote()])
+        self.assertNotIn("stop_loss", res.snapshot)
+
+    def test_take_profit_silenced_when_plan_has_tp(self):
+        self.ledger.save_plan({"code": "600000", "side": "sell", "price": 9.5,
+                               "shares": 1000, "take_profit": 11.5})
+        res = self._probe([self._quote(price=11.6, prev=11.5, open_=11.5)])
+        self.assertNotIn("take_profit", res.snapshot)
+
+    def test_plan_for_other_code_does_not_silence(self):
+        self.ledger.save_plan({"code": "000001", "side": "sell", "price": 10,
+                               "shares": 100, "stop_loss": 9.0})
+        res = self._probe([self._quote()])
+        self.assertIn("stop_loss", res.snapshot)
+
+    # ---------- 分级过滤 ----------
+
+    def test_min_level_urgent_filters_action(self):
+        """urgent 档只报紧急信号（止损），普通异动被过滤。"""
+        res = self._probe([self._quote()], extra={"min_level": "urgent"})
+        self.assertIn("stop_loss", res.snapshot)
+        self.assertNotIn("event", res.snapshot)
+
+    def test_min_level_info_reports_all(self):
+        res = self._probe([self._quote()], extra={"min_level": "info"})
+        self.assertIn("stop_loss", res.snapshot)
+        self.assertIn("event", res.snapshot)
+
+    # ---------- A 股时段信号 ----------
+
+    def test_auction_signal_only_in_window(self):
+        from unittest.mock import patch
+        import datetime as dt
+        with patch.object(mkt, "now_cn",
+                          return_value=dt.datetime(2026, 10, 23, 9, 20)):
+            res = self._probe([self._quote(price=10.1, prev=9.9)])
+        self.assertIn("auction", res.snapshot)
+
+    def test_auction_not_reported_outside_window(self):
+        from unittest.mock import patch
+        import datetime as dt
+        with patch.object(mkt, "now_cn",
+                          return_value=dt.datetime(2026, 10, 23, 11, 0)):
+            res = self._probe([self._quote(price=10.1, prev=9.9)])
+        self.assertNotIn("auction", res.snapshot)
+
+    def test_tail_signal_has_upper_bound(self):
+        """尾盘信号不能越过 15:00——否则收盘后、深夜还报"尾盘异动"（踩过）。"""
+        from unittest.mock import patch
+        import datetime as dt
+        cases = [(dt.datetime(2026, 10, 23, 14, 40), True),
+                 (dt.datetime(2026, 10, 23, 14, 59), True),
+                 (dt.datetime(2026, 10, 23, 15, 5), False),
+                 (dt.datetime(2026, 10, 23, 20, 0), False)]
+        for when, expect in cases:
+            with patch.object(mkt, "now_cn", return_value=when):
+                res = self._probe([self._quote(price=8.8, prev=9.9)])
+            self.assertEqual("tail" in res.snapshot, expect, f"{when} 期望 {expect}")
+
+    def test_gap_signal_detected_at_open(self):
+        from unittest.mock import patch
+        import datetime as dt
+        with patch.object(mkt, "now_cn",
+                          return_value=dt.datetime(2026, 10, 23, 9, 40)):
+            res = self._probe([self._quote(price=9.0, prev=9.9, open_=9.0)])
+        self.assertIn("gap", res.snapshot)
+
+    def test_kinds_filter_excludes_session_signal(self):
+        from unittest.mock import patch
+        import datetime as dt
+        with patch.object(mkt, "now_cn",
+                          return_value=dt.datetime(2026, 10, 23, 9, 20)):
+            res = self._probe([self._quote(price=10.1, prev=9.9)],
+                              extra={"kinds": "stop_loss"})
+        self.assertNotIn("auction", res.snapshot)
+
+    # ---------- 指纹稳定性 ----------
+
+    def test_same_signals_same_fingerprint(self):
+        a = self._probe([self._quote()])
+        b = self._probe([self._quote()])
+        self.assertEqual(a.fingerprint(), b.fingerprint())
+
+
 class TestPanelRender(unittest.TestCase):
+    """右栏面板：两种形态都要能渲染，且失败时降级而不是崩。"""
 
     def setUp(self):
         import tempfile

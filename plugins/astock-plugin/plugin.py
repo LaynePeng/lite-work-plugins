@@ -239,16 +239,33 @@ def _table(headers: List[str], rows: List[List[Any]]) -> str:
 
 
 class AStockWatch(WatchSource):
-    """盯梢源：持仓/自选股出现**异动**时才唤醒 Agent。
+    """盯梢源：只在**值得你动手**时唤醒 Agent（为炒股场景专门优化）。
 
-    关键设计：`snapshot` 里**只放触发信号**（"600000:stop_loss" 这样的标签），
-    不放价格。价格每秒都在变，放进去会导致每次探测都被判为"有变化"，
-    等于每 5 分钟白烧一次 LLM。信号集合变化才是真正值得叫醒用户的时刻。
+    ── 关键设计：snapshot 只放信号标签，不放价格 ──
+    价格每秒都在变，放进去会让每次探测都判为"有变化"，等于每 5 分钟白烧
+    一次 LLM。只有信号集合变化才真正值得叫醒你。
 
-    配置（计划编辑器里填）：
-        codes      额外盯的代码，逗号分隔（默认盯台账里的持仓 + 自选股）
-        kinds      要盯的信号类型，逗号分隔；默认
-                   stop_loss,take_profit,trailing,limit_up,limit_down,event
+    ── 四项炒股专属优化 ──
+    ① **A 股时段信号**（通用"当日涨跌%"覆盖不到）：
+       auction 集合竞价异动（9:15–9:30，反映隔夜消息）
+       gap     开盘跳空（9:30–10:00，常对应消息面）
+       tail    尾盘异动（14:30–15:00，资金明确表态，比盘中波动可信）
+       每个时段信号都有**上界**——收盘后不会再报"尾盘异动"。
+    ② **条件单去重**：你按建议挂了止损/止盈条件单后券商会自动执行，
+       插件不再重复喊同一件事（否则等于催办，还淹没真正的新信号）。
+    ③ **分级报告**：min_level 控制打扰程度——
+       urgent 只报紧急（跌停/止损/自选股大跌）、action 默认、info 全报。
+    ④ **配置双源合并**：计划的 probe_config 优先，其次插件设置页；
+       单条计划可临时覆盖全局阈值。
+
+    ── 交易时段自律 ──
+    非交易时段（周末/午休/收盘后）探针直接返回空快照 → **零 token**。
+    见 astock_market.should_watch_now()。
+
+    配置（计划编辑器里填，均可留空）：
+        codes      额外盯的代码（默认＝台账持仓 + 自选股）
+        kinds      要盯的信号类型，逗号分隔（默认全部 9 种）
+        min_level  最低报告级别：urgent / action / info（默认 action）
     """
 
     name = "astock-watch"
@@ -259,11 +276,15 @@ class AStockWatch(WatchSource):
     probe_interval_hint = 300
     config_schema = {
         "codes": "额外盯的代码，逗号分隔（留空＝台账里的持仓+自选股）",
-        "kinds": "要盯的信号类型，逗号分隔（默认止损/止盈/回撤/涨跌停/异动）",
+        "kinds": ("要盯的信号类型，逗号分隔。可选：stop_loss/take_profit/trailing/"
+                  "limit_up/limit_down/event（通用）+ auction（集合竞价异动）/"
+                  "gap（开盘跳空）/tail（尾盘异动）。默认全部"),
+        "min_level": ("最低报告级别：urgent 只报紧急（跌停/止损）｜action 默认"
+                      "（含止盈/超仓位/异动）｜info 全部。想少被打扰就设 urgent"),
     }
 
     DEFAULT_KINDS = ("stop_loss", "take_profit", "trailing", "limit_up",
-                     "limit_down", "event")
+                     "limit_down", "event", "auction", "gap", "tail")
 
     async def probe(self, cfg: Dict[str, Any], ctx: Any) -> Any:
         own = (ctx.config or {}).get(PLUGIN_NAME) if isinstance(ctx.config, dict) else {}
@@ -294,8 +315,19 @@ class AStockWatch(WatchSource):
         except Exception as exc:  # 台账打不开不该让盯梢变"有变化"
             return ProbeResult(ok=False, error=f"台账读取失败：{exc}")
 
-        cfg_codes = [c.strip() for c in str(cfg.get("codes") or "").replace("，", ",").split(",") if c.strip()]
-        want_kinds = {k.strip() for k in str(cfg.get("kinds") or "").replace("，", ",").split(",") if k.strip()} \
+        # 配置来源分两层，**两处都认**（cfg 优先）：
+        #   - cfg：计划编辑器里的 probe_config（单条计划专属，如临时只盯某几只）
+        #   - own：插件设置页 config["astock-plugin"]（全局默认）
+        # 只读一处会导致"设置页改了不生效"或"计划里改了不生效"的困惑，
+        # 而这两种诉求都合理（全局阈值 vs 单计划覆盖）。
+        def pick(key: str, default: Any = "") -> Any:
+            v = cfg.get(key)
+            if v in (None, ""):
+                v = own.get(key)
+            return default if v in (None, "") else v
+
+        cfg_codes = [c.strip() for c in str(pick("codes") or "").replace("，", ",").split(",") if c.strip()]
+        want_kinds = {k.strip() for k in str(pick("kinds") or "").replace("，", ",").split(",") if k.strip()} \
             or set(self.DEFAULT_KINDS)
 
         positions = {p["code"]: p for p in ledger.list_positions()}
@@ -335,27 +367,47 @@ class AStockWatch(WatchSource):
 
         signals: List[str] = []
         detail_lines: List[str] = []
+        # 已挂条件单的持仓：止损/止盈已交给券商自动执行，**不必再喊**
+        covered = self._conditional_covered(ledger, positions)
+        min_level = str(pick("min_level", "action")).strip().lower()
+        level_rank = {"info": 0, "action": 1, "urgent": 2}
+        floor = level_rank.get(min_level, 1)
+
         for q in quotes:
             pos = positions.get(q.code)
             qd = q.as_dict()
             if not pos:
-                # 自选股：只看当日异动与涨跌停
+                # 自选股：只看当日异动与涨跌停。
+                # 分级口径必须与持仓分支一致（早先漏了这里，导致 min_level=urgent
+                # 时自选股的普通异动照样报出来——见 test_min_level_urgent_filters）
                 if q.limit_up and q.price and abs(q.price - q.limit_up) < 0.005:
-                    sig = "limit_up"
+                    sig, lvl = "limit_up", "action"
                 elif q.limit_down and q.price and abs(q.price - q.limit_down) < 0.005:
-                    sig = "limit_down"
+                    sig, lvl = "limit_down", "urgent"
                 else:
                     chg = q.change_pct or 0
                     sig = "event" if abs(chg) >= hcfg.drop_alert_pct else ""
-                if sig and sig in want_kinds:
+                    # 自选股大跌到 -5% 以上算紧急（可能是消息面），否则只算 action
+                    lvl = "urgent" if (chg or 0) <= -abs(hcfg.drop_alert_pct) else "action"
+                if sig and sig in want_kinds and level_rank.get(lvl, 1) >= floor:
                     signals.append(f"{q.code}:{sig}")
                     detail_lines.append(f"- {q.name}({q.code}) {sig}：现价 {q.price}（{_pct(q.change_pct)}）")
                 continue
             hs = hints.build_position_hints(pos, qd, hcfg)
             for h in hs:
-                if h.kind in want_kinds:
-                    signals.append(f"{q.code}:{h.kind}")
-                    detail_lines.append(f"- {h.title}｜{h.suggestion}")
+                if h.kind not in want_kinds:
+                    continue
+                # 条件单已覆盖的止损/止盈：不报（否则等于催你重复操作）
+                if h.kind in covered.get(q.code, ()): 
+                    continue
+                if level_rank.get(h.severity, 1) < floor:
+                    continue
+                signals.append(f"{q.code}:{h.kind}")
+                detail_lines.append(f"- {h.title}｜{h.suggestion}")
+
+        # A 股专属时段信号（集合竞价 / 尾盘 / 跳空）——只在对应时刻产生
+        signals.extend(self._session_signals(quotes, positions, want_kinds,
+                                            detail_lines))
 
         snapshot = "\n".join(sorted(signals))
         if not snapshot:
@@ -364,6 +416,99 @@ class AStockWatch(WatchSource):
             snapshot=snapshot,
             summary=f"{len(signals)} 条异动信号",
             changed_hint="信号变化：\n" + "\n".join(detail_lines[:10]))
+
+    # -------------------------------------------------- 盯梢辅助
+
+    def _conditional_covered(self, ledger: Any,
+                             positions: Dict[str, Dict[str, Any]]) -> Dict[str, set]:
+        """查出"已挂条件单"的持仓 → {code: {已覆盖的信号类型}}。
+
+        **为什么必须做**：用户按建议挂了止损条件单后，券商会自动执行；
+        插件再喊"该止损"属于重复催办——既无意义，又会把真正的新信号淹没。
+        判定口径：存在 pending 计划且计划里带了对应触发价。
+        """
+        covered: Dict[str, set] = {}
+        try:
+            plans = ledger.list_plans(status="pending", limit=200)
+        except Exception:
+            return covered
+        for p in plans:
+            code = str(p.get("code") or "")
+            if code not in positions:
+                continue
+            kinds = covered.setdefault(code, set())
+            if p.get("stop_loss"):
+                kinds.add("stop_loss")
+            if p.get("take_profit"):
+                kinds.add("take_profit")
+            if p.get("trailing"):
+                kinds.add("trailing")
+        return covered
+
+    def _session_signals(self, quotes: List[Any],
+                         positions: Dict[str, Dict[str, Any]],
+                         want_kinds: set,
+                         detail_lines: List[str]) -> List[str]:
+        """A 股专属的时段信号：集合竞价异动 / 开盘跳空 / 尾盘异动。
+
+        为什么这几个必须单列（通用"当日涨跌 %"覆盖不到）：
+        - **集合竞价（9:15–9:25）**：开盘价在此形成，此时的价格反映隔夜消息，
+          是一天里最该看一眼的时刻；而当日涨跌幅在这时还没意义（基准是昨收，
+          但撮合未完）； 
+        - **开盘跳空**：跳空高开/低开超过阈值，往往对应消息面，需要判断是
+          "利好兑现"还是"错杀"；
+        - **尾盘（14:30 后）**：尾盘异动常是资金明确表态，比盘中波动更可信。
+        """
+        import datetime as _d
+        out: List[str] = []
+        try:
+            now = mkt.now_cn()
+        except Exception:
+            now = _d.datetime.now()
+        hhmm = now.strftime("%H:%M")
+
+        # 每个时段信号都必须有**上界**：收盘后 hhmm 仍满足 >= "14:30"，
+        # 不加 "15:00" 上界会让"尾盘异动"在收盘后、深夜照样产生（实测踩到：
+        # 周末 15 点后仍报 tail）。时段信号的意义就在于"正在发生时提醒"。
+        in_auction = "09:15" <= hhmm < "09:30"
+        in_tail = "14:30" <= hhmm < "15:00"
+        gap_pct = 1.0     # 跳空阈值（%），保守：1% 以上才算"明显跳空"
+
+        for q in quotes:
+            qd = q.as_dict()
+            prev = qd.get("prev_close")
+            price = qd.get("price")
+            name = qd.get("name") or q.code
+            if not prev or not price:
+                continue
+            # ① 集合竞价异动（只在 9:15–9:30 产生）
+            if in_auction and "auction" in want_kinds:
+                chg = (price - prev) / prev * 100.0
+                if abs(chg) >= gap_pct:
+                    out.append(f"{q.code}:auction")
+                    detail_lines.append(
+                        f"- {name}({q.code}) 集合竞价{'高开' if chg > 0 else '低开'} "
+                        f"{chg:+.2f}%：竞价价 {price:.2f}（昨收 {prev:.2f}）")
+            # ② 开盘跳空（9:30–10:00 内判断，避免全天重复）
+            if "09:30" <= hhmm < "10:00" and "gap" in want_kinds:
+                open_p = qd.get("open") or price
+                chg = (open_p - prev) / prev * 100.0
+                if abs(chg) >= gap_pct * 2:      # 跳空门槛更高：2%
+                    out.append(f"{q.code}:gap")
+                    detail_lines.append(
+                        f"- {name}({q.code}) {'跳空高开' if chg > 0 else '跳空低开'} "
+                        f"{chg:+.2f}%（开盘 {open_p:.2f} / 昨收 {prev:.2f}）")
+            # ③ 尾盘异动（14:30 后）
+            if in_tail and "tail" in want_kinds:
+                chg = (price - prev) / prev * 100.0
+                if abs(chg) >= 3.0:
+                    pos = positions.get(q.code)
+                    tag = "持仓" if pos else "自选"
+                    out.append(f"{q.code}:tail")
+                    detail_lines.append(
+                        f"- {name}({q.code}) 尾盘{'拉升' if chg > 0 else '跳水'} "
+                        f"{chg:+.2f}%（{tag}），现价 {price:.2f}")
+        return out
 
 
 # ---------------------------------------------------------------- 插件主体
