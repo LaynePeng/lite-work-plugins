@@ -544,6 +544,19 @@ class TestPluginSurface(unittest.TestCase):
             "astock_sentiment", "astock_events", "astock_sync", "astock_watch",
         })
 
+    def test_command_names_are_prefixed(self):
+        """斜杠命令必须带 astock- 前缀。
+
+        斜杠命令是宿主全局命名空间，裸名（如 events）易与内置/其他插件的
+        命令撞车——前缀化即归属声明（v1.7.0 起）。
+        """
+        cmds = self.plugin.contributes["commands"]
+        self.assertTrue(cmds, "命令声明为空")
+        for c in cmds:
+            self.assertTrue(c["name"].startswith("astock-"),
+                            f"命令未加前缀：{c['name']}")
+            self.assertTrue(c.get("description"), c["name"])
+
     def test_all_tools_have_schema(self):
         for t in self.plugin.get_tools():
             self.assertEqual(t.parameters.get("type"), "object", t.name)
@@ -1201,6 +1214,18 @@ class TestPanelRender(unittest.TestCase):
         out = pl.panel_content("portfolio", {})
         self.assertIn("台账读取失败", out)     # 不能把面板打空白或抛异常
         self.assertIn("台账炸了", out)
+
+    def test_status_section_separated_from_data(self):
+        """盯盘/舆情状态行集中到独立小节，不与数据块粘连。
+
+        回归背景：状态行此前直接 append 到输出末尾，与「自选观察」表
+        粘成一片、两条状态之间也无分隔（v1.7.0 起用 ── 分隔线拉开层次）。
+        """
+        pl = self._snapshot_stub(self._plugin("markdown"))
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("──", out)
+        # 分隔线在状态行（盯盘）之前：数据在上、状态在下
+        self.assertLess(out.index("──"), out.index("盯盘"))
 
     def test_sentiment_failure_does_not_blank_panel(self):
         """舆情接口挂了，面板仍要显示持仓（舆情只是附加信息）。"""

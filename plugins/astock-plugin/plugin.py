@@ -711,7 +711,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.6.2"
+    version = "1.7.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -813,21 +813,23 @@ class AstockPlugin(ToolPlugin):
         "commands": [
             # 命令名英文：输入框打 / 后处于英文输入态，中文命令要先切输入法（打断）。
             # 描述保留中文（命令面板说明的受众是用户）。
-            {"name": "hold",
+            # 命令名一律带 astock- 前缀：斜杠命令是宿主全局命名空间，裸名
+            # （如 events）易与内置/其他插件的命令撞车，前缀化即归属声明。
+            {"name": "astock-hold",
              "description": "看持仓：调 astock_portfolio 出看板（现价/浮盈/信号）",
              "argsHint": ""},
-            {"name": "senti",
+            {"name": "astock-senti",
              "description": "跑组合舆情报告：调 astock_sentiment code=portfolio"
                             "（持仓+自选全量，背离/同向清单+事件推荐+健康检查）",
              "argsHint": "[个股代码=只看一只]"},
-            {"name": "hint",
+            {"name": "astock-hint",
              "description": "下单提示：调 astock_hint（该不该动/动多少/条件单参数）",
              "argsHint": "[代码]"},
-            {"name": "events",
+            {"name": "astock-events",
              "description": "事件驱动筛股：调 astock_events（快讯硬事件→个股关联"
                             "→资金印证→背离标记，只列事实不预测）",
              "argsHint": "[类型:回购|中标|预增|重组|增持|获批|分红|利空]"},
-            {"name": "watch",
+            {"name": "astock-watch",
              "description": "盯盘开关与状态：调 astock_watch action=status",
              "argsHint": "[start|stop]"},
         ],
@@ -2517,8 +2519,11 @@ class AstockPlugin(ToolPlugin):
         head = self._panel_head(d)
         watch_line = self._panel_watch_line()
         if not d["positions"]:
-            return head + ("\n\n当前空仓。录入成交："
-                           "`astock_record side=buy code=... price=... shares=...`") + watch_line
+            empty = head + ("\n\n当前空仓。录入成交："
+                            "`astock_record side=buy code=... price=... shares=...`")
+            if watch_line.strip():
+                empty += "\n\n──\n\n" + watch_line.strip()
+            return empty
 
         # ── KPI 卡：先回答"我的钱怎么样了" ──
         equity = (d.get("total_market_value") or 0) + (d.get("cash") or 0)
@@ -2580,9 +2585,13 @@ class AstockPlugin(ToolPlugin):
             out.append(_table(["名称", "现价", "涨跌", "日低", "日高"], rows))
             out.append("")
 
-        out.append(watch_line.strip() if watch_line.strip() else "")
-        if flag:
-            out.append(flag)
+        # ── 状态区：盯盘状态 + 舆情速查集中到独立小节，与前文的持仓/自选
+        #    数据块拉开层次（此前直接 append 到输出末尾，与「自选观察」表
+        #    粘成一片，两条状态之间也无分隔——无层次无设计）。
+        status_lines = [x.strip() for x in (watch_line, flag) if x and x.strip()]
+        if status_lines:
+            out.append("──")
+            out.extend(status_lines)
         return "\n".join(x for x in out if x is not None).rstrip() + "\n"
 
     def _pnl_pct_of(self, d: Dict[str, Any]) -> str:
@@ -2598,6 +2607,8 @@ class AstockPlugin(ToolPlugin):
 
         宿主面板是**只读**的（Markdown / lite-tree 都点不了），按钮只能放
         设置页——所以这里必须明确告诉用户点哪里，否则他会以为看板上能点。
+        行首不再自帶 \n\n（空仓位分支手工拼接用），由调用方决定分隔——
+        状态区统一用 `──` 分隔线与数据块拉开层次。
         """
         try:
             enabled = _as_bool(_cfg(self._app, "watch_enabled", True), True)
@@ -2606,12 +2617,12 @@ class AstockPlugin(ToolPlugin):
         except Exception:
             return ""
         if not enabled:
-            return ("\n\n⏸ **盯盘已暂停**　到「设置 → 插件 → A股助手」点"
+            return ("⏸ **盯盘已暂停**　到「设置 → 插件 → A股助手」点"
                     "「启动 / 暂停盯盘」恢复")
         if ok_now:
-            return f"\n\n🟢 **正在盯盘**（{st['phase']}）"
-        return (f"\n\n⚪ **当前不盯盘**：{why}　下次 {mkt.next_watch_window()}"
-                f"\n\n　时段自律：工作日 9:10–15:00，午休跳过，收盘自动停")
+            return f"🟢 **正在盯盘**（{st['phase']}）"
+        return (f"⚪ **当前不盯盘**：{why}　下次 {mkt.next_watch_window()}"
+                f"\n　时段自律：工作日 9:10–15:00，午休跳过，收盘自动停")
 
     def _panel_tree(self, d: Dict[str, Any], flag: str) -> str:
         """lite-tree 决策树形态：一只股一张卡，卡内写触发规则与建议动作。
@@ -2637,9 +2648,10 @@ class AstockPlugin(ToolPlugin):
 
         positions = d["positions"][:MAX_ROWS]
         if not positions:
+            wl = self._panel_watch_line().strip()
             return ("**0 只持仓**｜当前空仓\n\n"
-                    "录入成交：`astock_record side=buy code=... price=... shares=...`\n\n"
-                    + self._panel_watch_line())
+                    "录入成交：`astock_record side=buy code=... price=... shares=...`"
+                    + (f"\n\n──\n\n{wl}" if wl else ""))
         cfg = self._hints_cfg()
         total_mv = d["total_market_value"] or 0
         cards: List[Dict[str, Any]] = []
