@@ -1643,8 +1643,11 @@ class TestEmailNotify(unittest.TestCase):
             return "me@test.com", "secret-token", "oauth2", ""
 
         m._auth_material = _auth_material
-        m._own_cfg = lambda app: {"smtp_host": "smtp.test.com", "smtp_port": 465,
-                                  "smtp_tls": "ssl"}
+        m._own_cfg = lambda app: {"email_from": ""}
+        # 真实 email-plugin 用 _oauth_conf() 展开服务商预设
+        # （主机/端口/加密方式）；astock 必须调它，不能读配置原始键
+        m._oauth_conf = lambda app: {"smtp_host": "smtp.test.com",
+                                     "smtp_port": 465, "smtp_tls": "ssl"}
         m._build_msg = (lambda frm, to, cc, bcc, subj, body, html, att, headers=None:
                         {"to": list(to), "subject": subj, "body": body})
         m._smtp_send = (lambda h, p, u, s, f, msg, auth_mode="basic", smtp_tls="ssl":
@@ -1759,8 +1762,9 @@ class TestNotifyIntegration(unittest.TestCase):
         sent = self.sent
         m = types.ModuleType(self.n._EMAIL_MODULE_KEY)
         m._auth_material = lambda app: ("me@test.com", "tok", "basic", "")
-        m._own_cfg = lambda app: {"smtp_host": "smtp.test.com", "smtp_port": 465,
-                                  "smtp_tls": "ssl"}
+        m._own_cfg = lambda app: {}
+        m._oauth_conf = lambda app: {"smtp_host": "smtp.test.com",
+                                     "smtp_port": 465, "smtp_tls": "ssl"}
         m._build_msg = (lambda frm, to, cc, bcc, subj, body, html, att, headers=None:
                         {"to": list(to), "subject": subj, "body": body})
         m._smtp_send = (lambda h, p, u, s, f, msg, auth_mode="basic", smtp_tls="ssl":
@@ -1949,8 +1953,9 @@ class TestSettingsActions(unittest.TestCase):
             return "me@test.com", "tok", "basic", ""
 
         m._auth_material = _auth_material
-        m._own_cfg = lambda app: {"smtp_host": "h", "smtp_port": 465,
-                                  "smtp_tls": "ssl"}
+        m._own_cfg = lambda app: {}
+        m._oauth_conf = lambda app: {"smtp_host": "smtp-mail.outlook.com",
+                                     "smtp_port": 587, "smtp_tls": "starttls"}
         m._build_msg = (lambda frm, to, cc, bcc, subj, body, html, att, headers=None:
                         {"to": list(to), "subject": subj})
         m._smtp_send = (lambda h, p, u, s, f, msg, auth_mode="basic", smtp_tls="ssl":
@@ -2014,6 +2019,82 @@ class TestSettingsActions(unittest.TestCase):
         res = self.plugin.settings_action("no_such_action", self.App.config)
         self.assertFalse(res["ok"])
         self.assertIn("未知动作", res["message"])
+
+
+class TestSmtpParamsFromEmailPlugin(unittest.TestCase):
+    """SMTP 参数必须由 email-plugin 解析，不能直接读配置原始键。
+
+    回归背景（真实报障）：用户用 Hotmail（OAuth2）时发信报
+      SMTPServerDisconnected: Connection unexpectedly closed
+    根因：email-plugin 的配置里存的是「服务商标识」（provider=outlook）
+    与 OAuth 令牌，具体的 smtp_host/smtp_port/smtp_tls 由它的预设表展开
+    （_oauth_conf()）。astock 原先直接读 own["smtp_host"]，拿到空值后回退到
+    "通用默认"（smtp.qq.com:465+ssl）——对 Hotmail 就是连错地址+用错协议，
+    服务器直接断开。
+    """
+
+    def setUp(self):
+        import astock_notify as n
+        self.n = n
+        self._saved = sys.modules.get(n._EMAIL_MODULE_KEY, "MISSING")
+        self.calls: list = []
+
+    def tearDown(self):
+        if self._saved == "MISSING":
+            sys.modules.pop(self.n._EMAIL_MODULE_KEY, None)
+        else:
+            sys.modules[self.n._EMAIL_MODULE_KEY] = self._saved
+
+    def _inject(self, oauth_conf, own_cfg=None):
+        calls = self.calls
+        m = types.ModuleType(self.n._EMAIL_MODULE_KEY)
+        m._auth_material = lambda app: ("me@test.com", "tok", "oauth2", "")
+        m._own_cfg = lambda app: dict(own_cfg or {})
+        m._oauth_conf = lambda app: dict(oauth_conf)
+        m._build_msg = (lambda frm, to, cc, bcc, subj, body, html, att, headers=None:
+                        {"to": list(to), "subject": subj})
+        m._smtp_send = (lambda h, p, u, s, f, msg, auth_mode="basic", smtp_tls="ssl":
+                        calls.append({"host": h, "port": p, "tls": smtp_tls}))
+        sys.modules[self.n._EMAIL_MODULE_KEY] = m
+        return m
+
+    def test_uses_oauth_conf_not_raw_keys(self):
+        """配置里没有 smtp_host（只有 provider），也要拿到正确的服务器。"""
+        self._inject({"smtp_host": "smtp-mail.outlook.com", "smtp_port": 587,
+                      "smtp_tls": "starttls"}, own_cfg={"provider": "outlook"})
+        cfg = self.n.MailConfig(enabled=True, mail_to=["a@x.com"])
+        ok, msg = self.n.Notifier().send(cfg, None, "s", "b")
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.calls[0]["host"], "smtp-mail.outlook.com")
+        self.assertEqual(self.calls[0]["port"], 587)
+        self.assertEqual(self.calls[0]["tls"], "starttls")
+
+    def test_never_falls_back_to_generic_default(self):
+        """关键回归：不能回退到 smtp.qq.com/465/ssl（那正是报障原因）。"""
+        self._inject({"smtp_host": "smtp-mail.outlook.com", "smtp_port": 587,
+                      "smtp_tls": "starttls"})
+        cfg = self.n.MailConfig(enabled=True, mail_to=["a@x.com"])
+        self.n.Notifier().send(cfg, None, "s", "b")
+        self.assertNotEqual(self.calls[0]["host"], "smtp.qq.com")
+        self.assertNotEqual(self.calls[0]["tls"], "ssl")
+
+    def test_missing_host_reports_actionable(self):
+        """解析不出服务器时给可操作提示，而不是硬连默认地址。"""
+        self._inject({"smtp_host": "", "smtp_port": 587, "smtp_tls": "starttls"})
+        cfg = self.n.MailConfig(enabled=True, mail_to=["a@x.com"])
+        ok, msg = self.n.Notifier().send(cfg, None, "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("SMTP 服务器", msg)
+        self.assertEqual(self.calls, [])
+
+    def test_source_does_not_read_raw_smtp_keys(self):
+        """结构性检查：源码里不得再直接读 own 的 smtp_host/port/tls。"""
+        with open(os.path.join(_HERE, "astock_notify.py"), encoding="utf-8") as _f:
+            src = _f.read()
+        self.assertIn("_oauth_conf", src)
+        for bad in ('own.get("smtp_host")', "own.get('smtp_host')",
+                    'own.get("smtp_port")', 'own.get("smtp_tls")'):
+            self.assertNotIn(bad, src, f"仍在直接读配置原始键：{bad}")
 
 
 if __name__ == "__main__":

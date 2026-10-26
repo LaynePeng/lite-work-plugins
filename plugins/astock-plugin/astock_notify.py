@@ -170,10 +170,21 @@ class Notifier:
             if not to:
                 return False, "未配置收件人"
 
+            # SMTP 参数必须让 email-plugin 自己解析，不能直接读配置原始键。
+            # 原因：用户配的是「服务商」（如 outlook/hotmail），具体
+            # smtp_host/smtp_port/smtp_tls 由 email-plugin 的预设表展开
+            # （见其 _oauth_conf()）。直接读 own["smtp_host"] 会拿到空值并
+            # 回退到"通用默认"（smtp.qq.com:465+ssl）——对 Hotmail/Gmail
+            # 这类服务商就是连错地址与协议，服务器直接断开：
+            #   SMTPServerDisconnected: Connection unexpectedly closed
+            conf = mod._oauth_conf(app) if hasattr(mod, "_oauth_conf") else {}
+            host = str((conf or {}).get("smtp_host") or "")
+            port = int((conf or {}).get("smtp_port") or 587)
+            tls = str((conf or {}).get("smtp_tls") or "starttls")
+            if not host:
+                return False, ("email-plugin 未解析出 SMTP 服务器："
+                               "请在其设置页完成邮箱配置（或检查服务商预设）")
             own = mod._own_cfg(app) if hasattr(mod, "_own_cfg") else {}
-            host = str((own or {}).get("smtp_host") or "smtp.qq.com")
-            port = int((own or {}).get("smtp_port") or 465)
-            tls = str((own or {}).get("smtp_tls") or "ssl")
             from_addr = str((own or {}).get("email_from") or user)
 
             msg = mod._build_msg(from_addr, to, [], [], subject, body, html, [])
