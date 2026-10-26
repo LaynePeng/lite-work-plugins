@@ -1073,7 +1073,6 @@ class TestWatchOptimizations(unittest.TestCase):
 
 
 class TestPanelRender(unittest.TestCase):
-    """右栏面板：两种形态都要能渲染，且失败时降级而不是崩。"""
 
     def setUp(self):
         import tempfile
@@ -1615,6 +1614,230 @@ class TestDataLayerOffline(unittest.TestCase):
         self.assertIsNone(to_float(None, None))
         self.assertEqual(to_float("1,234.5", None), 1234.5)
         self.assertIsNone(astock.mkt.to_float("abc", None))
+
+
+class TestEmailNotify(unittest.TestCase):
+    """高风险邮件通知：复用 email-plugin 的发信能力（不自建 SMTP）。"""
+
+    def setUp(self):
+        import astock_notify as n
+        self.n = n
+        self._saved = sys.modules.get(n._EMAIL_MODULE_KEY, "MISSING")
+        self.sent: list = []
+
+    def tearDown(self):
+        if self._saved == "MISSING":
+            sys.modules.pop(self.n._EMAIL_MODULE_KEY, None)
+        else:
+            sys.modules[self.n._EMAIL_MODULE_KEY] = self._saved
+
+    def _fake(self, auth_err=""):
+        sent = self.sent
+        m = types.ModuleType(self.n._EMAIL_MODULE_KEY)
+
+        def _auth_material(app):
+            if auth_err:
+                return "", "", "", auth_err
+            return "me@test.com", "secret-token", "oauth2", ""
+
+        m._auth_material = _auth_material
+        m._own_cfg = lambda app: {"smtp_host": "smtp.test.com", "smtp_port": 465,
+                                  "smtp_tls": "ssl"}
+        m._build_msg = (lambda frm, to, cc, bcc, subj, body, html, att, headers=None:
+                        {"to": list(to), "subject": subj, "body": body})
+        m._smtp_send = (lambda h, p, u, s, f, msg, auth_mode="basic", smtp_tls="ssl":
+                        sent.append({"user": u, "msg": msg, "auth_mode": auth_mode}))
+        return m
+
+    def test_unavailable_without_plugin(self):
+        import unittest.mock as mock
+        sys.modules.pop(self.n._EMAIL_MODULE_KEY, None)
+        with mock.patch.object(self.n, "_find_email_plugin", return_value=None):
+            self.assertFalse(self.n.module_available())
+
+    def test_send_uses_email_plugin(self):
+        sys.modules[self.n._EMAIL_MODULE_KEY] = self._fake()
+        cfg = self.n.MailConfig(enabled=True, mail_to=["a@x.com"])
+        ok, msg = self.n.Notifier().send(cfg, None, "主题", "正文", "<p>h</p>")
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.sent[0]["user"], "me@test.com")
+        self.assertEqual(self.sent[0]["msg"]["to"], ["a@x.com"])
+
+    def test_reuses_oauth2_auth_mode(self):
+        """OAuth2 账号必须能发（自建 SMTP 会丢掉这条能力）。"""
+        sys.modules[self.n._EMAIL_MODULE_KEY] = self._fake()
+        cfg = self.n.MailConfig(enabled=True, mail_to=["a@x.com"])
+        ok, _ = self.n.Notifier().send(cfg, None, "s", "b")
+        self.assertTrue(ok)
+        self.assertEqual(self.sent[0]["auth_mode"], "oauth2")
+
+    def test_fallback_to_self(self):
+        sys.modules[self.n._EMAIL_MODULE_KEY] = self._fake()
+        cfg = self.n.MailConfig(enabled=True, mail_to=[], fallback_to_self=True)
+        ok, _ = self.n.Notifier().send(cfg, None, "s", "b")
+        self.assertTrue(ok)
+        self.assertEqual(self.sent[0]["msg"]["to"], ["me@test.com"])
+
+    def test_missing_credentials_actionable(self):
+        sys.modules[self.n._EMAIL_MODULE_KEY] = self._fake(
+            auth_err="邮箱账号未配置：请在设置页填写")
+        cfg = self.n.MailConfig(enabled=True, mail_to=["a@x.com"])
+        ok, msg = self.n.Notifier().send(cfg, None, "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("凭据不可用", msg)
+
+    def test_dedup_and_reset(self):
+        nt = self.n.Notifier()
+        self.assertTrue(nt.should_send("600000", "stop_loss")[0])
+        nt.mark_sent("600000", "stop_loss")
+        ok, why = nt.should_send("600000", "stop_loss")
+        self.assertFalse(ok)
+        self.assertIn("已提醒过", why)
+        nt.reset_signal("600000", "stop_loss")
+        self.assertTrue(nt.should_send("600000", "stop_loss")[0])
+
+    def test_hourly_cap(self):
+        nt = self.n.Notifier()
+        for i in range(self.n.MAX_MAILS_PER_HOUR):
+            nt.mark_sent("c%d" % i, "event")
+        ok, why = nt.should_send("zzz", "event")
+        self.assertFalse(ok)
+        self.assertIn("上限", why)
+
+    def test_build_mail_config(self):
+        cfg = self.n.build_mail_config({
+            "email_notify_enabled": True, "mail_to": "a@x.com，b@y.com",
+            "email_min_level": "ACTION"})
+        self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.mail_to, ["a@x.com", "b@y.com"])
+        self.assertEqual(cfg.min_level, "action")
+
+    def test_render_subject_and_disclaimer(self):
+        entries = [{"code": "600000", "name": "浦发银行", "severity": "urgent",
+                    "title": "触发止损线", "kind": "stop_loss"}]
+        subject, body = self.n.render_mail(entries, "2026-10-25 10:00")
+        self.assertIn("紧急", subject)
+        self.assertIn("浦发银行", subject)
+        self.assertIn("不构成投资建议", body)
+        self.assertIn("计划外", body)
+
+    def test_render_html_escapes(self):
+        entries = [{"code": "600000", "name": "<script>x</script>",
+                    "severity": "urgent", "title": "t", "kind": "stop_loss"}]
+        html = self.n.render_mail_html(entries, "now")
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
+class TestNotifyIntegration(unittest.TestCase):
+    """盯梢 → 邮件通知 联动（注入假 email-plugin，离线验证）。"""
+
+    def setUp(self):
+        import astock_notify as n
+        self.n = n
+        self._saved = sys.modules.get(n._EMAIL_MODULE_KEY, "MISSING")
+        self.sent: list = []
+        sys.modules[n._EMAIL_MODULE_KEY] = self._fake_module()
+        import tempfile, datetime as dt
+        self.tmp = tempfile.mkdtemp(prefix="astock-notify-")
+        self.path = os.path.join(self.tmp, "l.sqlite")
+        lg = ledger_mod(self.path)
+        yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        lg.record_trade("600000", "buy", 10.0, 1000, trade_date=yday, name="浦发银行")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._saved == "MISSING":
+            sys.modules.pop(self.n._EMAIL_MODULE_KEY, None)
+        else:
+            sys.modules[self.n._EMAIL_MODULE_KEY] = self._saved
+
+    def _fake_module(self):
+        sent = self.sent
+        m = types.ModuleType(self.n._EMAIL_MODULE_KEY)
+        m._auth_material = lambda app: ("me@test.com", "tok", "basic", "")
+        m._own_cfg = lambda app: {"smtp_host": "smtp.test.com", "smtp_port": 465,
+                                  "smtp_tls": "ssl"}
+        m._build_msg = (lambda frm, to, cc, bcc, subj, body, html, att, headers=None:
+                        {"to": list(to), "subject": subj, "body": body})
+        m._smtp_send = (lambda h, p, u, s, f, msg, auth_mode="basic", smtp_tls="ssl":
+                        sent.append(msg))
+        return m
+
+    def _cfg(self, **over):
+        cfg = {"ledger_path": self.path, "watch_enabled": True,
+               "watch_only_trading_hours": False,
+               "email_notify_enabled": True, "mail_to": "boss@x.com",
+               "email_min_level": "urgent"}
+        cfg.update(over)
+        return {"astock-plugin": cfg}
+
+    def _probe(self, quotes, cfg=None, watch=None):
+        import asyncio
+        from unittest.mock import patch
+        import astock_data as d
+        w = watch or astock.AStockWatch()
+        config = cfg or self._cfg()
+        with patch.object(d, "fetch_quotes", lambda items, use_cache=True: quotes):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(w.probe(
+                    {}, types.SimpleNamespace(config=config, workspace=self.tmp)))
+            finally:
+                loop.close()
+
+    def _quote(self, price=8.8, prev=9.9):
+        from astock_data import Quote
+        return Quote(code="600000", venue="sh", name="浦发银行", price=price,
+                     prev_close=prev, open=price,
+                     limit_up=round(prev * 1.1, 2), limit_down=round(prev * 0.9, 2),
+                     change_pct=round((price - prev) / prev * 100, 2))
+
+    def test_urgent_signal_sends_mail(self):
+        res = self._probe([self._quote()])
+        self.assertIn("stop_loss", res.snapshot)
+        self.assertEqual(len(self.sent), 1, "未触发邮件发送")
+        self.assertIn("boss@x.com", self.sent[0]["to"])
+
+    def test_no_app_attribute_regression(self):
+        """回归：AStockWatch 没有 self._app，早先误用会让通知静默失效
+        （异常被 except 吞掉，只在日志留一行 warning，最难发现）。"""
+        w = astock.AStockWatch()
+        self.assertFalse(hasattr(w, "_app"))
+        self.assertTrue(hasattr(w, "_notifier"))     # 状态必须挂在本类
+        res = self._probe([self._quote()], watch=w)
+        self.assertTrue(res.ok)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_disabled_switch_sends_nothing(self):
+        self._probe([self._quote()], cfg=self._cfg(email_notify_enabled=False))
+        self.assertEqual(self.sent, [])
+
+    def test_action_signal_silent_at_urgent(self):
+        # 现价 9.4 / 昨收 9.9 → 当日 -5.05%：触发 event(action)，未到止损(-8%)
+        self._probe([self._quote(price=9.4, prev=9.9)],
+                    cfg=self._cfg(email_min_level="urgent"))
+        self.assertEqual(self.sent, [])
+
+    def test_action_signal_sent_at_action(self):
+        self._probe([self._quote(price=9.4, prev=9.9)],
+                    cfg=self._cfg(email_min_level="action"))
+        self.assertGreaterEqual(len(self.sent), 1)
+
+    def test_same_signal_deduped_across_probes(self):
+        w = astock.AStockWatch()
+        cfg = self._cfg()
+        first = self._probe([self._quote()], cfg=cfg, watch=w)
+        second = self._probe([self._quote()], cfg=cfg, watch=w)
+        self.assertIn("stop_loss", first.snapshot)
+        self.assertIn("stop_loss", second.snapshot)
+        self.assertEqual(len(self.sent), 1, "重复探测不应重发邮件")
+
+    def test_recipient_fallback_to_self(self):
+        self._probe([self._quote()], cfg=self._cfg(mail_to=""))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["to"], ["me@test.com"])
 
 
 if __name__ == "__main__":

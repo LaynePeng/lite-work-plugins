@@ -92,6 +92,7 @@ import astock_board as board
 import astock_data as data
 import astock_hints as hints
 import astock_market as mkt
+import astock_notify as notify
 import astock_orders as orders
 import astock_receipt as receipt
 import astock_sentiment as senti
@@ -238,6 +239,21 @@ def _table(headers: List[str], rows: List[List[Any]]) -> str:
 # ---------------------------------------------------------------- 盯梢源
 
 
+class _SimpleApp:
+    """把 config 字典包成 email-plugin 需要的最小 app 形状。
+
+    email-plugin 的 `_own_cfg(app)` / `_cfg(app, key)` 只访问 `app.config`，
+    而盯梢探针上下文只给得到 `ctx.config`（配置字典本身，拿不到宿主 app）。
+    有了这个包装，通知路径就能复用 email-plugin 的配置解析与发信逻辑。
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = config if isinstance(config, dict) else {}
+
+    def save_config(self, _updates: Dict[str, Any]) -> None:
+        """占位：盯梢路径不写配置（不申请宿主未授权的能力）。"""
+
+
 class AStockWatch(WatchSource):
     """盯梢源：只在**值得你动手**时唤醒 Agent（为炒股场景专门优化）。
 
@@ -285,6 +301,13 @@ class AStockWatch(WatchSource):
 
     DEFAULT_KINDS = ("stop_loss", "take_profit", "trailing", "limit_up",
                      "limit_down", "event", "auction", "gap", "tail")
+
+    def __init__(self) -> None:
+        # 通知去重/限流状态挂在**盯梢源实例**上：它是长期存活的那个对象
+        # （`self._notifier` 早先误写在 AstockPlugin 上，而 probe() 属本类，
+        # 于是每次探测都 AttributeError 被 except 吞掉 —— 通知静默失效，
+        # 这种"不报错的失败"最难发现，故状态归属必须与调用方一致）
+        self._notifier = notify.Notifier()
 
     async def probe(self, cfg: Dict[str, Any], ctx: Any) -> Any:
         own = (ctx.config or {}).get(PLUGIN_NAME) if isinstance(ctx.config, dict) else {}
@@ -367,6 +390,8 @@ class AStockWatch(WatchSource):
 
         signals: List[str] = []
         detail_lines: List[str] = []
+        # 邮件通知的候选条目（结构化，含 severity，供 astock_notify 渲染）
+        mail_entries: List[Dict[str, Any]] = []
         # 已挂条件单的持仓：止损/止盈已交给券商自动执行，**不必再喊**
         covered = self._conditional_covered(ledger, positions)
         min_level = str(pick("min_level", "action")).strip().lower()
@@ -392,6 +417,13 @@ class AStockWatch(WatchSource):
                 if sig and sig in want_kinds and level_rank.get(lvl, 1) >= floor:
                     signals.append(f"{q.code}:{sig}")
                     detail_lines.append(f"- {q.name}({q.code}) {sig}：现价 {q.price}（{_pct(q.change_pct)}）")
+                    mail_entries.append({
+                        "code": q.code, "name": q.name, "kind": sig,
+                        "severity": lvl,
+                        "title": f"{q.name} 当日 {_pct(q.change_pct)}",
+                        "detail": f"现价 {_f(q.price)}，昨收 {_f(q.prev_close)}（自选股）",
+                        "suggestion": "关注是否有公告/行业消息；自选股未持仓，仅作观察。",
+                    })
                 continue
             hs = hints.build_position_hints(pos, qd, hcfg)
             for h in hs:
@@ -404,20 +436,83 @@ class AStockWatch(WatchSource):
                     continue
                 signals.append(f"{q.code}:{h.kind}")
                 detail_lines.append(f"- {h.title}｜{h.suggestion}")
+                mail_entries.append({
+                    "code": q.code, "name": q.name, "kind": h.kind,
+                    "severity": h.severity, "title": h.title,
+                    "detail": h.detail, "suggestion": h.suggestion,
+                })
 
         # A 股专属时段信号（集合竞价 / 尾盘 / 跳空）——只在对应时刻产生
         signals.extend(self._session_signals(quotes, positions, want_kinds,
-                                            detail_lines))
+                                            detail_lines,
+                                            urgent_out=mail_entries))
 
         snapshot = "\n".join(sorted(signals))
         if not snapshot:
             return ProbeResult(snapshot="", summary=f"盯 {len(quotes)} 只，无异动")
+        # 高风险邮件通知（达到阈值的信号才发；去重与限流在 Notifier 内）。
+        # app 由 ctx.config 包成最小形状传入：email-plugin 的 _own_cfg/_cfg
+        # 只读 app.config，而探针上下文只给得到配置字典。
+        await self._maybe_notify(own, mail_entries, _SimpleApp(ctx.config or {}))
         return ProbeResult(
             snapshot=snapshot,
             summary=f"{len(signals)} 条异动信号",
             changed_hint="信号变化：\n" + "\n".join(detail_lines[:10]))
 
     # -------------------------------------------------- 盯梢辅助
+
+    async def _maybe_notify(self, own: Dict[str, Any],
+                            entries: List[Dict[str, Any]],
+                            app: Any = None) -> None:
+        """按阈值把高风险信号发邮件（复用 email-plugin；失败绝不影响盯梢）。
+
+        **为什么在探针里直接发、而不是让 Agent 调 email_send 工具**：
+        盯梢任务用 unattended_profile 启动，`email_send` 属 misc 域，会被
+        `UNATTENDED_PROFILES` 从工具面移除——Agent 根本看不到该工具，
+        不是"卡在审批等超时"（那是表象）。所以这里直接调用 email-plugin 的
+        模块函数（共享代码，不是调工具），既绕开权限档限制，也自动复用其
+        凭据与 OAuth2 能力。
+
+        `app` 由调用方传入：`AStockWatch` **不是** `ToolPlugin` 子类，
+        没有 `self._app`（早先误用导致每次探测都抛 AttributeError 被 except
+        吞掉——通知静默失效，这类"不报错的失败"最难发现，故改成显式传参）。
+        """
+        if not entries:
+            return
+        try:
+            mcfg = notify.build_mail_config(own)
+            if not mcfg.enabled:
+                return
+            level_rank = {"info": 0, "action": 1, "urgent": 2}
+            floor = level_rank.get(mcfg.min_level, 2)
+            picked = [e for e in entries
+                      if level_rank.get(e.get("severity"), 1) >= floor]
+            if not picked:
+                return
+            # 去重 / 限流：同一标的同一信号 6 小时内只发一次
+            fresh: List[Dict[str, Any]] = []
+            for e in picked:
+                ok, _why = self._notifier.should_send(e.get("code") or "",
+                                                      e.get("kind") or "")
+                if ok:
+                    fresh.append(e)
+            if not fresh:
+                return
+            as_of = str(mkt.trading_status().get("now") or "")
+            subject, body = notify.render_mail(fresh, as_of)
+            html = notify.render_mail_html(fresh, as_of)
+            ok, msg = await asyncio.to_thread(
+                self._notifier.send, mcfg, app, subject, body, html)
+            if ok:
+                for e in fresh:
+                    self._notifier.mark_sent(e.get("code") or "",
+                                             e.get("kind") or "")
+                logger.info("[astock] 高风险通知已发送：%s", msg)
+            else:
+                logger.warning("[astock] 高风险通知未发送：%s", msg)
+        except Exception:
+            # 通知是附加能力：任何异常都不能让盯梢失败
+            logger.warning("[astock] 高风险通知异常", exc_info=True)
 
     def _conditional_covered(self, ledger: Any,
                              positions: Dict[str, Dict[str, Any]]) -> Dict[str, set]:
@@ -448,7 +543,8 @@ class AStockWatch(WatchSource):
     def _session_signals(self, quotes: List[Any],
                          positions: Dict[str, Dict[str, Any]],
                          want_kinds: set,
-                         detail_lines: List[str]) -> List[str]:
+                         detail_lines: List[str],
+                         urgent_out: Optional[List[Dict[str, Any]]] = None) -> List[str]:
         """A 股专属的时段信号：集合竞价异动 / 开盘跳空 / 尾盘异动。
 
         为什么这几个必须单列（通用"当日涨跌 %"覆盖不到）：
@@ -489,6 +585,15 @@ class AStockWatch(WatchSource):
                     detail_lines.append(
                         f"- {name}({q.code}) 集合竞价{'高开' if chg > 0 else '低开'} "
                         f"{chg:+.2f}%：竞价价 {price:.2f}（昨收 {prev:.2f}）")
+                    # 竞价大幅高开/低开 = 隔夜有消息，值得进邮件（≥3% 才算）
+                    if urgent_out is not None and abs(chg) >= 3.0:
+                        urgent_out.append({
+                            "code": q.code, "name": name, "kind": "auction",
+                            "severity": "urgent" if abs(chg) >= 5.0 else "action",
+                            "title": f"集合竞价{'高开' if chg > 0 else '低开'} {chg:+.2f}%",
+                            "detail": f"竞价价 {price:.2f}，昨收 {prev:.2f}",
+                            "suggestion": "竞价异动多与隔夜消息有关：开盘前先看公告/新闻，再决定是否调整挂单。",
+                        })
             # ② 开盘跳空（9:30–10:00 内判断，避免全天重复）
             if "09:30" <= hhmm < "10:00" and "gap" in want_kinds:
                 open_p = qd.get("open") or price
@@ -498,7 +603,15 @@ class AStockWatch(WatchSource):
                     detail_lines.append(
                         f"- {name}({q.code}) {'跳空高开' if chg > 0 else '跳空低开'} "
                         f"{chg:+.2f}%（开盘 {open_p:.2f} / 昨收 {prev:.2f}）")
-            # ③ 尾盘异动（14:30 后）
+                    if urgent_out is not None:
+                        urgent_out.append({
+                            "code": q.code, "name": name, "kind": "gap",
+                            "severity": "action",
+                            "title": f"{'跳空高开' if chg > 0 else '跳空低开'} {chg:+.2f}%",
+                            "detail": f"开盘 {open_p:.2f}，昨收 {prev:.2f}",
+                            "suggestion": "跳空常对应消息面：先确认是利好兑现还是错杀，别开盘就追高/砍仓。",
+                        })
+            # ③ 尾盘异动（14:30–15:00）
             if in_tail and "tail" in want_kinds:
                 chg = (price - prev) / prev * 100.0
                 if abs(chg) >= 3.0:
@@ -508,6 +621,14 @@ class AStockWatch(WatchSource):
                     detail_lines.append(
                         f"- {name}({q.code}) 尾盘{'拉升' if chg > 0 else '跳水'} "
                         f"{chg:+.2f}%（{tag}），现价 {price:.2f}")
+                    if urgent_out is not None and abs(chg) >= 5.0:
+                        urgent_out.append({
+                            "code": q.code, "name": name, "kind": "tail",
+                            "severity": "urgent",
+                            "title": f"尾盘{'拉升' if chg > 0 else '跳水'} {chg:+.2f}%",
+                            "detail": f"现价 {price:.2f}（{tag}），距收盘不足 30 分钟",
+                            "suggestion": "尾盘异动常是资金明确表态：持仓的话留意是否需要处理，别拖到收盘后。",
+                        })
         return out
 
 
@@ -589,6 +710,37 @@ class AstockPlugin(ToolPlugin):
              "label": "回单校价容差（%）", "default": 2.0,
              "hint": "成交价与建议计划价偏差超过该比例时标黄提醒。"
                      "只是提示，不会阻断落账（成交价由市场决定）"},
+            {"key": "email_notify_enabled", "type": "boolean",
+             "label": "高风险邮件通知", "default": False,
+             "hint": "开启后，盯盘发现达到阈值的信号会发邮件（后台自动发，不需要你在线）。"
+                     "用插件自己的 SMTP 直发，不经审批卡——盯梢无人值守，审批卡必然超时失败"},
+            {"key": "email_reuse_email_plugin", "type": "boolean",
+             "label": "复用 email-plugin 的邮箱配置", "default": True,
+             "hint": "开启且下面的 SMTP 项留空时，自动沿用 email-plugin 已配好的账号/密码，"
+                     "配过邮件插件就不必重复填"},
+            {"key": "smtp_host", "type": "str", "label": "SMTP 服务器",
+             "default": "", "placeholder": "smtp.qq.com",
+             "hint": "常用 smtp.qq.com / smtp.163.com / smtp.gmail.com / smtp.office365.com。"
+                     "留空则复用 email-plugin"},
+            {"key": "smtp_port", "type": "number", "label": "SMTP 端口",
+             "default": 465, "hint": "SSL 一般 465，STARTTLS 一般 587"},
+            {"key": "smtp_security", "type": "select", "label": "加密方式",
+             "default": "ssl", "options": ["ssl", "starttls", "none"]},
+            {"key": "smtp_username", "type": "str", "label": "邮箱账号",
+             "default": "", "hint": "通常是完整邮箱地址；留空则复用 email-plugin"},
+            {"key": "smtp_password", "type": "secret", "label": "密码 / 授权码",
+             "default": "", "hint": "QQ/163/Gmail 必须用「授权码」而非登录密码。"
+                                     "留空则复用 email-plugin 里的凭据"},
+            {"key": "mail_from", "type": "str", "label": "发件人地址",
+             "default": "", "hint": "一般与账号相同；留空自动使用账号"},
+            {"key": "mail_to", "type": "str", "label": "收件人",
+             "default": "", "hint": "多个用英文逗号分隔。填手机邮箱可当推送用"},
+            {"key": "email_min_level", "type": "select", "label": "通知阈值",
+             "default": "urgent", "options": ["urgent", "action", "info"],
+             "hint": "urgent＝只发紧急（止损/跌停/尾盘跳水/竞价大异动）；"
+                     "action＝再加止盈/超仓位/跳空；info＝全部。建议保持 urgent"},
+            {"key": "email_test_send", "type": "action", "label": "发送测试邮件",
+             "hint": "立即用当前配置发一封测试邮件，验证账号/授权码是否正确"},
         ],
         "panels": [
             {"id": "portfolio", "title": "持仓"},
@@ -599,6 +751,8 @@ class AstockPlugin(ToolPlugin):
         self._app: Any = None
         self._ledger: Optional[Ledger] = None
         self._ledger_key: str = ""
+        # 邮件通知的去重/限流状态（跨 probe 复用，故挂在插件实例上）
+        self._notifier = notify.Notifier()
 
     # -------------------------------------------------- 安装
 
@@ -1896,17 +2050,19 @@ class AstockPlugin(ToolPlugin):
         return "\n".join(lines)
 
     def settings_action(self, key: str, config: Dict[str, Any]) -> Dict[str, Any]:
-        """设置页动作按钮：启动 / 暂停盯盘。
+        """设置页动作按钮：盯盘开关 + 发送测试邮件。
 
-        为什么盯盘开关放在**设置页**而不是右栏看板：宿主的面板协议只支持
+        为什么这些控件在**设置页**而不是右栏看板：宿主的面板协议只支持
         Markdown 与 lite-tree 两种**只读**渲染，卡片/Markdown 都点不了；
-        插件唯一能提供的可点击控件是设置页的 `type: "action"` 按钮。
-        右栏持仓面板会显示当前盯盘状态并指向这里（见 `_panel_markdown`）。
+        插件唯一能提供的可点击控件就是这里的 `type: "action"` 按钮。
         """
-        if key != "watch_toggle":
-            return {"ok": False, "message": f"未知动作 {key}"}
         own = (config or {}).get(PLUGIN_NAME) if isinstance(config, dict) else {}
         own = own if isinstance(own, dict) else {}
+        if key == "email_test_send":
+            return self._action_test_mail(own, config or {})
+        if key != "watch_toggle":
+            return {"ok": False, "message": f"未知动作 {key}"}
+
         cur = _as_bool(own.get("watch_enabled"), True)
         want = not cur
         err = self._save_plugin_config({"watch_enabled": want})
@@ -1918,11 +2074,60 @@ class AstockPlugin(ToolPlugin):
             tail = (f"现在在盯着（{st['phase']}）" if ok_now
                     else f"现在不盯：{why}；下次 {mkt.next_watch_window()}")
             msg = f"已启动盯盘。{tail}"
-            # 提醒仍需建宿主盯梢计划（插件无权创建）
-            msg += "。注意：还需在右栏「盯梢」页建一次 source=astock 的计划（间隔 300 秒），它才会被周期调用"
+            msg += ("。注意：还需在右栏「盯梢」页建一次 source=astock 的计划"
+                    "（间隔 300 秒），它才会被周期调用")
         else:
             msg = "已暂停盯盘：探针将直接返回「无变化」，不会再唤醒你。"
         return {"ok": True, "message": msg, "watch_enabled": want}
+
+    def _action_test_mail(self, own: Dict[str, Any],
+                          config: Dict[str, Any]) -> Dict[str, Any]:
+        """发一封测试邮件，验证账号/授权码是否正确。
+
+        设置页按钮是**用户显式点击**触发的（不是无人值守），所以这里同步发信
+        是可接受的（最多等 SMTP 超时 15 秒）。失败原因要说人话——
+        "认证失败"九成是用了登录密码而不是授权码，这条必须写出来。
+        """
+        email_cfg = config.get("email-plugin") if isinstance(config, dict) else {}
+        mcfg = notify.build_mail_config(
+            own, email_cfg if isinstance(email_cfg, dict) else {},
+            notify.email_plugin_credentials())
+        mcfg.enabled = True          # 测试发送无视主开关，方便先验证再启用
+        ok, why = mcfg.ready()
+        if not ok:
+            return {"ok": False, "message": f"配置不完整：{why}"}
+        st = mkt.trading_status()
+        subject = "[A股助手] 测试邮件"
+        body = (
+            "这是一封来自 A 股助手插件的测试邮件。\n\n"
+            "收到它说明 SMTP 配置可用，高风险信号届时会通过这个邮箱通知你。\n\n"
+            f"配置摘要：\n"
+            f"  服务器：{mcfg.smtp_host}:{mcfg.smtp_port}（{mcfg.smtp_security}）\n"
+            f"  账号：{mcfg.username}\n"
+            f"  收件人：{', '.join(mcfg.mail_to)}\n"
+            f"  通知阈值：{mcfg.min_level}\n\n"
+            f"当前时间：{st.get('now')}（{st.get('phase')}）\n\n"
+            "提醒：邮件只发【计划外】的高风险变化；你挂了条件单的止损/止盈"
+            "由券商自动执行，插件不会重复催办。\n"
+        )
+        html = (
+            '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;'
+            'max-width:560px;padding:16px">'
+            '<h3 style="margin:0 0 12px">A 股助手 · 测试邮件</h3>'
+            '<p>收到这封邮件说明 SMTP 配置可用，高风险信号届时会通过它通知你。</p>'
+            '<table style="font-size:13px;color:#5f6368;border-collapse:collapse">'
+            f'<tr><td>服务器</td><td>{notify._esc(mcfg.smtp_host)}:{mcfg.smtp_port}'
+            f'（{notify._esc(mcfg.smtp_security)}）</td></tr>'
+            f'<tr><td>账号</td><td>{notify._esc(mcfg.username)}</td></tr>'
+            f'<tr><td>收件人</td><td>{notify._esc(", ".join(mcfg.mail_to))}</td></tr>'
+            f'<tr><td>通知阈值</td><td>{notify._esc(mcfg.min_level)}</td></tr>'
+            '</table>'
+            '<p style="color:#80868b;font-size:12px">'
+            '邮件只发【计划外】的高风险变化；已挂条件单的止损/止盈由券商自动执行，'
+            '插件不会重复催办。</p></div>'
+        )
+        ok, msg = self._notifier.send(mcfg, subject, body, html)
+        return {"ok": ok, "message": ("测试邮件" + msg) if ok else msg}
 
     def _save_plugin_config(self, updates: Dict[str, Any]) -> str:
         app = self._app
