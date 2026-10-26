@@ -1150,13 +1150,13 @@ class TestPanelRender(unittest.TestCase):
         labels = [it["label"] for it in kpi["items"]]
         self.assertIn("总资产", labels)
         self.assertIn("可用资金", labels)
-        # progress 围栏：仓位 + 距止损两条
+        # progress 围栏：仓位空间 + 距止损余量两条（v1.7.2 改为「安全余量」语义）
         self.assertIn("```progress", out)
         pr_json = out.split("```progress\n", 1)[1].split("\n```", 1)[0]
         pr = _json.loads(pr_json)
         plabels = [it["label"] for it in pr["items"]]
-        self.assertTrue(any("仓位" in x for x in plabels))
-        self.assertTrue(any("距止损" in x for x in plabels))
+        self.assertTrue(any("仓位空间" in x for x in plabels))
+        self.assertTrue(any("距止损余量" in x for x in plabels))
         # 数值在 0-100 区间
         for it in pr["items"]:
             self.assertGreaterEqual(it["value"], 0)
@@ -1216,16 +1216,95 @@ class TestPanelRender(unittest.TestCase):
         self.assertIn("台账炸了", out)
 
     def test_status_section_separated_from_data(self):
-        """盯盘/舆情状态行集中到独立小节，不与数据块粘连。
+        """盯盘/舆情各自成块不粘连：分割线 + 小标题 + 块间空行。
 
-        回归背景：状态行此前直接 append 到输出末尾，与「自选观察」表
-        粘成一片、两条状态之间也无分隔（v1.7.0 起用 ── 分隔线拉开层次）。
+        回归背景（真实报障两轮）：① 状态行直接 append 到末尾与自选表
+        粘成一片；② v1.7.0 用自造的 `──` 文本当分隔线，markdown 渲染器
+        不认，且盯盘/舆情之间只有单换行——渲染时三行全合并成一行。
+        v1.7.1 改为标准 `---` 分割线 + **盯盘**/**舆情** 各自成块。
         """
         pl = self._snapshot_stub(self._plugin("markdown"))
+        pl._panel_sentiment_flag = lambda d: "🔴 **浦发银行 舆情背离**：研报偏多但融资余额连降"
         out = pl.panel_content("portfolio", {})
-        self.assertIn("──", out)
-        # 分隔线在状态行（盯盘）之前：数据在上、状态在下
-        self.assertLess(out.index("──"), out.index("盯盘"))
+        # 标准 markdown 分割线（不是自造 ──）
+        self.assertIn("\n---\n", out)
+        self.assertNotIn("──", out)
+        # 两块各有小标题，且顺序：盯盘在前、舆情在后
+        self.assertIn("**盯盘**", out)
+        self.assertIn("**舆情**", out)
+        self.assertLess(out.index("**盯盘**"), out.index("**舆情**"))
+        # 块与块之间必须空行分隔（单换行会被渲染器合并成一行）
+        m = __import__("re").search(r"\*\*盯盘\*\*\n\n(.+?)\n\n\*\*舆情\*\*", out, __import__("re").S)
+        self.assertTrue(m, "盯盘块与舆情块之间未用空行分隔")
+        # 数据区在分割线之前：数据在上、状态在下
+        self.assertLess(out.index("浦发银行"), out.index("\n---\n"))
+
+    def test_progress_is_safety_headroom_not_consumed(self):
+        """进度条语义必须是「安全余量」而非「已消耗量」（v1.7.2）。
+
+        回归背景（真实报障）：宿主 progress 色阶固定 <40 红 / ≥80 绿
+        （为健康度设计）。此前喂「已消耗量」：浮亏 -8.06% 触到 8% 止损线
+        → 100% 满条**绿色**——看着最健康实际最危险，语义反转。
+        修复后：触线 = 0（红短条），安全 = 100（绿满条）。
+        """
+        import json as _json
+        pl = self._plugin("markdown")
+        quote = {"price": 8.0, "prev_close": 9.5, "change_pct": -15.8,
+                 "limit_up": 10.45, "limit_down": 8.55}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
+            "total_market_value": 8000.0, "equity": 38000.0, "cash": 30000.0,
+            "float_pnl": -2000.0, "today_pnl": -1500.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        pr_json = out.split("```progress\n", 1)[1].split("\n```", 1)[0]
+        pr = _json.loads(pr_json)
+        stop = next(it for it in pr["items"] if "距止损余量" in it["label"])
+        # 浮亏 20% 超过 8% 止损线 → 余量应为 0（红色短条），不是 100
+        self.assertEqual(stop["value"], 0)
+        # 仓位 100% 超过 25% 上限 → 空间应为 0
+        room = next(it for it in pr["items"] if "仓位空间" in it["label"])
+        self.assertEqual(room["value"], 0)
+        self.assertIn("超限", room["note"])
+
+    def test_watch_quotes_renders_table_when_ok(self):
+        """自选行情正常时必须画出表格（防回归：v1.7.2 曾把表格代码掉进
+        elif 分支，行情正常时只出标题不出表——真实报障「自选观察没有了」）。"""
+        pl = self._plugin("markdown")
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": {"price": 9.5, "change_pct": -1.2}},
+            "watch_quotes": {"600036": {"name": "招商银行", "price": 42.5,
+                                           "change_pct": 1.75, "low": 41.4, "high": 42.5}},
+            "watch_count": 1,
+            "total_market_value": 9500.0, "equity": 39500.0, "cash": 30000.0,
+            "float_pnl": -500.0, "today_pnl": -100.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("自选观察", out)
+        self.assertIn("招商银行（600036）", out)
+        self.assertIn("42.50", out)
+        self.assertIn("| 名称 |", out)   # 表格本身必须在，不能只出标题
+
+    def test_watch_fetch_failure_shows_notice_not_silence(self):
+        """自选行情拉取失败不得静默消失（v1.7.2）。
+
+        回归背景（真实报障）：拉挂时 `if wq:` 跳过整节，用户无从分辨
+        「没自选」还是「拉挂了」。修复后 watch_count>0 且无行情时显式提示。
+        """
+        pl = self._plugin("markdown")
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": {"price": 9.5, "change_pct": -1.2}},
+            "watch_quotes": {}, "watch_count": 5,
+            "total_market_value": 9500.0, "equity": 39500.0, "cash": 30000.0,
+            "float_pnl": -500.0, "today_pnl": -100.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("自选观察", out)
+        self.assertIn("5 只行情未取到", out)
+        self.assertIn("重试", out)
 
     def test_sentiment_failure_does_not_blank_panel(self):
         """舆情接口挂了，面板仍要显示持仓（舆情只是附加信息）。"""

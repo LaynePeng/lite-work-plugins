@@ -711,7 +711,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.7.0"
+    version = "1.7.2"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -1718,6 +1718,7 @@ class AstockPlugin(ToolPlugin):
 
         # 自选股行情（只在需要时打，行情源有限速）
         watch_quotes: Dict[str, Dict[str, Any]] = {}
+        watch_count = 0
         if include_watch:
             held = {p.get("code") for p in positions}
             witems: List[Tuple[str, str, str]] = []
@@ -1730,6 +1731,7 @@ class AstockPlugin(ToolPlugin):
                 except ValueError:
                     continue
                 witems.append((c, venue, "stock"))
+            watch_count = len(witems)      # 面板用：拉不到时显式提示而非静默消失
             if witems:
                 try:
                     for q in data.fetch_quotes(witems):
@@ -1786,6 +1788,7 @@ class AstockPlugin(ToolPlugin):
             "data": {
                 "positions": positions, "quotes": quotes,
                 "watch_quotes": watch_quotes,
+                "watch_count": watch_count,
                 "total_market_value": total_mv, "equity": equity,
                 "cash": float(cash["balance"] or 0),
                 "float_pnl": round(total_float_pnl, 2),
@@ -2493,12 +2496,13 @@ class AstockPlugin(ToolPlugin):
             rep = senti.summarize(collected["items"], top["code"],
                                  top.get("name") or "",
                                  collected["errors"], collected["extras"])
+            label = top.get("name") or top["code"]
             if rep.conflicts:
                 c = rep.conflicts[0]
                 mark = "🔴" if c.severity == "high" else "🟠"
-                return f"{mark} **舆情背离**：{c.title}"
+                return f"{mark} **{label} 舆情背离**：{c.title}"
             if rep.tone != "thin":
-                return f"⚪ 舆情：{senti_tool.render_brief(rep)}"
+                return f"⚪ **{label} 舆情**：{senti_tool.render_brief(rep)}"
         except Exception:
             logger.debug("[astock] 面板舆情速查失败", exc_info=True)
         return ""
@@ -2522,7 +2526,7 @@ class AstockPlugin(ToolPlugin):
             empty = head + ("\n\n当前空仓。录入成交："
                             "`astock_record side=buy code=... price=... shares=...`")
             if watch_line.strip():
-                empty += "\n\n──\n\n" + watch_line.strip()
+                empty += "\n\n---\n\n**盯盘**\n\n" + watch_line.strip()
             return empty
 
         # ── KPI 卡：先回答"我的钱怎么样了" ──
@@ -2557,23 +2561,31 @@ class AstockPlugin(ToolPlugin):
             arrow = "▲" if (chg_pct or 0) > 0 else ("▼" if (chg_pct or 0) < 0 else "—")
             out.append(f"**{p['name'] or p['code']}**　{_f(price)}　{arrow}{_pct(chg_pct)}"
                        f"　{shares}股 · 成本{_f(cost, 3)} · 浮盈{_f(pnl)}（{_pct(pnl_pct)}）")
+            # progress 语义对齐宿主色阶（<40 红 / ≥80 绿，为「健康度」设计）：
+            # 一律喂**安全余量**——越高越安全越绿，触线/超限 = 0% = 红。
+            # 此前喂「已消耗量」（浮亏触到止损线 → 100% 满条**绿色**，看着
+            # 最健康实际最危险——语义反转，真实报障）。
             items: List[Dict[str, Any]] = []
             if total_mv > 0:
                 weight = mv / total_mv * 100
                 cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
-                items.append({"label": f"仓位（上限 {cap:g}%）", "value": round(weight, 1),
-                              "note": "超限" if weight > cap else ""})
+                headroom = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
+                items.append({"label": f"仓位空间（上限 {cap:g}%）",
+                              "value": round(headroom, 1),
+                              "note": (f"现占 {weight:.1f}%" +
+                                       (" · 超限" if weight > cap else ""))})
             stop_pct = abs(float(cfg.stop_loss_pct or 0))
             if pnl_pct is not None and stop_pct > 0:
                 used = max(0.0, min(100.0, -pnl_pct / stop_pct * 100)) if pnl_pct < 0 else 0
-                items.append({"label": f"距止损（阈值 -{stop_pct:g}%）",
-                              "value": round(used, 1),
+                items.append({"label": f"距止损余量（跌破 -{stop_pct:g}% 触发）",
+                              "value": round(100.0 - used, 1),
                               "note": _pct(pnl_pct) if pnl_pct < 0 else "浮盈中"})
             if items:
                 out += ["```progress", _jsonlib.dumps({"items": items}, ensure_ascii=False), "```", ""]
         # ── 自选区（未持仓）：紧凑表 + 备注提示。与聊天看板「无需关注」列对齐——
         #    面板此前只画持仓，自选完全不出现，用户换 tab 看不到候选池。
         wq = d.get("watch_quotes") or {}
+        wcount = int(d.get("watch_count") or 0)
         if wq:
             out.append("**自选观察**（未持仓）")
             rows = []
@@ -2584,14 +2596,26 @@ class AstockPlugin(ToolPlugin):
                              f"{arrow}{_pct(chg)}", _f(q.get("low")), _f(q.get("high"))])
             out.append(_table(["名称", "现价", "涨跌", "日低", "日高"], rows))
             out.append("")
+        elif wcount > 0:
+            # 行情拉取失败不得静默消失（此前 if wq: 直接跳过整节，用户
+            # 无从分辨「没自选」还是「拉挂了」——真实报障：自选表不见了）。
+            # 注意：只出提示行，不再画表（此时没有行情数据可画）。
+            out.append(f"**自选观察**（未持仓）：{wcount} 只行情未取到"
+                       "（接口限流或断网），稍后自动重试")
+            out.append("")
 
-        # ── 状态区：盯盘状态 + 舆情速查集中到独立小节，与前文的持仓/自选
-        #    数据块拉开层次（此前直接 append 到输出末尾，与「自选观察」表
-        #    粘成一片，两条状态之间也无分隔——无层次无设计）。
-        status_lines = [x.strip() for x in (watch_line, flag) if x and x.strip()]
-        if status_lines:
-            out.append("──")
-            out.extend(status_lines)
+        # ── 状态区：盯盘与舆情是两个语义不同的部分，各自成块、各带小标题。
+        #    要点：① 分隔用标准 markdown 分割线 `---`（自造的 `──` 只是普通
+        #    文本，渲染器不认）；② 块内行间用空行分段——单换行会被 markdown
+        #    合并成一行，三行状态就会粘在一起（v1.7.1 修复的真正原因）。
+        blocks: List[str] = []
+        if watch_line.strip():
+            blocks.append("**盯盘**\n\n" + watch_line.strip())
+        if flag and flag.strip():
+            blocks.append("**舆情**\n\n" + flag.strip())
+        if blocks:
+            out += ["", "---", ""]
+            out.append("\n\n".join(blocks))
         return "\n".join(x for x in out if x is not None).rstrip() + "\n"
 
     def _pnl_pct_of(self, d: Dict[str, Any]) -> str:
@@ -2621,8 +2645,9 @@ class AstockPlugin(ToolPlugin):
                     "「启动 / 暂停盯盘」恢复")
         if ok_now:
             return f"🟢 **正在盯盘**（{st['phase']}）"
+        # 块内空行分段：单换行会被 markdown 渲染器合并成一行（v1.7.1）
         return (f"⚪ **当前不盯盘**：{why}　下次 {mkt.next_watch_window()}"
-                f"\n　时段自律：工作日 9:10–15:00，午休跳过，收盘自动停")
+                f"\n\n　时段自律：工作日 9:10–15:00，午休跳过，收盘自动停")
 
     def _panel_tree(self, d: Dict[str, Any], flag: str) -> str:
         """lite-tree 决策树形态：一只股一张卡，卡内写触发规则与建议动作。
@@ -2651,7 +2676,7 @@ class AstockPlugin(ToolPlugin):
             wl = self._panel_watch_line().strip()
             return ("**0 只持仓**｜当前空仓\n\n"
                     "录入成交：`astock_record side=buy code=... price=... shares=...`"
-                    + (f"\n\n──\n\n{wl}" if wl else ""))
+                    + (f"\n\n---\n\n**盯盘**\n\n{wl}" if wl else ""))
         cfg = self._hints_cfg()
         total_mv = d["total_market_value"] or 0
         cards: List[Dict[str, Any]] = []
@@ -2674,10 +2699,14 @@ class AstockPlugin(ToolPlugin):
                 kind = "holding"
                 question = "未触发规则区间"
                 label = f"继续持有（止损 -{cfg.stop_loss_pct}% / 止盈 +{cfg.take_profit_pct}%）"
-            # 刻度①：单票仓位占比 vs 上限（超限转红）
+            # 刻度语义与 markdown 形态对齐（v1.7.2）：一律「安全余量」——
+            # 条越长越安全；触线/超限 → 0 → 短条。此前「已消耗量」画满条
+            # 反而像"很健康"（语义反转）。
+            # 刻度①：仓位空间 = 距上限的余量（超限 = 0）
             weight = (p["shares"] * price / total_mv * 100) if total_mv > 0 else 0.0
             cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
-            # 刻度②：浮亏走到止损阈值前的用量（越满越危险）
+            room = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
+            # 刻度②：距止损余量 = 1 - 浮亏消耗（触线 = 0）
             # 阈值配成 0 ＝ 关闭止损提示，此时不画（避免除零）
             stop_pct = abs(float(cfg.stop_loss_pct or 0))
             used = (max(0.0, min(100.0, -pct / stop_pct * 100.0))
@@ -2687,13 +2716,13 @@ class AstockPlugin(ToolPlugin):
                 {"label": (label or "")[:80], "prob": 1.0,
                  "tone": tone, "chosen": True}]
             if total_mv > 0:
-                opts.append(_scale(f"仓位 {weight:.1f}% / 上限 {cap:g}%",
-                                   weight, "danger" if weight > cap else "alt"))
+                opts.append(_scale(f"仓位空间 {room:.0f}%（现占 {weight:.1f}% / 上限 {cap:g}%）",
+                                   room, "danger" if weight > cap else "alt"))
             if pct is not None and stop_pct > 0:
                 opts.append(_scale(
-                    (f"距止损 −{abs(pct):.1f}% / 阈值 −{stop_pct:g}%"
+                    (f"距止损余量 {100 - used:.0f}%（浮亏 {abs(pct):.1f}% / 阈值 −{stop_pct:g}%）"
                      if pct < 0 else f"浮盈 {pct:+.1f}%（未接近止损）"),
-                    used, "danger" if used >= 100.0 else "alt"))
+                    100.0 - used, "danger" if used >= 100.0 else "alt"))
             cards.append({
                 "title": f"{p['name'] or p['code']}  {_f(price)}  {_pct(pct)}",
                 "context": (f"{p['shares']}股 · 成本{_f(p['cost_price'], 3)}"
