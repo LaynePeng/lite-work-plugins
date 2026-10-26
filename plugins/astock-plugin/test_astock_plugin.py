@@ -1840,5 +1840,66 @@ class TestNotifyIntegration(unittest.TestCase):
         self.assertEqual(self.sent[0]["to"], ["me@test.com"])
 
 
+class TestSettingsConsistency(unittest.TestCase):
+    """设置页声明的键必须与实际读取的键一致。
+
+    回归背景：astock 的邮件通知从"自建 SMTP"改为"复用 email-plugin"后，
+    设置页残留了 smtp_host / smtp_password 等 6 项——它们已不再被任何代码
+    读取，用户填了却不生效，比"没有这个选项"更糟（会误以为已配好）。
+    这类"声明与实现脱节"无法靠跑功能测出来，只能用结构性检查锁住。
+    """
+
+    def setUp(self):
+        import re
+        self.src = open(os.path.join(_HERE, "plugin.py"), encoding="utf-8").read()
+        m = re.search(r'"settings": \[(.*?)\n        \],\n        "panels"',
+                      self.src, re.S)
+        self.block = m.group(1) if m else ""
+        self.declared = re.findall(r'"key": "(\w+)"', self.block)
+
+    def test_settings_block_found(self):
+        self.assertTrue(self.declared, "未解析到 settings 声明块")
+
+    def test_no_stale_smtp_keys(self):
+        """自建 SMTP 时代的键必须彻底移除（改复用 email-plugin 后已无用途）。"""
+        stale = [k for k in ("smtp_host", "smtp_port", "smtp_security",
+                             "smtp_username", "smtp_password", "mail_from",
+                             "email_reuse_email_plugin")
+                 if k in self.declared]
+        self.assertEqual(stale, [], f"设置页残留失效项：{stale}")
+
+    def test_declared_keys_are_actually_read(self):
+        """声明的键必须至少在一处被读取。
+
+        **为什么不能只查字面量**：阈值类键（stop_loss_pct 等）由
+        `hints_config()` 迭代 dataclass 字段 + `_num(app, key)` 动态读取，
+        源码里不会出现 `"stop_loss_pct"` 字面量。因此这里分两步：
+          ① 字面量出现的直接算命中；
+          ② 其余要求能在 HintsConfig 的字段名里找到（说明是动态读取）。
+        """
+        import astock_hints as h
+        body = self.src.replace(self.block, "")       # 排除声明块本身
+        # 通知类键由 astock_notify.build_mail_config 读取（另一个模块）
+        notify_src = open(os.path.join(_HERE, "astock_notify.py"),
+                          encoding="utf-8").read()
+        combined = body + notify_src
+        hint_fields = set(h.HintsConfig().__dataclass_fields__)
+        unused = [k for k in self.declared
+                  if f'"{k}"' not in combined and k not in hint_fields]
+        self.assertEqual(unused, [], f"声明了但无人读取的键：{unused}")
+
+    def test_read_keys_are_declared(self):
+        """代码读取的 email_/watch_ 前缀键必须有声明（否则用户改不了）。"""
+        import astock_notify as n
+        import re as _re
+        notify_src = open(os.path.join(_HERE, "astock_notify.py"),
+                          encoding="utf-8").read()
+        read = set(_re.findall(r'own\.get\("(\w+)"\)', notify_src))
+        read |= set(_re.findall(r'pick\("(\w+)"', self.src))
+        missing = [k for k in sorted(read)
+                   if k.startswith(("email_", "watch_")) and k not in self.declared]
+        self.assertEqual(missing, [], f"代码读取但未声明的键：{missing}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

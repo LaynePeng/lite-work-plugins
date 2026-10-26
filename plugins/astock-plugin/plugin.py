@@ -717,35 +717,24 @@ class AstockPlugin(ToolPlugin):
                      "只是提示，不会阻断落账（成交价由市场决定）"},
             {"key": "email_notify_enabled", "type": "boolean",
              "label": "高风险邮件通知", "default": False,
-             "hint": "开启后，盯盘发现达到阈值的信号会发邮件（后台自动发，不需要你在线）。"
-                     "用插件自己的 SMTP 直发，不经审批卡——盯梢无人值守，审批卡必然超时失败"},
-            {"key": "email_reuse_email_plugin", "type": "boolean",
-             "label": "复用 email-plugin 的邮箱配置", "default": True,
-             "hint": "开启且下面的 SMTP 项留空时，自动沿用 email-plugin 已配好的账号/密码，"
-                     "配过邮件插件就不必重复填"},
-            {"key": "smtp_host", "type": "str", "label": "SMTP 服务器",
-             "default": "", "placeholder": "smtp.qq.com",
-             "hint": "常用 smtp.qq.com / smtp.163.com / smtp.gmail.com / smtp.office365.com。"
-                     "留空则复用 email-plugin"},
-            {"key": "smtp_port", "type": "number", "label": "SMTP 端口",
-             "default": 465, "hint": "SSL 一般 465，STARTTLS 一般 587"},
-            {"key": "smtp_security", "type": "select", "label": "加密方式",
-             "default": "ssl", "options": ["ssl", "starttls", "none"]},
-            {"key": "smtp_username", "type": "str", "label": "邮箱账号",
-             "default": "", "hint": "通常是完整邮箱地址；留空则复用 email-plugin"},
-            {"key": "smtp_password", "type": "secret", "label": "密码 / 授权码",
-             "default": "", "hint": "QQ/163/Gmail 必须用「授权码」而非登录密码。"
-                                     "留空则复用 email-plugin 里的凭据"},
-            {"key": "mail_from", "type": "str", "label": "发件人地址",
-             "default": "", "hint": "一般与账号相同；留空自动使用账号"},
-            {"key": "mail_to", "type": "str", "label": "收件人",
-             "default": "", "hint": "多个用英文逗号分隔。填手机邮箱可当推送用"},
+             "hint": "开启后，盯盘发现达到阈值的信号会通过 email-plugin 的邮箱发给你"
+                     "（后台自动发，不需要你在线）。邮箱账号/密码不在本页填——"
+                     "**沿用 email-plugin 已配好的凭据**，含 OAuth2"},
             {"key": "email_min_level", "type": "select", "label": "通知阈值",
              "default": "urgent", "options": ["urgent", "action", "info"],
              "hint": "urgent＝只发紧急（止损/跌停/尾盘跳水/竞价大异动）；"
-                     "action＝再加止盈/超仓位/跳空；info＝全部。建议保持 urgent"},
+                     "action＝再加止盈/超仓位/跳空；info＝全部。建议保持 urgent，"
+                     "否则邮件会变成骚扰"},
+            {"key": "mail_to", "type": "str", "label": "收件人",
+             "default": "",
+             "hint": "多个用英文逗号分隔。留空＝发到 email-plugin 的发件邮箱自己"
+                     "（提醒自己是最常见用法）"},
+            {"key": "email_to_self_if_empty", "type": "boolean",
+             "label": "收件人留空时发给自己", "default": True,
+             "hint": "关闭后若无收件人则不发信，并在设置页提示补填"},
             {"key": "email_test_send", "type": "action", "label": "发送测试邮件",
-             "hint": "立即用当前配置发一封测试邮件，验证账号/授权码是否正确"},
+             "hint": "点一下立即用 email-plugin 的配置发一封测试邮件。"
+                     "没收到说明 email-plugin 的邮箱尚未配好"},
         ],
         "panels": [
             {"id": "portfolio", "title": "持仓"},
