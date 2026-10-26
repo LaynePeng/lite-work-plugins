@@ -644,7 +644,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.0.0"
+    version = "1.1.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -1435,7 +1435,7 @@ class AstockPlugin(ToolPlugin):
     async def _render_board_text(self) -> str:
         """持仓 → 聊天内三栏看板（含空列占位与文字兜底）。"""
         try:
-            snap = await asyncio.to_thread(self._snapshot)
+            snap = await asyncio.to_thread(self._snapshot, include_watch=True)
             data_ = snap["data"]
             ledger = self._get_ledger()
             watch = await asyncio.to_thread(ledger.list_watch)
@@ -1457,8 +1457,14 @@ class AstockPlugin(ToolPlugin):
             f"完整数值用 `astock_portfolio action=trades` 或右栏「持仓」面板核对。")
         return "\n".join(lines)
 
-    def _snapshot(self) -> Dict[str, Any]:
-        """同步取台账 + 实时行情，返回 {'text':..., 'data':...}。"""
+    def _snapshot(self, *, include_watch: bool = False) -> Dict[str, Any]:
+        """同步取台账 + 实时行情，返回 {'text':..., 'data':...}。
+
+        `include_watch=True` 时一并拉取自选股行情，放进 `data['watch_quotes']`。
+        此前自选股**从不取行情**，看板里每只自选都落到 `if not q:` 分支显示
+        「（行情未取到）」——实测 5 只自选里 4 张卡片是空的，看着像坏了。
+        默认 False：`astock_hint` 等调用方自行按需补拉，避免重复请求。
+        """
         ledger = self._get_ledger()
         positions = ledger.list_positions()
         cash = ledger.get_cash()
@@ -1480,6 +1486,27 @@ class AstockPlugin(ToolPlugin):
                         quotes[q.code] = q.as_dict()
                 except data.DataError as exc:
                     logger.warning("[astock] 持仓行情获取失败: %s", exc)
+
+        # 自选股行情（只在需要时打，行情源有限速）
+        watch_quotes: Dict[str, Dict[str, Any]] = {}
+        if include_watch:
+            held = {p.get("code") for p in positions}
+            witems: List[Tuple[str, str, str]] = []
+            for w in ledger.list_watch():
+                code = str(w.get("code") or "")
+                if not code or code in held:
+                    continue
+                try:
+                    c, venue = mkt.normalize_code(code)
+                except ValueError:
+                    continue
+                witems.append((c, venue, "stock"))
+            if witems:
+                try:
+                    for q in data.fetch_quotes(witems):
+                        watch_quotes[q.code] = q.as_dict()
+                except data.DataError as exc:
+                    logger.warning("[astock] 自选行情获取失败: %s", exc)
 
         rows = []
         total_mv = 0.0
@@ -1529,6 +1556,7 @@ class AstockPlugin(ToolPlugin):
             "text": "\n".join(lines),
             "data": {
                 "positions": positions, "quotes": quotes,
+                "watch_quotes": watch_quotes,
                 "total_market_value": total_mv, "equity": equity,
                 "cash": float(cash["balance"] or 0),
                 "float_pnl": round(total_float_pnl, 2),
@@ -2246,18 +2274,29 @@ class AstockPlugin(ToolPlugin):
         if not d["positions"]:
             return head + ("\n\n当前空仓。录入成交："
                            "`astock_record side=buy code=... price=... shares=...`") + watch_line
-        rows = []
+        # 6 列宽表在 331px 右栏里必然横向挤压（列被挤成竖条，数值读不出来）。
+        # 改为「每股 2 行」：第 1 行＝名称·现价·涨跌，第 2 行＝股数/成本/市值/浮盈，
+        # 再补一行刻度条把"现价在区间里的位置"画出来。行数变多但每行都短，
+        # 窄栏里"读得出来"比"行数少"重要。
+        blocks: List[str] = []
         for p in d["positions"][:MAX_ROWS]:
             q = d["quotes"].get(p["code"]) or {}
             price = q.get("price") or p["cost_price"]
-            mv = price * p["shares"]
-            pnl = (price - p["cost_price"]) * p["shares"]
-            rows.append([f"{p['name'] or p['code']}", p["shares"],
-                         _f(p["cost_price"], 3), _f(price),
-                         f"{_f(pnl)}（{_pct(mkt.pct_change(price, p['cost_price']))}）",
-                         _money(mv)])
-        body = _table(["名称", "股数", "成本", "现价", "浮盈", "市值"], rows)
-        return head + "\n\n" + body + watch_line + (f"\n\n{flag}" if flag else "")
+            cost = float(p["cost_price"] or 0)
+            shares = int(p["shares"] or 0)
+            mv = price * shares
+            pnl = (price - cost) * shares
+            pnl_pct = mkt.pct_change(price, cost)
+            chg_pct = q.get("change_pct")
+            arrow = "▲" if (chg_pct or 0) > 0 else ("▼" if (chg_pct or 0) < 0 else "—")
+            blocks.append(
+                f"**{p['name'] or p['code']}**　{_f(price)}　{arrow}{_pct(chg_pct)}\n"
+                f"　　{shares}股 · 成本{_f(cost, 3)} · 市值{_money(mv)} · "
+                f"浮盈{_f(pnl)}（{_pct(pnl_pct)}）\n"
+                f"　　{_range_bar(q.get('low'), q.get('high'), price, cost)}")
+        body = "\n\n".join(blocks)
+        return (head + "\n\n" + body + watch_line
+                + (f"\n\n{flag}" if flag else ""))
 
     def _panel_watch_line(self) -> str:
         """面板里的盯盘状态行（含"去哪儿点按钮"的指引）。
@@ -2283,11 +2322,24 @@ class AstockPlugin(ToolPlugin):
         """lite-tree 决策树形态：一只股一张卡，卡内写触发规则与建议动作。
 
         `trees[].options` 在原协议里表示"多个候选方案及其概率"。持仓提示不是
-        概率选择，因此每卡只放**一条** option（=当前建议动作），prob 恒为 1.0、
+        概率选择，因此每卡的第一条 option 承载"当前建议动作"，prob 恒为 1.0、
         chosen=true；`kind` 承载信号类型，`question` 承载规则标题，`tone` 承载
-        严重度——这样既复用现成渲染，又不伪造概率语义。
+        严重度——既复用现成渲染，又不伪造概率语义。
+
+        **`prob` 会被前端渲染成一条彩色进度条**（label + 横条 + 百分比，宿主实测）。
+        这是面板里**唯一能被"看见"的图形元素**，因此把它当可视化通道复用：不表示
+        概率，而表示**仓位占比 / 距止损的余量**这类 0-100 的刻度。卡片于是从
+        "一段文字"变成"一眼看出位置"。每卡最多 3 条 option，再多会盖过正文。
         """
+
         import json as _json
+
+        def _scale(label: str, value: float, tone: str = "alt") -> Dict[str, Any]:
+            """把 0-100 的刻度值借 option.prob 通道渲染成进度条。"""
+            return {"label": label,
+                    "prob": max(0.0, min(1.0, float(value) / 100.0)),
+                    "tone": tone, "chosen": False}
+
         positions = d["positions"][:MAX_ROWS]
         if not positions:
             return ("**0 只持仓**｜当前空仓\n\n"
@@ -2315,6 +2367,26 @@ class AstockPlugin(ToolPlugin):
                 kind = "holding"
                 question = "未触发规则区间"
                 label = f"继续持有（止损 -{cfg.stop_loss_pct}% / 止盈 +{cfg.take_profit_pct}%）"
+            # 刻度①：单票仓位占比 vs 上限（超限转红）
+            weight = (p["shares"] * price / total_mv * 100) if total_mv > 0 else 0.0
+            cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
+            # 刻度②：浮亏走到止损阈值前的用量（越满越危险）
+            # 阈值配成 0 ＝ 关闭止损提示，此时不画（避免除零）
+            stop_pct = abs(float(cfg.stop_loss_pct or 0))
+            used = (max(0.0, min(100.0, -pct / stop_pct * 100.0))
+                    if (pct is not None and pct < 0 and stop_pct > 0) else 0.0)
+
+            opts: List[Dict[str, Any]] = [
+                {"label": (label or "")[:80], "prob": 1.0,
+                 "tone": tone, "chosen": True}]
+            if total_mv > 0:
+                opts.append(_scale(f"仓位 {weight:.1f}% / 上限 {cap:g}%",
+                                   weight, "danger" if weight > cap else "alt"))
+            if pct is not None and stop_pct > 0:
+                opts.append(_scale(
+                    (f"距止损 −{abs(pct):.1f}% / 阈值 −{stop_pct:g}%"
+                     if pct < 0 else f"浮盈 {pct:+.1f}%（未接近止损）"),
+                    used, "danger" if used >= 100.0 else "alt"))
             cards.append({
                 "title": f"{p['name'] or p['code']}  {_f(price)}  {_pct(pct)}",
                 "context": (f"{p['shares']}股 · 成本{_f(p['cost_price'], 3)}"
@@ -2322,8 +2394,7 @@ class AstockPlugin(ToolPlugin):
                             f" · 市值{_money(p['shares'] * price)}"),
                 "kind": kind,
                 "question": question,
-                "options": [{"label": (label or "")[:80], "prob": 1.0,
-                             "tone": tone, "chosen": True}],
+                "options": opts[:3],
                 "confidence": 1.0,
                 "accepted": True,
             })
@@ -2345,3 +2416,43 @@ class AstockPlugin(ToolPlugin):
             "total": len(cards),
         }
         return _json.dumps(payload, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------- 排版辅助
+
+
+def _range_bar(low: Any, high: Any, price: Any, cost: Any = None,
+               width: int = 9) -> str:
+    """把「现价在区间里的位置」画成一行刻度条（纯文本，窄栏也读得出来）。
+
+    为什么用文字条而不是 Markdown 表格：右栏只有 331px，6 列表格会被挤变形、
+    数值竖着排成一列读不出；一行 `27.5├──●──┤30.0` 只占十来个字符，却能一眼
+    看出「贴近上沿还是下沿」。`◇` 是成本线（落在区间内时才画）。
+
+    数据缺失时返回一行说明而不是画错的图——**画不出来的宁可明说**。
+    """
+    try:
+        lo = float(low) if low is not None else None
+        hi = float(high) if high is not None else None
+        px = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        return "（区间数据缺失）"
+    if lo is None or hi is None or px is None or hi <= lo:
+        return "（区间数据缺失）"
+    n = max(5, int(width))
+    ratio = (px - lo) / (hi - lo)
+    ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1 else ratio)
+    idx = int(round(ratio * (n - 1)))
+    cells = ["─"] * n
+    cells[idx] = "●"
+    # 成本线落在区间内时一并标出——"成本在山腰还是山顶"是要紧信息
+    if cost:
+        try:
+            c = float(cost)
+            if lo <= c <= hi:
+                ci = max(0, min(n - 1, int(round((c - lo) / (hi - lo) * (n - 1)))))
+                if ci != idx:
+                    cells[ci] = "◇"
+        except (TypeError, ValueError):
+            pass
+    return f"{lo:g}├{''.join(cells)}┤{hi:g}　现价处区间 {ratio * 100:.0f}%"

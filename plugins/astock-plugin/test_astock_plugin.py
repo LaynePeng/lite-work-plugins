@@ -1100,13 +1100,15 @@ class TestPanelRender(unittest.TestCase):
     def _snapshot_stub(self, pl):
         """替换 _snapshot，避免联网（面板逻辑才是测试目标）。"""
         quote = {"price": 9.53, "prev_close": 9.62, "change_pct": -0.94,
+                 "low": 9.40, "high": 9.80,
                  "limit_up": 10.58, "limit_down": 8.66}
         pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
                 "cost_price": 10.005, "available_today": 1000, "board": "main",
                 "cost_amount": 10005.0, "opened_at": "2026-10-20",
                 "updated_at": "2026-10-20", "note": ""}]
-        pl._snapshot = lambda: {"data": {
+        pl._snapshot = lambda **kw: {"data": {
             "positions": pos, "quotes": {"600000": quote},
+            "watch_quotes": {},
             "total_market_value": 9530.0, "equity": 39530.0, "cash": 30000.0,
             "float_pnl": -475.1, "today_pnl": -90.0, "realized_pnl": 0.0}}
         return pl
@@ -1114,12 +1116,26 @@ class TestPanelRender(unittest.TestCase):
     def test_unknown_panel_returns_empty(self):
         self.assertEqual(self._plugin().panel_content("nope", {}), "")
 
-    def test_markdown_has_table_and_no_json(self):
+    def test_markdown_is_compact_and_has_range_bar(self):
+        """markdown 形态：每股紧凑 2 行 + 位置刻度条，不再是 6 列宽表。
+
+        宽表在 331px 右栏里会被挤成竖条（数值读不出来），故改为短行块；
+        刻度条用 `├─●─┤` 表达现价位置，成本线落在区间内时以 `◇` 标出。
+        """
         pl = self._snapshot_stub(self._plugin("markdown"))
         out = pl.panel_content("portfolio", {})
-        self.assertIn("| 名称 |", out)
         self.assertIn("浦发银行", out)
         self.assertNotIn("lite-tree", out)
+        # 不再用 6 列宽表；每行都要短
+        self.assertNotIn("| 名称 | 股数 |", out)
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 60, f"行过长会挤压窄栏: {line!r}")
+        # 刻度条：区间端点 + 现价位置点
+        self.assertIn("├", out)
+        self.assertIn("●", out)
+        self.assertNotIn("（区间数据缺失）", out)
+        # 成本 10.005 在当日区间 9.40-9.80 之外 → 不画成本线（画了反而是错的）
+        self.assertNotIn("◇", out)
 
     def test_tree_is_valid_litetree_json(self):
         import json
@@ -1131,9 +1147,15 @@ class TestPanelRender(unittest.TestCase):
         card = data["trees"][0]
         self.assertIn("浦发银行", card["title"])
         # 卡片必须带"当前建议动作"，且不伪造概率（单选项恒 1.0）
-        self.assertEqual(len(card["options"]), 1)
+        # 第 1 条＝当前建议动作（prob 1.0 / chosen）；其余是可视化刻度（≤3 条）
         self.assertEqual(card["options"][0]["prob"], 1.0)
         self.assertTrue(card["options"][0]["chosen"])
+        self.assertLessEqual(len(card["options"]), 3)
+        self.assertGreaterEqual(len(card["options"]), 2)
+        for extra in card["options"][1:]:
+            self.assertFalse(extra["chosen"])
+            self.assertGreaterEqual(extra["prob"], 0.0)
+            self.assertLessEqual(extra["prob"], 1.0)
 
     def test_tree_card_shows_triggered_rule(self):
         import json
@@ -2095,6 +2117,174 @@ class TestSmtpParamsFromEmailPlugin(unittest.TestCase):
         for bad in ('own.get("smtp_host")', "own.get('smtp_host')",
                     'own.get("smtp_port")', 'own.get("smtp_tls")'):
             self.assertNotIn(bad, src, f"仍在直接读配置原始键：{bad}")
+
+
+class TestBoardRender(unittest.TestCase):
+    """`astock_board.build_board` —— 此前**零测试覆盖**，而它是聊天内看板的核心。
+
+    看板是用户最常看到的"扫一眼"视图（`astock_portfolio` 默认就渲染它），
+    却有字段上限、分栏规则、tone 着色三层逻辑从未被验证。
+    """
+
+    def setUp(self):
+        import astock_board as bd
+        import astock_hints as hs
+        self.bd, self.hs = bd, hs
+        self.cfg = hs.HintsConfig()
+        self.data = {
+            "positions": [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                           "cost_price": 10.0, "available_today": 1000}],
+            "quotes": {"600000": {"price": 9.53, "change_pct": -0.94}},
+            "total_market_value": 9530.0, "cash": 30000.0,
+            "float_pnl": -470.0, "today_pnl": -90.0,
+        }
+
+    def _build(self, data=None, watch=()):
+        def no_t1(pos, avail):
+            return None
+        return self.bd.build_board(data or self.data, self.cfg,
+                                   self.hs.build_position_hints, no_t1,
+                                   watch_codes=list(watch))
+
+    def test_no_content_returns_none(self):
+        empty = {"positions": [], "quotes": {},
+                 "total_market_value": 0.0, "cash": 0.0,
+                 "float_pnl": 0.0, "today_pnl": 0.0}
+        self.assertIsNone(self._build(empty))
+
+    def test_respects_host_field_limits(self):
+        """title≤80 / desc≤200 / tag≤20 —— 超了前端会静默硬截成半句话。"""
+        spec = self._build()
+        for col in spec["columns"]:
+            self.assertLessEqual(len(col["name"]), 30)
+            for card in col["cards"]:
+                self.assertLessEqual(len(card["title"]), 80)
+                self.assertLessEqual(len(card["desc"] or ""), 200)
+                self.assertLessEqual(len(card["tag"] or ""), 20)
+
+    def test_tone_only_host_supported_values(self):
+        """宿主只认 good/bad/neutral 三色，其它值会被前端丢弃成无色。"""
+        spec = self._build()
+        for col in spec["columns"]:
+            for card in col["cards"]:
+                self.assertIn(card["tone"], ("good", "bad", "neutral"))
+
+    def test_watch_without_quote_is_honestly_marked(self):
+        """自选股没有行情时如实标「未取到」，不假装有数据。"""
+        spec = self._build(watch=["600519"])
+        idle = [c for col in spec["columns"] if col["name"] == "无需关注"
+                for c in col["cards"]]
+        self.assertTrue(any("未取到" in (c["desc"] or "") for c in idle))
+
+    def test_watch_with_quote_shows_price_not_placeholder(self):
+        """修复：自选股有行情时必须显示价格，而不是「（行情未取到）」。
+
+        回归点：`_snapshot` 曾完全不取自选行情，导致看板里每只自选都是空卡片。
+        """
+        data = dict(self.data)
+        data["watch_quotes"] = {"600519": {"code": "600519", "name": "贵州茅台",
+                                           "price": 1342.0, "change_pct": 0.52}}
+        spec = self._build(data, watch=["600519"])
+        self.assertIsNotNone(spec)
+        titles = [c["title"] for col in spec["columns"] for c in col["cards"]]
+        self.assertIn("贵州茅台", "\n".join(titles))
+        # 有行情就不该出现"未取到"占位
+        descs = "\n".join(c["desc"] or "" for col in spec["columns"]
+                           for c in col["cards"])
+        self.assertNotIn("未取到", descs)
+
+    def test_columns_always_three(self):
+        spec = self._build()
+        self.assertEqual([c["name"] for c in spec["columns"]],
+                         ["需处理", "持有中", "无需关注"])
+
+
+class TestPanelRangeBar(unittest.TestCase):
+    """位置刻度条：把"现价在区间哪个位置"画成一行，替代被挤变形的宽表。"""
+
+    def setUp(self):
+        import plugin as pl
+        self.rb = pl._range_bar
+
+    def test_position_ratio_and_ends(self):
+        out = self.rb(10.0, 20.0, 15.0)
+        self.assertIn("10", out)
+        self.assertIn("20", out)
+        self.assertIn("●", out)
+        self.assertIn("50%", out)
+
+    def test_clamps_out_of_range_price(self):
+        """价格超出区间时不越界画点（宁可靠边也不画到框外）。"""
+        low = self.rb(10.0, 20.0, 5.0)
+        high = self.rb(10.0, 20.0, 99.0)
+        self.assertIn("0%", low)
+        self.assertIn("100%", high)
+
+    def test_cost_marker_only_when_inside_range(self):
+        inside = self.rb(10.0, 20.0, 15.0, cost=12.0)
+        outside = self.rb(10.0, 20.0, 15.0, cost=99.0)
+        self.assertIn("◇", inside)
+        self.assertNotIn("◇", outside)
+
+    def test_missing_data_says_so(self):
+        """数据缺失时明说，而不是画一条错的图。"""
+        self.assertIn("缺失", self.rb(None, None, 10.0))
+        self.assertIn("缺失", self.rb(20.0, 10.0, 15.0))   # high<=low 视为坏数据
+        self.assertIn("缺失", self.rb("x", "y", "z"))
+
+
+class TestSnapshotIncludesWatch(unittest.TestCase):
+    """`_snapshot(include_watch=True)` 必须拉自选行情（空卡片 bug 的根因）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="astock-snap-")
+        # 走默认路径（<workspace>/.astock/ledger.sqlite），确保插件的 _ledger_path
+        # 与测试写入的是同一个库——之前写到 tmp/ledger.sqlite 会读不到自选。
+        lg = ledger_mod(astock.default_ledger_path(self.tmp))
+        lg.add_watch("600519", "贵州茅台")
+        lg.set_cash(1000)
+        pl = astock.AstockPlugin()
+        pl._app = types.SimpleNamespace(workspace=self.tmp, config={})
+        self.pl = pl
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_watch_quotes_present_when_requested(self):
+        import astock_data as d
+        seen = {}
+
+        def fake_fetch(items, use_cache=True):
+            seen["items"] = list(items)
+            return []
+
+        orig = d.fetch_quotes
+        d.fetch_quotes = fake_fetch
+        try:
+            snap = self.pl._snapshot(include_watch=True)
+        finally:
+            d.fetch_quotes = orig
+        self.assertIn("watch_quotes", snap["data"])
+        codes = [c for c, _, _ in seen.get("items", [])]
+        self.assertIn("600519", codes, "自选股未被请求行情 → 看板会出现空卡片")
+
+    def test_watch_not_fetched_by_default(self):
+        import astock_data as d
+        called = {"n": 0}
+
+        def fake_fetch(items, use_cache=True):
+            called["n"] += 1
+            return []
+
+        orig = d.fetch_quotes
+        d.fetch_quotes = fake_fetch
+        try:
+            snap = self.pl._snapshot()
+        finally:
+            d.fetch_quotes = orig
+        self.assertEqual(called["n"], 0, "默认不该为自选打行情请求")
+        self.assertEqual(snap["data"]["watch_quotes"], {})
 
 
 if __name__ == "__main__":

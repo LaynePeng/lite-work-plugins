@@ -149,7 +149,10 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
     返回 None 表示没有任何可展示内容（调用方回退为文字说明）。
     """
     positions = list(data.get("positions") or [])
-    quotes = data.get("quotes") or {}
+    # 自选行情单独放在 watch_quotes 里（调用方 `_snapshot(include_watch=True)` 拉取）。
+    # 合并成本地量，持仓行情优先——同代码不重叠（取数时已排除持仓），这里只是兜底。
+    quotes: Dict[str, Any] = dict(data.get("watch_quotes") or {})
+    quotes.update(data.get("quotes") or {})
     total_mv = float(data.get("total_market_value") or 0)
 
     buckets: Dict[str, List[Dict[str, Any]]] = {
@@ -205,8 +208,8 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
         q = quotes.get(code) or {}
         if not q:
             buckets[COLUMN_IDLE].append({
-                "title": code, "desc": "（行情未取到）", "tag": "自选",
-                "tone": "neutral"})
+                "title": code, "desc": "行情暂未取到（接口限流或代码有误）",
+                "tag": "自选", "tone": "neutral"})
             continue
         hs = [h for h in hint_builder({"code": code}, q, hints_cfg, watch_only=True)
               if h.kind in ACTION_KINDS]
