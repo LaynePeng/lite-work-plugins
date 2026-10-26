@@ -711,7 +711,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.6.0"
+    version = "1.6.1"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -1211,12 +1211,18 @@ class AstockPlugin(ToolPlugin):
         for h in hits:
             if shown >= max_n:
                 break
-            try:
-                flows = await asyncio.to_thread(data.fetch_money_flow, h["code"], 5)
-                net5 = sum(float(f.get("net_amount") or 0) for f in flows) \
-                    if flows else None
-            except Exception:
-                net5 = None
+            # 资金印证只对前 5 条拉接口（每条一次请求；逐条拉满 8+ 会被
+            # 行情源掐连接——实测 17:59 连续 6 条即触发限流）。后面的
+            # 条目显示「未查（限流保护）」，事实仍在，用户点名再查。
+            net5 = None
+            if shown < 5:
+                try:
+                    flows = await asyncio.to_thread(data.fetch_money_flow, h["code"], 5)
+                    net5 = sum(float(f.get("main_net") or 0) for f in flows) \
+                        if flows else None
+                    await asyncio.sleep(0.4)     # 限速：公共接口礼貌间隔
+                except Exception:
+                    net5 = None
             mark = "✅" if (net5 or 0) > 0 else ("⚠️" if (net5 or 0) < 0 else "—")
             flow_txt = (f"5日主力净流入 {net5 / 1e8:+.2f} 亿"
                         if net5 is not None else "资金数据缺失")
@@ -1230,11 +1236,23 @@ class AstockPlugin(ToolPlugin):
         return "\n".join(out_lines)
 
     async def _company_in_text(self, text: str) -> Optional[Dict[str, str]]:
-        """快讯文本 → 上市公司（句首公司名模式 → 搜索接口定位代码）。"""
+        """快讯文本 → 上市公司（搜索接口定位代码）。
+
+        两级提取（实测 17:59 快讯修订）：
+        ① 【公司名：…】——新浪个股快讯的标准格式，最可靠；
+        ② 句首「公司名+行业后缀」——无【】时的兜底（部分源不带括号）。
+        搜索接口验证唯一性：命中 A 股代码才认，搜索不到/歧义则放弃该条。
+        """
         import re as _re
-        m = _re.match(r"^([\u4e00-\u9fa5A-Za-z]{2,8}?(?:股份|集团|科技|生物|"
-                      r"制药|电子|光电|能源|银行|证券|控股))", text)
-        cand = m.group(1) if m else ""
+        cand = ""
+        m = _re.search(r"【([\u4e00-\u9fa5A-Za-z0-9]{2,10})：", text)
+        if m:
+            cand = m.group(1)
+        else:
+            m2 = _re.match(r"^([\u4e00-\u9fa5A-Za-z]{2,8}?"
+                           r"(?:股份|集团|科技|生物|制药|电子|光电|能源|"
+                           r"银行|证券|控股|电力|健康|环保|新材|咨询))", text)
+            cand = m2.group(1) if m2 else ""
         if not cand:
             return None
         try:
@@ -2803,7 +2821,8 @@ async def _event_reco_for_report(ledger, existing_codes: set) -> List[Dict[str, 
             seen.add(company["code"])
             try:
                 flows = await asyncio.to_thread(data.fetch_money_flow, company["code"], 5)
-                net5 = sum(float(f.get("net_amount") or 0) for f in flows) if flows else None
+                net5 = sum(float(f.get("main_net") or 0) for f in flows) if flows else None
+                await asyncio.sleep(0.4)
             except Exception:
                 net5 = None
             if net5 is None or net5 <= 0:
