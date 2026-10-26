@@ -640,7 +640,7 @@ class TestWatchControl(unittest.TestCase):
     def test_panel_shows_watch_state(self):
         pl = astock.AstockPlugin()
         pl._app = self._app(watch=False)
-        pl._snapshot = lambda: {"data": {
+        pl._snapshot = lambda **kw: {"data": {
             "positions": [], "quotes": {}, "total_market_value": 0.0,
             "equity": 0.0, "cash": 0.0, "float_pnl": 0.0,
             "today_pnl": 0.0, "realized_pnl": 0.0}}
@@ -1107,7 +1107,7 @@ class TestPanelRender(unittest.TestCase):
                 "cost_amount": 10005.0, "opened_at": "2026-10-20",
                 "updated_at": "2026-10-20", "note": ""}]
         pl._snapshot = lambda **kw: {"data": {
-            "positions": pos, "quotes": {"600000": quote},
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
             "watch_quotes": {},
             "total_market_value": 9530.0, "equity": 39530.0, "cash": 30000.0,
             "float_pnl": -475.1, "today_pnl": -90.0, "realized_pnl": 0.0}}
@@ -1176,8 +1176,8 @@ class TestPanelRender(unittest.TestCase):
                  "limit_up": 10.45, "limit_down": 8.55}
         pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
                 "cost_price": 10.0, "available_today": 1000}]
-        pl._snapshot = lambda: {"data": {
-            "positions": pos, "quotes": {"600000": quote},
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
             "total_market_value": 8000.0, "equity": 38000.0, "cash": 30000.0,
             "float_pnl": -2000.0, "today_pnl": -1500.0, "realized_pnl": 0.0}}
         data = json.loads(pl.panel_content("portfolio", {}))
@@ -1188,7 +1188,7 @@ class TestPanelRender(unittest.TestCase):
 
     def test_empty_portfolio_message(self):
         pl = self._plugin("tree")
-        pl._snapshot = lambda: {"data": {
+        pl._snapshot = lambda **kw: {"data": {
             "positions": [], "quotes": {}, "total_market_value": 0.0,
             "equity": 0.0, "cash": 0.0, "float_pnl": 0.0,
             "today_pnl": 0.0, "realized_pnl": 0.0}}
@@ -1197,7 +1197,7 @@ class TestPanelRender(unittest.TestCase):
 
     def test_broken_ledger_degrades_gracefully(self):
         pl = self._plugin()
-        pl._snapshot = lambda: (_ for _ in ()).throw(RuntimeError("台账炸了"))
+        pl._snapshot = lambda **kw: (_ for _ in ()).throw(RuntimeError("台账炸了"))
         out = pl.panel_content("portfolio", {})
         self.assertIn("台账读取失败", out)     # 不能把面板打空白或抛异常
         self.assertIn("台账炸了", out)
