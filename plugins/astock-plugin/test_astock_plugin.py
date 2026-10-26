@@ -541,7 +541,7 @@ class TestPluginSurface(unittest.TestCase):
         self.assertEqual(names, {
             "astock_quote", "astock_kline", "astock_search", "astock_screen",
             "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
-            "astock_sentiment", "astock_sync", "astock_watch",
+            "astock_sentiment", "astock_events", "astock_sync", "astock_watch",
         })
 
     def test_all_tools_have_schema(self):
