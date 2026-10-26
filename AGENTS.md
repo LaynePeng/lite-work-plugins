@@ -24,11 +24,16 @@
    直接在这三个插件里开发改动（本仓库是上游事实源）；需要进主程序内置时，
    再**按需同步回** lite-work 的 `litework/tools/{office,ocr,web}.py`。
    不要反向操作（不要改主仓库后往回同步）。
-4. **manifest.json**：新增插件必须登记（name / version / description / path）；
+4. **`astock-plugin`（A 股助手）不内置，只在本仓库独立发布**：
+   **禁止**把它同步进 lite-work 的 `litework/tools/` 或 `builtin_plugins/`。
+   它是「个人自用型」插件——依赖用户自己的券商习惯、台账数据与邮箱配置，
+   进内置只会增加主程序的维护面与体积，且没有内置的必要性。
+   后续如需内置其他插件，须逐项确认，不要套用第 3 条的同步流程。
+5. **manifest.json**：新增插件必须登记（name / version / description / path）；
    **工具型插件**（`kind` 缺省或 `tool`）另需登记 `tools`，且与实际 `get_tools()` 一致；
    **模式型插件**（`kind: collab`）与无工具的数据源插件（如 `pricing-plugin` 的
    `get_tools()` 返回空）不需要 `tools`，登记空数组亦可
-5. **禁止提交 0 字节隐藏文件**（`.gitkeep` 类占位）：仓库不接受 0 字节的隐藏文件
+6. **禁止提交 0 字节隐藏文件**（`.gitkeep` 类占位）：仓库不接受 0 字节的隐藏文件
    （CI `.github/workflows/hidden-file-check.yml` 会强制检查）；上游同步型技能的
    同步脚本已自动清理（见 `sync_academic_diagram.py` 的 `.gitkeep` 清理），
    手改时也不要引入这类占位
