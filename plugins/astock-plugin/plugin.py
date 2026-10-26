@@ -711,7 +711,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.3.1"
+    version = "1.3.2"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -2297,7 +2297,9 @@ class AstockPlugin(ToolPlugin):
         if panel_id != "portfolio":
             return ""
         try:
-            snap = self._snapshot()
+            # include_watch：自选股行情一并拉——面板要画自选区（此前只画持仓，
+            # 与聊天看板行为不一致：聊天里有「无需关注」列，右栏却没有）
+            snap = self._snapshot(include_watch=True)
         except Exception as exc:
             logger.warning("[astock] 面板渲染失败: %s", exc)
             return f"台账读取失败：{exc}\n\n检查设置页「台账文件路径」，或先用 `astock_record` 录入持仓。"
@@ -2407,6 +2409,20 @@ class AstockPlugin(ToolPlugin):
                               "note": _pct(pnl_pct) if pnl_pct < 0 else "浮盈中"})
             if items:
                 out += ["```progress", _jsonlib.dumps({"items": items}, ensure_ascii=False), "```", ""]
+        # ── 自选区（未持仓）：紧凑表 + 备注提示。与聊天看板「无需关注」列对齐——
+        #    面板此前只画持仓，自选完全不出现，用户换 tab 看不到候选池。
+        wq = d.get("watch_quotes") or {}
+        if wq:
+            out.append("**自选观察**（未持仓）")
+            rows = []
+            for code, q in list(wq.items())[:MAX_ROWS]:
+                chg = q.get("change_pct")
+                arrow = "▲" if (chg or 0) > 0 else ("▼" if (chg or 0) < 0 else "—")
+                rows.append([f"{q.get('name') or code}（{code}）", _f(q.get("price")),
+                             f"{arrow}{_pct(chg)}", _f(q.get("low")), _f(q.get("high"))])
+            out.append(_table(["名称", "现价", "涨跌", "日低", "日高"], rows))
+            out.append("")
+
         out.append(watch_line.strip() if watch_line.strip() else "")
         if flag:
             out.append(flag)
