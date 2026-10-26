@@ -711,7 +711,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.5.0"
+    version = "1.6.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -2759,4 +2759,117 @@ async def portfolio_sentiment_report(ledger: "Ledger",
         parts.append(f"**✅ 同向偏正（{len(aligned)} 只）**：{'、'.join(aligned)}")
     if not conflicted and not aligned:
         parts.append("今日证据量普遍偏薄（thin），无明确方向。")
+
+    # ── 联动①：事件推荐区（快讯硬事件 × 资金同向，且不在池）——只推荐不自动加：
+    #    自动改自选会让「观察池」变成机器的池，用户说「加」才加。
+    try:
+        ev_recos = await _event_reco_for_report(ledger, set(codes))
+    except Exception:
+        ev_recos = []
+    if ev_recos:
+        parts += ["", f"**📌 事件推荐（{len(ev_recos)} 只，未在池）**——说「加自选」即入池："]
+        for r in ev_recos:
+            parts.append(f"- {r['mark']} **{r['name']}（{r['code']}）**｜{r['kind']}：{r['text']}"
+                         f"（{r['flow']}）")
+
+    # ── 联动②：自选健康检查——按池内 note 的既定约定标「建议移除」，只建议不删。
+    try:
+        drops = await _watch_health_check(ledger)
+    except Exception:
+        drops = []
+    if drops:
+        parts += ["", f"**🧹 建议移除（{len(drops)} 只）**——说「移除」即删："]
+        for d in drops:
+            parts.append(f"- {d}")
     return "\n".join(parts)
+
+
+async def _event_reco_for_report(ledger, existing_codes: set) -> List[Dict[str, Any]]:
+    """盘后报告联动①：快讯硬事件 → 推荐候选（排除在池/持仓；资金须同向）。"""
+    feed = await asyncio.to_thread(senti_data.fetch_feed, 40, "")
+    recos: List[Dict[str, Any]] = []
+    seen: set = set()
+    _pl = AstockPlugin()
+    for ev in feed:
+        text = (ev.summary or ev.title or "")
+        for k_name, k_words in AstockPlugin.EVENT_KINDS.items():
+            if k_name == "利空":
+                continue
+            if not any(w in text for w in k_words):
+                continue
+            company = await _pl._company_in_text(text)
+            if not company or company["code"] in existing_codes | seen:
+                break
+            seen.add(company["code"])
+            try:
+                flows = await asyncio.to_thread(data.fetch_money_flow, company["code"], 5)
+                net5 = sum(float(f.get("net_amount") or 0) for f in flows) if flows else None
+            except Exception:
+                net5 = None
+            if net5 is None or net5 <= 0:
+                break          # 资金未印证/背离 → 不进推荐位
+            recos.append({
+                "kind": k_name, "code": company["code"], "name": company["name"],
+                "text": ev.title or text[:60],
+                "flow": f"5日主力净流入 {net5 / 1e8:+.2f} 亿", "mark": "✅"})
+            break
+        if len(recos) >= 3:
+            break
+    return recos
+
+
+async def _watch_health_check(ledger) -> List[str]:
+    """盘后报告联动②：自选淘汰建议（只建议，不删）。
+
+    规则全部基于入池时写进 note 的约定——机器只执行用户自己定的纪律：
+    1. 买点失效：note 有「回踩XX.X」而现价高于买点 8% 以上（追高成本
+       过高，原观察逻辑不成立）；
+    2. 背离持续：note 注明「背离」的候选，舆情仍 conflicted → 提醒
+       （不判死刑：背离消除日可能正是买点，交给用户）。
+    """
+    import re as _re
+    drops: List[str] = []
+    held = {p["code"] for p in ledger.list_positions()}
+    # 现价：批量拉一次自选行情（不逐只打接口）
+    watched = ledger.list_watch()
+    codes = [w["code"] for w in watched if w["code"] not in held]
+    quotes: Dict[str, Dict[str, Any]] = {}
+    if codes:
+        try:
+            items = []
+            for c in codes:
+                try:
+                    cc, vv = mkt.normalize_code(c)
+                    items.append((cc, vv, "stock"))
+                except ValueError:
+                    continue
+            for q in await asyncio.to_thread(data.fetch_quotes, items):
+                quotes[q.code] = q.as_dict()
+        except Exception:
+            pass
+    for w in watched:
+        code = w["code"]
+        if code in held:
+            continue
+        note = w.get("note") or ""
+        q = quotes.get(code) or {}
+        price = q.get("price")
+        # 规则1：买点失效
+        m = _re.search(r"回踩(\d+(?:\.\d+)?)", note)
+        if m and price and price > float(m.group(1)) * 1.08:
+            drops.append(f"{w.get('name') or code}（{code}）：现价 {price} 已偏离"
+                         f"买点 {m.group(1)} 超过 8%，观察前提失效")
+            continue
+        # 规则2：背离持续（只对 note 提到背离的查，控制请求量）
+        if "背离" in note:
+            try:
+                collected = await asyncio.to_thread(senti_data.collect, code, "")
+                rep = await asyncio.to_thread(
+                    senti.summarize, collected["items"], code, "",
+                    collected["errors"], collected["extras"])
+                if rep.tone == "conflicted":
+                    drops.append(f"{w.get('name') or code}（{code}）：舆情背离持续"
+                                 f"（等「背离消除」条件触发，或移除换标的）")
+            except Exception:
+                pass
+    return drops[:5]
