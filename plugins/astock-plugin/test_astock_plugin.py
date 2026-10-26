@@ -1116,26 +1116,38 @@ class TestPanelRender(unittest.TestCase):
     def test_unknown_panel_returns_empty(self):
         self.assertEqual(self._plugin().panel_content("nope", {}), "")
 
-    def test_markdown_is_compact_and_has_range_bar(self):
-        """markdown 形态：每股紧凑 2 行 + 位置刻度条，不再是 6 列宽表。
+    def test_markdown_is_richbox_kpi_and_progress(self):
+        """markdown 形态：富围栏版——头部 ```kpi 指标卡 + 每股 ```progress 条。
 
-        宽表在 331px 右栏里会被挤成竖条（数值读不出来），故改为短行块；
-        刻度条用 `├─●─┤` 表达现价位置，成本线落在区间内时以 `◇` 标出。
+        宿主面板（lite-work 2.0.4+）已支持富围栏渲染；面板输出从纯文本短行
+        升级为「KPI 卡 + 进度条」结构。旧宿主不识别时围栏降级为代码块，
+        数字仍在 JSON 里可读。
         """
+        import json as _json
         pl = self._snapshot_stub(self._plugin("markdown"))
         out = pl.panel_content("portfolio", {})
         self.assertIn("浦发银行", out)
         self.assertNotIn("lite-tree", out)
-        # 不再用 6 列宽表；每行都要短
         self.assertNotIn("| 名称 | 股数 |", out)
-        for line in out.splitlines():
-            self.assertLessEqual(len(line), 60, f"行过长会挤压窄栏: {line!r}")
-        # 刻度条：区间端点 + 现价位置点
-        self.assertIn("├", out)
-        self.assertIn("●", out)
-        self.assertNotIn("（区间数据缺失）", out)
-        # 成本 10.005 在当日区间 9.40-9.80 之外 → 不画成本线（画了反而是错的）
-        self.assertNotIn("◇", out)
+        # kpi 围栏：可解析、4 张卡
+        self.assertIn("```kpi", out)
+        kpi_json = out.split("```kpi\n", 1)[1].split("\n```", 1)[0]
+        kpi = _json.loads(kpi_json)
+        self.assertEqual(len(kpi["items"]), 4)
+        labels = [it["label"] for it in kpi["items"]]
+        self.assertIn("总资产", labels)
+        self.assertIn("可用资金", labels)
+        # progress 围栏：仓位 + 距止损两条
+        self.assertIn("```progress", out)
+        pr_json = out.split("```progress\n", 1)[1].split("\n```", 1)[0]
+        pr = _json.loads(pr_json)
+        plabels = [it["label"] for it in pr["items"]]
+        self.assertTrue(any("仓位" in x for x in plabels))
+        self.assertTrue(any("距止损" in x for x in plabels))
+        # 数值在 0-100 区间
+        for it in pr["items"]:
+            self.assertGreaterEqual(it["value"], 0)
+            self.assertLessEqual(it["value"], 100)
 
     def test_tree_is_valid_litetree_json(self):
         import json
@@ -2199,38 +2211,6 @@ class TestBoardRender(unittest.TestCase):
                          ["需处理", "持有中", "无需关注"])
 
 
-class TestPanelRangeBar(unittest.TestCase):
-    """位置刻度条：把"现价在区间哪个位置"画成一行，替代被挤变形的宽表。"""
-
-    def setUp(self):
-        import plugin as pl
-        self.rb = pl._range_bar
-
-    def test_position_ratio_and_ends(self):
-        out = self.rb(10.0, 20.0, 15.0)
-        self.assertIn("10", out)
-        self.assertIn("20", out)
-        self.assertIn("●", out)
-        self.assertIn("50%", out)
-
-    def test_clamps_out_of_range_price(self):
-        """价格超出区间时不越界画点（宁可靠边也不画到框外）。"""
-        low = self.rb(10.0, 20.0, 5.0)
-        high = self.rb(10.0, 20.0, 99.0)
-        self.assertIn("0%", low)
-        self.assertIn("100%", high)
-
-    def test_cost_marker_only_when_inside_range(self):
-        inside = self.rb(10.0, 20.0, 15.0, cost=12.0)
-        outside = self.rb(10.0, 20.0, 15.0, cost=99.0)
-        self.assertIn("◇", inside)
-        self.assertNotIn("◇", outside)
-
-    def test_missing_data_says_so(self):
-        """数据缺失时明说，而不是画一条错的图。"""
-        self.assertIn("缺失", self.rb(None, None, 10.0))
-        self.assertIn("缺失", self.rb(20.0, 10.0, 15.0))   # high<=low 视为坏数据
-        self.assertIn("缺失", self.rb("x", "y", "z"))
 
 
 class TestSnapshotIncludesWatch(unittest.TestCase):
@@ -2238,13 +2218,18 @@ class TestSnapshotIncludesWatch(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="astock-snap-")
-        # 走默认路径（<workspace>/.astock/ledger.sqlite），确保插件的 _ledger_path
-        # 与测试写入的是同一个库——之前写到 tmp/ledger.sqlite 会读不到自选。
-        lg = ledger_mod(astock.default_ledger_path(self.tmp))
+        # **显式 ledger_path 指到临时目录**：默认路径已改为全局
+        # （~/.lite-work/astock-data/），测试若走默认会**读写用户真实台账**
+        # （曾把 set_cash(1000) 写进真实数据）。显式配置是测试隔离的唯一
+        # 正确方式——不要再用 default_ledger_path(workspace) 语义。
+        self.path = os.path.join(self.tmp, "ledger.sqlite")
+        lg = ledger_mod(self.path)
         lg.add_watch("600519", "贵州茅台")
         lg.set_cash(1000)
         pl = astock.AstockPlugin()
-        pl._app = types.SimpleNamespace(workspace=self.tmp, config={})
+        pl._app = types.SimpleNamespace(
+            workspace=self.tmp,
+            config={"astock-plugin": {"ledger_path": self.path}})
         self.pl = pl
 
     def tearDown(self):

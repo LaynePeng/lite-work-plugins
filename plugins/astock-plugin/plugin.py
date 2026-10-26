@@ -644,18 +644,19 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.1.0"
+    version = "1.2.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
-                   "零第三方依赖；数据落盘 <workspace>/.astock/ledger.sqlite。")
+                   "零第三方依赖；台账默认落 ~/.lite-work/astock-data/ledger.sqlite"
+                   "（全局位置，与工作区无关）。")
 
     contributes = {
         "settings": [
             {"key": "ledger_path", "type": "str", "label": "台账文件路径",
              "default": "",
-             "hint": "留空＝<workspace>/.astock/ledger.sqlite。想跨项目共用一份台账时"
-                     "填绝对路径（如 ~/Documents/astock/ledger.sqlite）"},
+             "hint": "留空＝~/.lite-work/astock-data/ledger.sqlite（全局位置，"
+                     "跨平台，与当前项目无关）。要改放别处再填绝对路径"},
             {"key": "commission_rate", "type": "number", "label": "佣金率",
              "default": 0.00025, "hint": "万 2.5 填 0.00025；按你券商实际费率改"},
             {"key": "min_commission", "type": "number", "label": "最低佣金（元）",
@@ -2269,16 +2270,44 @@ class AstockPlugin(ToolPlugin):
         return ""
 
     def _panel_markdown(self, d: Dict[str, Any], flag: str) -> str:
+        """markdown 形态：富围栏版（宿主面板已支持 ```kpi / ```progress 渲染）。
+
+        结构：
+        - 头部一句纯文本合计（面板标题条之外的眼睛锚点）；
+        - ```kpi：4 张指标卡（总资产/持仓市值/浮动盈亏/可用资金）——数字大、
+          一眼看到钱；
+        - 每只持仓一段：名称行（markdown）+ ```progress（仓位占比、距止损余量
+          两根进度条，超限自动红）；
+        - 老环境兜底：宿主若不支持富围栏（旧版 lite-work），围栏内容会显示为
+          代码块——仍可读（JSON 里的数字都在），不至于空白。v2.0.4+ 已支持。
+        """
+        import json as _jsonlib
         head = self._panel_head(d)
         watch_line = self._panel_watch_line()
         if not d["positions"]:
             return head + ("\n\n当前空仓。录入成交："
                            "`astock_record side=buy code=... price=... shares=...`") + watch_line
-        # 6 列宽表在 331px 右栏里必然横向挤压（列被挤成竖条，数值读不出来）。
-        # 改为「每股 2 行」：第 1 行＝名称·现价·涨跌，第 2 行＝股数/成本/市值/浮盈，
-        # 再补一行刻度条把"现价在区间里的位置"画出来。行数变多但每行都短，
-        # 窄栏里"读得出来"比"行数少"重要。
-        blocks: List[str] = []
+
+        # ── KPI 卡：先回答"我的钱怎么样了" ──
+        equity = (d.get("total_market_value") or 0) + (d.get("cash") or 0)
+        pnl_v = d.get("float_pnl") or 0
+        kpi = {
+            "items": [
+                {"label": "总资产", "value": _f(equity),
+                 "delta": f"今日 {_f(d.get('today_pnl') or 0)}",
+                 "trend": "up" if (d.get("today_pnl") or 0) >= 0 else "down"},
+                {"label": "持仓市值", "value": _money(d.get("total_market_value") or 0),
+                 "trend": "flat"},
+                {"label": "浮动盈亏", "value": _f(pnl_v),
+                 "delta": self._pnl_pct_of(d), "trend": "up" if pnl_v >= 0 else "down"},
+                {"label": "可用资金", "value": _money(d.get("cash") or 0),
+                 "trend": "flat"},
+            ]}
+        out = [head, "", "```kpi", _jsonlib.dumps(kpi, ensure_ascii=False), "```", ""]
+
+        # ── 每股：名称行 + progress 双条（仓位/距止损） ──
+        cfg = self._hints_cfg()
+        total_mv = d.get("total_market_value") or 0
         for p in d["positions"][:MAX_ROWS]:
             q = d["quotes"].get(p["code"]) or {}
             price = q.get("price") or p["cost_price"]
@@ -2289,14 +2318,34 @@ class AstockPlugin(ToolPlugin):
             pnl_pct = mkt.pct_change(price, cost)
             chg_pct = q.get("change_pct")
             arrow = "▲" if (chg_pct or 0) > 0 else ("▼" if (chg_pct or 0) < 0 else "—")
-            blocks.append(
-                f"**{p['name'] or p['code']}**　{_f(price)}　{arrow}{_pct(chg_pct)}\n"
-                f"　　{shares}股 · 成本{_f(cost, 3)} · 市值{_money(mv)} · "
-                f"浮盈{_f(pnl)}（{_pct(pnl_pct)}）\n"
-                f"　　{_range_bar(q.get('low'), q.get('high'), price, cost)}")
-        body = "\n\n".join(blocks)
-        return (head + "\n\n" + body + watch_line
-                + (f"\n\n{flag}" if flag else ""))
+            out.append(f"**{p['name'] or p['code']}**　{_f(price)}　{arrow}{_pct(chg_pct)}"
+                       f"　{shares}股 · 成本{_f(cost, 3)} · 浮盈{_f(pnl)}（{_pct(pnl_pct)}）")
+            items: List[Dict[str, Any]] = []
+            if total_mv > 0:
+                weight = mv / total_mv * 100
+                cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
+                items.append({"label": f"仓位（上限 {cap:g}%）", "value": round(weight, 1),
+                              "note": "超限" if weight > cap else ""})
+            stop_pct = abs(float(cfg.stop_loss_pct or 0))
+            if pnl_pct is not None and stop_pct > 0:
+                used = max(0.0, min(100.0, -pnl_pct / stop_pct * 100)) if pnl_pct < 0 else 0
+                items.append({"label": f"距止损（阈值 -{stop_pct:g}%）",
+                              "value": round(used, 1),
+                              "note": _pct(pnl_pct) if pnl_pct < 0 else "浮盈中"})
+            if items:
+                out += ["```progress", _jsonlib.dumps({"items": items}, ensure_ascii=False), "```", ""]
+        out.append(watch_line.strip() if watch_line.strip() else "")
+        if flag:
+            out.append(flag)
+        return "\n".join(x for x in out if x is not None).rstrip() + "\n"
+
+    def _pnl_pct_of(self, d: Dict[str, Any]) -> str:
+        """组合层浮动盈亏率（成本基数为 0 时显示 '-'）。"""
+        cost_base = sum(float(p.get("cost_price") or 0) * int(p.get("shares") or 0)
+                        for p in d.get("positions") or [])
+        if cost_base <= 0:
+            return "-"
+        return _pct((d.get("float_pnl") or 0) / cost_base * 100)
 
     def _panel_watch_line(self) -> str:
         """面板里的盯盘状态行（含"去哪儿点按钮"的指引）。
@@ -2421,38 +2470,3 @@ class AstockPlugin(ToolPlugin):
 # ---------------------------------------------------------------- 排版辅助
 
 
-def _range_bar(low: Any, high: Any, price: Any, cost: Any = None,
-               width: int = 9) -> str:
-    """把「现价在区间里的位置」画成一行刻度条（纯文本，窄栏也读得出来）。
-
-    为什么用文字条而不是 Markdown 表格：右栏只有 331px，6 列表格会被挤变形、
-    数值竖着排成一列读不出；一行 `27.5├──●──┤30.0` 只占十来个字符，却能一眼
-    看出「贴近上沿还是下沿」。`◇` 是成本线（落在区间内时才画）。
-
-    数据缺失时返回一行说明而不是画错的图——**画不出来的宁可明说**。
-    """
-    try:
-        lo = float(low) if low is not None else None
-        hi = float(high) if high is not None else None
-        px = float(price) if price is not None else None
-    except (TypeError, ValueError):
-        return "（区间数据缺失）"
-    if lo is None or hi is None or px is None or hi <= lo:
-        return "（区间数据缺失）"
-    n = max(5, int(width))
-    ratio = (px - lo) / (hi - lo)
-    ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1 else ratio)
-    idx = int(round(ratio * (n - 1)))
-    cells = ["─"] * n
-    cells[idx] = "●"
-    # 成本线落在区间内时一并标出——"成本在山腰还是山顶"是要紧信息
-    if cost:
-        try:
-            c = float(cost)
-            if lo <= c <= hi:
-                ci = max(0, min(n - 1, int(round((c - lo) / (hi - lo) * (n - 1)))))
-                if ci != idx:
-                    cells[ci] = "◇"
-        except (TypeError, ValueError):
-            pass
-    return f"{lo:g}├{''.join(cells)}┤{hi:g}　现价处区间 {ratio * 100:.0f}%"

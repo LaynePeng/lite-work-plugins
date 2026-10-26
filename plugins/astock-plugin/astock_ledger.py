@@ -586,10 +586,21 @@ class Ledger:
                 "name": name}
 
 
+#: 台账的**全局固定位置**：`~/.lite-work/astock-data/ledger.sqlite`。
+#:
+#: 跨平台：macOS/Linux = `~/.lite-work/`；Windows = `C:\Users\<用户>\.lite-work\`
+#: （宿主 config/logs/plugins 同在此目录，插件数据与宿主全局数据同层）。
+#:
+#: 为什么不再用 `<workspace>/.astock/`：台账是用户的**账户数据**，不是项目
+#: 文件——跟随工作区会导致「换个项目/换种启动方式就冒出一份空账」，用户
+#: 以为持仓丢了。全局唯一位置 + 设置页可覆盖（ledger_path 绝对路径）。
+_LEDGER_DIR = os.path.join(os.path.expanduser("~"), ".lite-work", "astock-data")
+
+
 def default_ledger_path(workspace: str = "") -> str:
-    """默认台账位置：<workspace>/.astock/ledger.sqlite；无 workspace 时落到家目录。"""
-    base = (workspace or "").strip()
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), ".lite-work")
-    return os.path.join(os.path.abspath(os.path.expanduser(base)),
-                        ".astock", "ledger.sqlite")
+    """默认台账路径：`~/.lite-work/astock-data/ledger.sqlite`（全局，与工作区无关）。
+
+    `workspace` 参数保留仅为兼容旧调用签名（**不参与路径计算**）。
+    显式配置（设置页 ledger_path）仍优先于本默认。
+    """
+    return os.path.join(_LEDGER_DIR, "ledger.sqlite")
