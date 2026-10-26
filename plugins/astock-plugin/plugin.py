@@ -505,73 +505,31 @@ class AStockWatch(WatchSource):
         if self._eod_done_date == today:
             return None
 
-        path = str(own.get("ledger_path") or "").strip() or default_ledger_path(workspace)
-        name_by_code: Dict[str, str] = {}
-        try:
-            ledger = Ledger(path)
-            codes: List[str] = []
-            for p in ledger.list_positions():
-                codes.append(p["code"])
-                name_by_code[p["code"]] = p.get("name") or ""
-            for w in ledger.list_watch():
-                if w["code"] not in codes:
-                    codes.append(w["code"])
-                name_by_code.setdefault(w["code"], w.get("name") or "")
-        except Exception:
-            return None
-        if not codes:
-            return None
-
         self._eod_done_date = today  # 先记账再干活（失败也不重试，明天再来）
+        # 注意：_eod_report_text 走 _get_ledger()（读插件自己的台账句柄，
+        # 路径配置以插件设置页为准）；盯梢上下文的 own.ledger_path 覆盖
+        # 与之同源（都是 config["astock-plugin"]），不会分叉。
+        text = await portfolio_sentiment_report(self._eod_ledger(own, workspace), manual=False)
+        if not text:
+            return None
+        return self._eod_wrap_probe_result(text, today)
 
-        parts: List[str] = [
-            f"## 📊 盘后舆情报告（{today}）",
-            "",
-            f"覆盖 {len(codes)} 只标的（持仓+自选）。数据来源七类证据，"
-            f"**只列事实与背离，不预测涨跌**。",
-            "",
-        ]
-        aligned: List[str] = []
-        conflicted: List[str] = []
-        for code in codes[:10]:
-            try:
-                collected = await asyncio.to_thread(
-                    senti_data.collect, code, "")   # scope 留空=默认全量七类
-                rep = await asyncio.to_thread(
-                    senti.summarize, collected["items"], code, "",
-                    collected["errors"], collected["extras"])
-            except Exception:
-                continue
-            # 名称以台账为准（行情/舆情接口对代码查询常不给名称），
-            # 台账没有再用收集结果里第一条带名称的证据
-            name = name_by_code.get(code) or next(
-                (getattr(x, "name", "") for x in collected.get("items", [])
-                 if getattr(x, "name", "")), code)
-            tone_mark = {"aligned_positive": "🟢", "conflicted": "🟡",
-                         "aligned_negative": "🔴", "thin": "⚪"}.get(rep.tone, "⚪")
-            line = f"- {tone_mark} **{name}（{code}）**：{rep.tone_text or rep.tone}"
-            parts.append(line)
-            if rep.conflicts:
-                conflicted.append(f"{name}（{code}）")
-                for c in rep.conflicts[:1]:
-                    parts.append(f"  - ⚠️ 背离：{c.title}")
-            elif rep.tone == "aligned_positive":
-                aligned.append(f"{name}（{code}）")
-        parts.append("")
-        if conflicted:
-            parts.append(f"**⚠️ 背离标的（{len(conflicted)} 只）**：{'、'.join(conflicted)}"
-                         f" —— 按「以客观数据为准」原则，融资余额止跌回升前不宜据研报加仓。")
-        if aligned:
-            parts.append(f"**✅ 同向偏正（{len(aligned)} 只）**：{'、'.join(aligned)}")
-        if not conflicted and not aligned:
-            parts.append("今日证据量普遍偏薄（thin），无明确方向。")
+    @staticmethod
+    def _eod_ledger(own: Dict[str, Any], workspace: str) -> "Ledger":
+        """Watch 侧拿台账句柄（Plugin 的 _get_ledger 是实例方法，这里独立）。"""
+        path = str(own.get("ledger_path") or "").strip() or default_ledger_path(workspace)
+        return Ledger(path)
 
-        report_text = "\n".join(parts)
+    def _eod_wrap_probe_result(self, text: str, today: str) -> Any:
+        """盘后报告文本 → ProbeResult（分离出来便于 summary 计数）。"""
+        import re as _re
+        conflicted = _re.findall(r"🟡", text)
+        aligned = _re.findall(r"🟢", text)
         return ProbeResult(
             snapshot=f"eod-report:{today}",
-            summary=f"盘后舆情报告：{len(codes)} 只标的，"
-                    f"背离 {len(conflicted)} 只 / 同向 {len(aligned)} 只",
-            changed_hint=report_text)
+            summary=f"盘后舆情报告：背离 {len(conflicted)} 只 / 同向 {len(aligned)} 只",
+            changed_hint=text)
+
 
     # -------------------------------------------------- 盯梢辅助
 
@@ -753,7 +711,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.3.0"
+    version = "1.3.1"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -1106,7 +1064,9 @@ class AstockPlugin(ToolPlugin):
                     "相关新闻、市场热度、龙虎榜、融资融券、股东户数。每条标可靠度"
                     "（事实/观点/媒体/情绪）与影响方向，并**优先给出信号背离提示**"
                     "（如「研报偏多但融资余额下降」）。不合成情绪分、不预测涨跌。"
-                    "可选返回行业背景与全市场快讯。"),
+                    "可选返回行业背景与全市场快讯。"
+                    "code 传 **portfolio** ＝跑持仓+自选的全量组合报告"
+                    "（与盘后自动报告同款输出）。"),
                 parameters={
                     "type": "object",
                     "properties": {
@@ -2078,7 +2038,11 @@ class AstockPlugin(ToolPlugin):
         code_raw = str(args.get("code") or "").strip()
         if not code_raw:
             return ("[Error] 需要 code。舆情按标的维度分析——"
-                    "要查行业/宏观事件请传 scope 含 feed 并给出可关联的标的代码。")
+                    "要查行业/宏观事件请传 scope 含 feed 并给出可关联的标的代码。"
+                    "跑持仓+自选全量请传 code=portfolio。")
+        # 组合模式：持仓+自选全量舆情报告（与盘后自动报告同一实现）
+        if code_raw.lower() == "portfolio":
+            return await portfolio_sentiment_report(self._get_ledger(), manual=True)
         code, _ = mkt.normalize_code(code_raw)
         scope = args.get("scope") or []
         if isinstance(scope, str):
@@ -2579,3 +2543,67 @@ class AstockPlugin(ToolPlugin):
 # ---------------------------------------------------------------- 排版辅助
 
 
+# ---------------------------------------------------------------- 组合舆情报告
+
+async def portfolio_sentiment_report(ledger: "Ledger",
+                                     manual: bool = False) -> str:
+    """持仓+自选的全量舆情报告（盘后自动与对话手动共用一份实现）。
+
+    - 每只标的：七类证据收集 → tone 判定 → 首要背离；
+    - 组合层：背离清单 + 同向清单 + 操作纪律提示；
+    - 名称以台账为准（舆情接口按代码查询常不给名称）；
+    - 覆盖 ≤10 只（更多无意义且请求太重）。
+    """
+    name_by_code: Dict[str, str] = {}
+    codes: List[str] = []
+    for p in ledger.list_positions():
+        codes.append(p["code"])
+        name_by_code[p["code"]] = p.get("name") or ""
+    for w in ledger.list_watch():
+        if w["code"] not in codes:
+            codes.append(w["code"])
+        name_by_code.setdefault(w["code"], w.get("name") or "")
+    if not codes:
+        return "台账里没有持仓或自选，先录入（astock_record / astock_watch）。"
+
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    parts: List[str] = [
+        f"## 📊 {'组合舆情报告' if manual else '盘后舆情报告'}（{today}）",
+        "",
+        f"覆盖 {len(codes)} 只标的（持仓+自选）。数据来源七类证据，"
+        f"**只列事实与背离，不预测涨跌**。",
+        "",
+    ]
+    aligned: List[str] = []
+    conflicted: List[str] = []
+    for code in codes[:10]:
+        try:
+            collected = await asyncio.to_thread(
+                senti_data.collect, code, "")   # scope 留空=默认全量七类
+            rep = await asyncio.to_thread(
+                senti.summarize, collected["items"], code, "",
+                collected["errors"], collected["extras"])
+        except Exception:
+            continue
+        name = name_by_code.get(code) or next(
+            (getattr(x, "name", "") for x in collected.get("items", [])
+             if getattr(x, "name", "")), code)
+        tone_mark = {"aligned_positive": "🟢", "conflicted": "🟡",
+                     "aligned_negative": "🔴", "thin": "⚪"}.get(rep.tone, "⚪")
+        parts.append(f"- {tone_mark} **{name}（{code}）**：{rep.tone_text or rep.tone}")
+        if rep.conflicts:
+            conflicted.append(f"{name}（{code}）")
+            for c in rep.conflicts[:1]:
+                parts.append(f"  - ⚠️ 背离：{c.title}")
+        elif rep.tone == "aligned_positive":
+            aligned.append(f"{name}（{code}）")
+    parts.append("")
+    if conflicted:
+        parts.append(f"**⚠️ 背离标的（{len(conflicted)} 只）**：{'、'.join(conflicted)}"
+                     f" —— 按「以客观数据为准」原则，融资余额止跌回升前不宜据研报加仓。")
+    if aligned:
+        parts.append(f"**✅ 同向偏正（{len(aligned)} 只）**：{'、'.join(aligned)}")
+    if not conflicted and not aligned:
+        parts.append("今日证据量普遍偏薄（thin），无明确方向。")
+    return "\n".join(parts)
