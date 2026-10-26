@@ -711,7 +711,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.3.2"
+    version = "1.4.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -806,6 +806,28 @@ class AstockPlugin(ToolPlugin):
         ],
         "panels": [
             {"id": "portfolio", "title": "持仓"},
+        ],
+        # 斜杠命令：宿主把它们放进输入框的 / 命令面板（快捷提示）。
+        # 输入后原样透传给 Agent——靠 description 引导 Agent 调对应工具，
+        # 所以描述里写明「调什么工具、看什么」。用户少打十几个字。
+        "commands": [
+            {"name": "持仓",
+             "description": "看持仓：调 astock_portfolio 出看板（现价/浮盈/信号）",
+             "argsHint": ""},
+            {"name": "舆情",
+             "description": "跑组合舆情报告：调 astock_sentiment code=portfolio"
+                            "（持仓+自选全量，背离/同向清单）",
+             "argsHint": "[个股代码=只看一只]"},
+            {"name": "提示",
+             "description": "下单提示：调 astock_hint（该不该动/动多少/条件单参数）",
+             "argsHint": "[代码]"},
+            {"name": "事件",
+             "description": "扫市场事件：调 astock_screen 按资金/异动筛一遍，"
+                            "再对入选标的跑舆情背离——只列事实不预测",
+             "argsHint": ""},
+            {"name": "盯盘",
+             "description": "盯盘开关与状态：调 astock_watch action=status",
+             "argsHint": "[start|stop]"},
         ],
     }
 
