@@ -2075,31 +2075,35 @@ class AstockPlugin(ToolPlugin):
         return {"ok": True, "message": msg, "watch_enabled": want}
 
     def _action_test_mail(self, own: Dict[str, Any],
-                          config: Dict[str, Any]) -> Dict[str, Any]:
-        """发一封测试邮件，验证账号/授权码是否正确。
+                          _config: Dict[str, Any]) -> Dict[str, Any]:
+        """发一封测试邮件，验证"邮件通道是否真的可用"。
 
-        设置页按钮是**用户显式点击**触发的（不是无人值守），所以这里同步发信
-        是可接受的（最多等 SMTP 超时 15 秒）。失败原因要说人话——
-        "认证失败"九成是用了登录密码而不是授权码，这条必须写出来。
+        与盯梢通知走**同一条通道**（复用 email-plugin 的发信函数），
+        所以测试通过就等于线上可用——不是另写一套测试路径。
+
+        设置页按钮由用户显式点击触发（非无人值守），因此这里同步发信可接受
+        （最长等 SMTP 超时 15 秒）。失败原因要说人话：认证失败九成是用了
+        登录密码而非授权码，这条必须写出来。
         """
-        email_cfg = config.get("email-plugin") if isinstance(config, dict) else {}
-        mcfg = notify.build_mail_config(
-            own, email_cfg if isinstance(email_cfg, dict) else {},
-            notify.email_plugin_credentials())
+        if not notify.module_available():
+            return {"ok": False, "message": (
+                "未找到 email-plugin。请先安装并在「设置 → 插件 → email-plugin」"
+                "里配好邮箱账号（本插件不单独收邮箱凭据，直接复用它）")}
+        mcfg = notify.build_mail_config(own)
         mcfg.enabled = True          # 测试发送无视主开关，方便先验证再启用
         ok, why = mcfg.ready()
         if not ok:
-            return {"ok": False, "message": f"配置不完整：{why}"}
+            return {"ok": False, "message": why}
+
         st = mkt.trading_status()
+        to_text = ", ".join(mcfg.mail_to) if mcfg.mail_to else "（发送给 email-plugin 的发件邮箱自己）"
         subject = "[A股助手] 测试邮件"
         body = (
             "这是一封来自 A 股助手插件的测试邮件。\n\n"
-            "收到它说明 SMTP 配置可用，高风险信号届时会通过这个邮箱通知你。\n\n"
-            f"配置摘要：\n"
-            f"  服务器：{mcfg.smtp_host}:{mcfg.smtp_port}（{mcfg.smtp_security}）\n"
-            f"  账号：{mcfg.username}\n"
-            f"  收件人：{', '.join(mcfg.mail_to)}\n"
-            f"  通知阈值：{mcfg.min_level}\n\n"
+            "收到它说明邮件通道可用，高风险信号届时会通过 email-plugin 的邮箱"
+            "通知你。\n\n"
+            f"收件人：{to_text}\n"
+            f"通知阈值：{mcfg.min_level}\n"
             f"当前时间：{st.get('now')}（{st.get('phase')}）\n\n"
             "提醒：邮件只发【计划外】的高风险变化；你挂了条件单的止损/止盈"
             "由券商自动执行，插件不会重复催办。\n"
@@ -2108,20 +2112,19 @@ class AstockPlugin(ToolPlugin):
             '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;'
             'max-width:560px;padding:16px">'
             '<h3 style="margin:0 0 12px">A 股助手 · 测试邮件</h3>'
-            '<p>收到这封邮件说明 SMTP 配置可用，高风险信号届时会通过它通知你。</p>'
+            '<p>收到这封邮件说明邮件通道可用，高风险信号届时会通过它通知你。</p>'
             '<table style="font-size:13px;color:#5f6368;border-collapse:collapse">'
-            f'<tr><td>服务器</td><td>{notify._esc(mcfg.smtp_host)}:{mcfg.smtp_port}'
-            f'（{notify._esc(mcfg.smtp_security)}）</td></tr>'
-            f'<tr><td>账号</td><td>{notify._esc(mcfg.username)}</td></tr>'
-            f'<tr><td>收件人</td><td>{notify._esc(", ".join(mcfg.mail_to))}</td></tr>'
+            f'<tr><td>收件人</td><td>{notify._esc(to_text)}</td></tr>'
             f'<tr><td>通知阈值</td><td>{notify._esc(mcfg.min_level)}</td></tr>'
+            f'<tr><td>当前时间</td><td>{notify._esc(st.get("now"))}'
+            f'（{notify._esc(st.get("phase"))}）</td></tr>'
             '</table>'
             '<p style="color:#80868b;font-size:12px">'
             '邮件只发【计划外】的高风险变化；已挂条件单的止损/止盈由券商自动执行，'
             '插件不会重复催办。</p></div>'
         )
-        ok, msg = self._notifier.send(mcfg, subject, body, html)
-        return {"ok": ok, "message": ("测试邮件" + msg) if ok else msg}
+        sent, detail = self._notifier.send(mcfg, self._app, subject, body, html)
+        return {"ok": sent, "message": ("测试邮件" + detail) if sent else detail}
 
     def _save_plugin_config(self, updates: Dict[str, Any]) -> str:
         app = self._app

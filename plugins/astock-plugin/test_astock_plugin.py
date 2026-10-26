@@ -66,6 +66,8 @@ _SPEC.loader.exec_module(astock)  # type: ignore[union-attr]
 
 mkt = astock.mkt
 orders_mod = astock.orders
+# 复用 plugin 内部已导入的 astock_notify（同一模块对象）
+notify_mod = astock.notify
 ledger_mod = astock.Ledger
 hints = astock.hints
 
@@ -1851,7 +1853,8 @@ class TestSettingsConsistency(unittest.TestCase):
 
     def setUp(self):
         import re
-        self.src = open(os.path.join(_HERE, "plugin.py"), encoding="utf-8").read()
+        with open(os.path.join(_HERE, "plugin.py"), encoding="utf-8") as _f:
+            self.src = _f.read()
         m = re.search(r'"settings": \[(.*?)\n        \],\n        "panels"',
                       self.src, re.S)
         self.block = m.group(1) if m else ""
@@ -1880,8 +1883,8 @@ class TestSettingsConsistency(unittest.TestCase):
         import astock_hints as h
         body = self.src.replace(self.block, "")       # 排除声明块本身
         # 通知类键由 astock_notify.build_mail_config 读取（另一个模块）
-        notify_src = open(os.path.join(_HERE, "astock_notify.py"),
-                          encoding="utf-8").read()
+        with open(os.path.join(_HERE, "astock_notify.py"), encoding="utf-8") as _f:
+            notify_src = _f.read()
         combined = body + notify_src
         hint_fields = set(h.HintsConfig().__dataclass_fields__)
         unused = [k for k in self.declared
@@ -1892,13 +1895,125 @@ class TestSettingsConsistency(unittest.TestCase):
         """代码读取的 email_/watch_ 前缀键必须有声明（否则用户改不了）。"""
         import astock_notify as n
         import re as _re
-        notify_src = open(os.path.join(_HERE, "astock_notify.py"),
-                          encoding="utf-8").read()
+        with open(os.path.join(_HERE, "astock_notify.py"), encoding="utf-8") as _f:
+            notify_src = _f.read()
         read = set(_re.findall(r'own\.get\("(\w+)"\)', notify_src))
         read |= set(_re.findall(r'pick\("(\w+)"', self.src))
         missing = [k for k in sorted(read)
                    if k.startswith(("email_", "watch_")) and k not in self.declared]
         self.assertEqual(missing, [], f"代码读取但未声明的键：{missing}")
+
+
+class TestSettingsActions(unittest.TestCase):
+    """设置页动作按钮：这两个 action 是用户唯一能点的插件控件，必须不抛异常。
+
+    回归背景（真实报障）：把邮件通知从"自建 SMTP"改为"复用 email-plugin"后，
+    `_action_test_mail` 漏改——它仍在调用已删除的
+    `notify.email_plugin_credentials()`，并访问新 MailConfig 里不存在的
+    smtp_host/username 字段。用户在设置页一点「发送测试邮件」就 500：
+      module 'astock_notify' has no attribute 'email_plugin_credentials'
+    这类"只改一半"的重构，功能测试测不出来（因为动作入口没被覆盖）。
+    """
+
+    def setUp(self):
+        self._saved = sys.modules.get(notify_mod._EMAIL_MODULE_KEY, "MISSING")
+        self.sent: list = []
+
+        class App:
+            workspace = tempfile.mkdtemp(prefix="astock-act-")
+            config = {"astock-plugin": {}}
+
+            def save_config(self, upd):
+                for k, v in upd.items():
+                    App.config.setdefault(k, {}).update(v)
+
+        self.App = App
+        self.plugin = astock.AstockPlugin()
+        self.plugin._app = App()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.App.workspace, ignore_errors=True)
+        if self._saved == "MISSING":
+            sys.modules.pop(notify_mod._EMAIL_MODULE_KEY, None)
+        else:
+            sys.modules[notify_mod._EMAIL_MODULE_KEY] = self._saved
+
+    def _inject_email_plugin(self, auth_err=""):
+        sent = self.sent
+        m = types.ModuleType(notify_mod._EMAIL_MODULE_KEY)
+
+        def _auth_material(app):
+            if auth_err:
+                return "", "", "", auth_err
+            return "me@test.com", "tok", "basic", ""
+
+        m._auth_material = _auth_material
+        m._own_cfg = lambda app: {"smtp_host": "h", "smtp_port": 465,
+                                  "smtp_tls": "ssl"}
+        m._build_msg = (lambda frm, to, cc, bcc, subj, body, html, att, headers=None:
+                        {"to": list(to), "subject": subj})
+        m._smtp_send = (lambda h, p, u, s, f, msg, auth_mode="basic", smtp_tls="ssl":
+                        sent.append(msg))
+        sys.modules[notify_mod._EMAIL_MODULE_KEY] = m
+
+    # ---------- 发送测试邮件 ----------
+
+    def test_test_mail_does_not_raise(self):
+        """真实报障的回归：无论如何都不能抛 AttributeError（会变成 500）。"""
+        self._inject_email_plugin()
+        res = self.plugin.settings_action("email_test_send", self.App.config)
+        self.assertIsInstance(res, dict)
+        self.assertIn("ok", res)
+        self.assertIn("message", res)
+
+    def test_test_mail_sends_when_configured(self):
+        self._inject_email_plugin()
+        res = self.plugin.settings_action("email_test_send", self.App.config)
+        self.assertTrue(res["ok"], res.get("message"))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_test_mail_ignores_main_switch(self):
+        """测试发送无视「高风险邮件通知」主开关（先验证再启用是正常流程）。"""
+        self._inject_email_plugin()
+        self.App.config["astock-plugin"]["email_notify_enabled"] = False
+        res = self.plugin.settings_action("email_test_send", self.App.config)
+        self.assertTrue(res["ok"], res.get("message"))
+
+    def test_test_mail_reports_missing_plugin(self):
+        """email-plugin 不可用时给可操作提示，而不是抛异常。"""
+        sys.modules.pop(notify_mod._EMAIL_MODULE_KEY, None)
+        import unittest.mock as mock
+        with mock.patch.object(notify_mod, "_find_email_plugin", return_value=None):
+            res = self.plugin.settings_action("email_test_send", self.App.config)
+        self.assertFalse(res["ok"])
+        self.assertIn("email-plugin", res["message"])
+
+    def test_test_mail_reports_bad_credentials(self):
+        self._inject_email_plugin(auth_err="邮箱账号未配置：请在设置页填写")
+        res = self.plugin.settings_action("email_test_send", self.App.config)
+        self.assertFalse(res["ok"])
+        self.assertIn("凭据不可用", res["message"])
+
+    def test_test_mail_recipient_uses_email_plugin_sender(self):
+        """收件人留空 → 发给 email-plugin 的发件邮箱自己。"""
+        self._inject_email_plugin()
+        res = self.plugin.settings_action("email_test_send", self.App.config)
+        self.assertTrue(res["ok"])
+        self.assertEqual(self.sent[0]["to"], ["me@test.com"])
+
+    # ---------- 盯盘开关 ----------
+
+    def test_watch_toggle_does_not_raise(self):
+        res = self.plugin.settings_action("watch_toggle", self.App.config)
+        self.assertIsInstance(res, dict)
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["watch_enabled"])          # 默认开 → 点一下关
+
+    def test_unknown_action_returns_error(self):
+        res = self.plugin.settings_action("no_such_action", self.App.config)
+        self.assertFalse(res["ok"])
+        self.assertIn("未知动作", res["message"])
 
 
 if __name__ == "__main__":
