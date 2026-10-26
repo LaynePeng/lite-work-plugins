@@ -326,9 +326,15 @@ class AStockWatch(WatchSource):
         # ② 交易时段自律：非交易时段不查行情、不产生信号。
         #    **这是"什么时候开始盯"的真正答案**——不用你设闹钟，也不用
         #    24 小时常驻：工作日 9:10 起、15:00 止，午休自动跳过。
+        #    例外：交易日 15:05–16:00 的首次探测触发【盘后舆情报告】
+        #    （收盘了、舆情数据齐了，跑一轮全量分析；当天只跑一次）。
         if _as_bool(own.get("watch_only_trading_hours"), True):
             ok_now, why = mkt.should_watch_now()
             if not ok_now:
+                report = await self._maybe_eod_report(own, why,
+                                                      str(getattr(ctx, "workspace", "") or ""))
+                if report is not None:
+                    return report
                 return ProbeResult(
                     snapshot="",
                     summary=f"当前不盯盘：{why}（下次 {mkt.next_watch_window()}）")
@@ -463,6 +469,109 @@ class AStockWatch(WatchSource):
             snapshot=snapshot,
             summary=f"{len(signals)} 条异动信号",
             changed_hint="信号变化：\n" + "\n".join(detail_lines[:10]))
+
+    # -------------------------------------------------- 盘后舆情报告
+
+    #: 盘后报告窗口与去重状态（当天只跑一次）
+    _EOD_WINDOW = ("15:05", "16:00")
+    _eod_done_date: Optional[str] = None
+
+    async def _maybe_eod_report(self, own: Dict[str, Any],
+                                why_not_watch: str,
+                                workspace: str = "") -> Optional[Any]:
+        """交易日收盘后的【盘后舆情报告】：全量跑持仓+自选舆情，富围栏输出。
+
+        触发条件（全满足才跑）：
+        - 今天是交易日且时间在 15:05–16:00（收盘后数据齐全的窗口）；
+        - 当天还没跑过（`_eod_done_date` 去重——探针每 5 分钟一次，
+          窗口内会进 11 次，只第一次真正干活）；
+        - 台账里至少有一只持仓或自选（没数据跑报告没有意义）。
+
+        报告 = 唤醒 Agent 一次（token 花在这里），内容含：
+        - 每只标的的证据方向 + 背离摘要（复用 senti.summarize）；
+        - 组合层结论：谁同向、谁背离、该警惕什么。
+        返回 None 表示「不在窗口/已跑过/无标的」→ 调用方走正常静默路径。
+        """
+        import datetime as _dt
+        now = _dt.datetime.now()
+        hhmm = now.strftime("%H:%M")
+        today = now.date().isoformat()
+        # 只有"刚收盘"这种 not-watch 原因才考虑盘后报告；
+        # 周末/清晨/深夜等原因直接跳过（报告属于交易日收盘后的动作）
+        if "收盘" not in why_not_watch:
+            return None
+        if not (self._EOD_WINDOW[0] <= hhmm < self._EOD_WINDOW[1]):
+            return None
+        if self._eod_done_date == today:
+            return None
+
+        path = str(own.get("ledger_path") or "").strip() or default_ledger_path(workspace)
+        name_by_code: Dict[str, str] = {}
+        try:
+            ledger = Ledger(path)
+            codes: List[str] = []
+            for p in ledger.list_positions():
+                codes.append(p["code"])
+                name_by_code[p["code"]] = p.get("name") or ""
+            for w in ledger.list_watch():
+                if w["code"] not in codes:
+                    codes.append(w["code"])
+                name_by_code.setdefault(w["code"], w.get("name") or "")
+        except Exception:
+            return None
+        if not codes:
+            return None
+
+        self._eod_done_date = today  # 先记账再干活（失败也不重试，明天再来）
+
+        parts: List[str] = [
+            f"## 📊 盘后舆情报告（{today}）",
+            "",
+            f"覆盖 {len(codes)} 只标的（持仓+自选）。数据来源七类证据，"
+            f"**只列事实与背离，不预测涨跌**。",
+            "",
+        ]
+        aligned: List[str] = []
+        conflicted: List[str] = []
+        for code in codes[:10]:
+            try:
+                collected = await asyncio.to_thread(
+                    senti_data.collect, code, "")   # scope 留空=默认全量七类
+                rep = await asyncio.to_thread(
+                    senti.summarize, collected["items"], code, "",
+                    collected["errors"], collected["extras"])
+            except Exception:
+                continue
+            # 名称以台账为准（行情/舆情接口对代码查询常不给名称），
+            # 台账没有再用收集结果里第一条带名称的证据
+            name = name_by_code.get(code) or next(
+                (getattr(x, "name", "") for x in collected.get("items", [])
+                 if getattr(x, "name", "")), code)
+            tone_mark = {"aligned_positive": "🟢", "conflicted": "🟡",
+                         "aligned_negative": "🔴", "thin": "⚪"}.get(rep.tone, "⚪")
+            line = f"- {tone_mark} **{name}（{code}）**：{rep.tone_text or rep.tone}"
+            parts.append(line)
+            if rep.conflicts:
+                conflicted.append(f"{name}（{code}）")
+                for c in rep.conflicts[:1]:
+                    parts.append(f"  - ⚠️ 背离：{c.title}")
+            elif rep.tone == "aligned_positive":
+                aligned.append(f"{name}（{code}）")
+        parts.append("")
+        if conflicted:
+            parts.append(f"**⚠️ 背离标的（{len(conflicted)} 只）**：{'、'.join(conflicted)}"
+                         f" —— 按「以客观数据为准」原则，融资余额止跌回升前不宜据研报加仓。")
+        if aligned:
+            parts.append(f"**✅ 同向偏正（{len(aligned)} 只）**：{'、'.join(aligned)}")
+        if not conflicted and not aligned:
+            parts.append("今日证据量普遍偏薄（thin），无明确方向。")
+
+        report_text = "\n".join(parts)
+        return ProbeResult(
+            snapshot=f"eod-report:{today}",
+            summary=f"盘后舆情报告：{len(codes)} 只标的，"
+                    f"背离 {len(conflicted)} 只 / 同向 {len(aligned)} 只",
+            changed_hint=report_text)
 
     # -------------------------------------------------- 盯梢辅助
 
@@ -644,7 +753,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.2.0"
+    version = "1.3.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
