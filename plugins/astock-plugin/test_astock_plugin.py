@@ -773,6 +773,92 @@ class TestWatchControl(unittest.TestCase):
         self.assertIn("不盯盘", res.summary)
 
 
+class TestPriceRulesInProbe(unittest.TestCase):
+    """精确价位规则接入 probe()（v2.1.4，并入原 ruthless-watch）。
+
+    覆盖迁移后最容易出错的两点：
+    ① 规则写在**设置页**也要生效（早先只读计划级 cfg，导致整条链路静默无信号）；
+    ② `once_per_day` 必须真的去重——价位条件持续满足，不去重就是每 5 分钟
+       一封，很快撞上限流上限、然后一整天不再报新信号。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="astock-prule-")
+        self.ledger_path = os.path.join(self.tmp, "ledger.sqlite")
+        lg = ledger_mod(self.ledger_path)
+        import datetime as dt
+        yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        lg.record_trade("000651", "buy", 38.0, 1000, trade_date=yday, name="格力电器")
+        self.watch = astock.AStockWatch()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ctx(self, extra):
+        cfg = {"ledger_path": self.ledger_path, "watch_enabled": True,
+               "watch_only_trading_hours": False}
+        cfg.update(extra)
+        return types.SimpleNamespace(
+            config={"astock-plugin": cfg}, workspace=self.tmp)
+
+    def _run(self, price=35.5, extra=None, cfg=None):
+        import asyncio
+        from unittest.mock import patch
+        import astock_data as d
+        from astock_data import Quote
+        q = Quote(code="000651", venue="sz", name="格力电器", price=price,
+                  prev_close=36.2, change_pct=-1.93, volume_ratio=1.3)
+
+        def fake(items, use_cache=True):
+            return [q]
+        with patch.object(d, "fetch_quotes", fake):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    self.watch.probe(cfg or {}, self._ctx(extra or {})))
+            finally:
+                loop.close()
+
+    RULES = [{"code": "000651", "name": "格力电器", "kind": "stop_loss",
+              "price": 36.0, "op": "lt", "label": "跌破前低 36.00 清仓",
+              "severity": "urgent"}]
+
+    def test_rule_from_settings_page(self):
+        """规则写在设置页（own）也要生效——真实踩过的静默失效。"""
+        res = self._run(price=35.5, extra={"rules": self.RULES})
+        self.assertIn("000651:stop_loss:36", res.snapshot)
+        self.assertIn("跌破前低", res.changed_hint)
+
+    def test_rule_from_plan_config(self):
+        """规则写在计划级 probe_config（cfg）优先。"""
+        res = self._run(price=35.5, cfg={"rules": self.RULES})
+        self.assertIn("000651:stop_loss:36", res.snapshot)
+
+    def test_once_per_day_dedup(self):
+        res1 = self._run(price=35.5, extra={"rules": self.RULES})
+        self.assertIn("stop_loss", res1.snapshot)
+        res2 = self._run(price=35.5, extra={"rules": self.RULES})
+        self.assertEqual(res2.snapshot, "", "同一天第二次不该再报")
+
+    def test_not_triggered_when_price_above(self):
+        res = self._run(price=37.0, extra={"rules": self.RULES})
+        self.assertNotIn("stop_loss", res.snapshot)
+
+    def test_bad_rules_do_not_crash_probe(self):
+        """坏配置不能让探针报错停摆（那会连其他持仓的信号一起丢）。"""
+        res = self._run(price=35.5, extra={"rules": [
+            {"price": 10}, "垃圾", {"code": "000651", "price": "abc"}]})
+        self.assertTrue(res.ok)
+        self.assertIn("价位规则", res.summary)
+
+    def test_rule_note_in_summary(self):
+        res = self._run(price=35.5, extra={"rules": self.RULES})
+        self.assertIn("价位规则 1 条", res.summary)
+        self.assertIn("命中 1 条", res.summary)
+
+
 class TestWatchWindow(unittest.TestCase):
     """“什么时候开始盯”：交易时段判断（这是省 token 的关键闸门）。"""
 

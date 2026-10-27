@@ -158,6 +158,7 @@ from astock_mixin_watch import WatchToolsMixin
 import astock_notify as notify
 import astock_panel as panel
 import astock_plan as plan_ctl
+import astock_price_rule as price_rule
 import astock_report as report
 import astock_quant as quant
 import astock_quant_tool as quant_tool
@@ -291,6 +292,14 @@ class AStockWatch(WatchSource):
                   "gap（开盘跳空）/tail（尾盘异动）。默认全部"),
         "min_level": ("最低报告级别：urgent 只报紧急（跌停/止损）｜action 默认"
                       "（含止盈/超仓位/异动）｜info 全部。想少被打扰就设 urgent"),
+        "rules": ("**精确价位规则**（v2.1.4，数组 JSON）。要盯\"跌破前低 36.01\""
+                  "\"放量站回 37.11\"这类技术位时用它——百分比表达不出来。"
+                  "每条：{code, name?, kind, price, op, label?, severity?, "
+                  "vol_ratio_lt?, vol_ratio_gt?}；op: lt 跌破 / gt 站上 / le / ge。"
+                  "例：[{\"code\":\"000651\",\"kind\":\"stop_loss\",\"price\":36.0,"
+                  "\"op\":\"lt\",\"label\":\"跌破前低清仓\"}]"),
+        "once_per_day": ("价位规则同一信号当天只报一次（默认 true）。"
+                         "关掉后条件持续满足会每 5 分钟提醒，很快触发限流"),
     }
 
     DEFAULT_KINDS = ("stop_loss", "take_profit", "trailing", "limit_up",
@@ -302,6 +311,8 @@ class AStockWatch(WatchSource):
         # 于是每次探测都 AttributeError 被 except 吞掉 —— 通知静默失效，
         # 这种"不报错的失败"最难发现，故状态归属必须与调用方一致）
         self._notifier = notify.Notifier()
+        # 精确价位规则的"当天只报一次"状态（跨 5 分钟探测累积，故挂实例上）
+        self._price_state = price_rule.PriceRuleState()
 
     async def probe(self, cfg: Dict[str, Any], ctx: Any) -> Any:
         own = (ctx.config or {}).get(PLUGIN_NAME) if isinstance(ctx.config, dict) else {}
@@ -463,16 +474,29 @@ class AStockWatch(WatchSource):
                                             detail_lines,
                                             urgent_out=mail_entries))
 
+        # 精确价位规则（v2.1.4，并入原 ruthless-watch 的能力）：
+        # "跌破前低 36.01 清仓""放量站回 37.11"这类技术位用百分比表达不出来，
+        # 所以单列一套按写死价位判定的规则。信号塞进同一条 detail/mail 链路，
+        # 从而自动获得邮件通知、去重限流与台账上下文。
+        rule_note = self._price_rule_signals(
+            cfg, own, quotes, positions, signals, detail_lines, mail_entries)
+
         snapshot = "\n".join(sorted(signals))
         if not snapshot:
-            return ProbeResult(snapshot="", summary=f"盯 {len(quotes)} 只，无异动")
+            summary = f"盯 {len(quotes)} 只，无异动"
+            if rule_note:
+                summary += f"；{rule_note}"
+            return ProbeResult(snapshot="", summary=summary)
         # 高风险邮件通知（达到阈值的信号才发；去重与限流在 Notifier 内）。
         # app 由 ctx.config 包成最小形状传入：email-plugin 的 _own_cfg/_cfg
         # 只读 app.config，而探针上下文只给得到配置字典。
         await self._maybe_notify(own, mail_entries, _SimpleApp(ctx.config or {}))
+        summary = f"{len(signals)} 条异动信号"
+        if rule_note:
+            summary += f"；{rule_note}"
         return ProbeResult(
             snapshot=snapshot,
-            summary=f"{len(signals)} 条异动信号",
+            summary=summary,
             changed_hint="信号变化：\n" + "\n".join(detail_lines[:10]))
 
     # -------------------------------------------------- 盘后舆情报告
@@ -619,6 +643,77 @@ class AStockWatch(WatchSource):
                 kinds.add("trailing")
         return covered
 
+    def _price_rule_signals(self, cfg: Dict[str, Any], own: Dict[str, Any],
+                            quotes: List[Any],
+                            positions: Dict[str, Dict[str, Any]],
+                            signals: List[str],
+                            detail_lines: List[str],
+                            mail_entries: List[Dict[str, Any]]) -> str:
+        """精确价位规则 → 信号（v2.1.4，并入原 ruthless-watch 的能力）。
+
+        设计要点：
+        ① **配置写在 probe_config.rules**（计划编辑器里填），代码不写死标的；
+        ② 信号格式与百分比信号一致（kind/code/severity/title/detail/
+           suggestion），因此自动获得邮件通知与 Notifier 去重；
+        ③ `once_per_day` 默认 true——价位条件是**持续满足**的，跌破 36.00
+           之后只要不涨回去，每 5 分钟都会命中；不去重就是每小时 12 封邮件
+           （正好撞上限流上限，然后一整天不再报新信号）；
+        ④ **拿不到行情就如实跳过**，不猜测、不假装；
+        ⑤ 配置**两处都认**：计划级 `probe_config.rules` 优先，设置页兜底
+           （与其它阈值同语义）。只读一处会导致"设置页改了不生效"——
+           实测踩到：规则写在设置页时整条链路静默无信号。
+
+        返回一句给 summary 的补充说明（无规则时为空串）。
+        """
+        raw_rules = cfg.get("rules")
+        if raw_rules in (None, "", []):
+            raw_rules = own.get("rules")
+        rules, errs = price_rule.parse_rules(raw_rules)
+        if not rules:
+            # 有错但没规则时也要让人知道（否则用户以为配置生效了）
+            return ("价位规则全部无效：" + "；".join(errs[:2])) if errs else ""
+
+        qmap: Dict[str, Dict[str, Any]] = {}
+        for q in quotes:
+            d = q.as_dict() if hasattr(q, "as_dict") else dict(q)
+            qmap[str(d.get("code") or "")] = d
+
+        once_raw = cfg.get("once_per_day")
+        if once_raw in (None, ""):
+            once_raw = own.get("once_per_day")
+        once = True if once_raw in (None, "") else _as_bool(once_raw, True)
+        fired, tags = price_rule.evaluate(
+            rules, qmap, state=getattr(self, "_price_state", None),
+            once_per_day=once)
+
+        for sig in fired:
+            signals.append(tags[fired.index(sig)])
+            pos = positions.get(sig["code"]) or {}
+            # 台账上下文：独立插件拿不到这个（它只有 config 里的价位）
+            extra = ""
+            if pos and pos.get("cost_price"):
+                try:
+                    cost = float(pos["cost_price"])
+                    pct = (float(qmap[sig["code"]]["price"]) - cost) / cost * 100
+                    extra = f"｜持仓成本 {cost:.3f}，浮动 {pct:+.2f}%"
+                except Exception:
+                    extra = ""
+            detail_lines.append(f"- {sig['title']}｜{sig['suggestion']}")
+            mail_entries.append({
+                "code": sig["code"], "name": sig["name"], "kind": sig["kind"],
+                "severity": sig["severity"],
+                "title": sig["title"],
+                "detail": sig["detail"] + extra,
+                "suggestion": sig["suggestion"],
+            })
+
+        note = f"价位规则 {len(rules)} 条"
+        if fired:
+            note += f"，命中 {len(fired)} 条"
+        if errs:
+            note += f"（{len(errs)} 条配置有问题）"
+        return note
+
     def _session_signals(self, quotes: List[Any],
                          positions: Dict[str, Dict[str, Any]],
                          want_kinds: set,
@@ -720,7 +815,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.1.3"
+    version = "2.1.4"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
