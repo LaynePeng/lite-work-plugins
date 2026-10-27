@@ -742,7 +742,13 @@ class TestWatchControl(unittest.TestCase):
         self.assertIn("暂停", res.summary)
 
     def test_probe_respects_trading_hours_gate(self):
-        """开启时段自律时，非交易时段探针不产生信号。"""
+        """开启时段自律时，非交易时段探针不产生信号。
+
+        **必须同时屏蔽盘后报告**：`should_watch_now` 返回"已收盘"时，
+        15:05–16:00 窗口内探针会先尝试产出【盘后舆情报告】（那是另一个
+        功能）。本测试验证的是"时段闸门"，不是报告；不屏蔽会让它在
+        收盘后那段时间里偶发失败（真实踩到过：CI 上午绿、傍晚红）。
+        """
         import asyncio
         from unittest.mock import patch
         import astock_data as d
@@ -752,7 +758,12 @@ class TestWatchControl(unittest.TestCase):
                                       "watch_enabled": True,
                                       "watch_only_trading_hours": True}},
             workspace=self.tmp)
-        with patch.object(mkt, "should_watch_now", return_value=(False, "已收盘")):
+
+        async def _no_eod(*a, **k):
+            return None
+
+        with patch.object(mkt, "should_watch_now", return_value=(False, "已收盘")), \
+                patch.object(w, "_maybe_eod_report", _no_eod):
             loop = asyncio.new_event_loop()
             try:
                 res = loop.run_until_complete(w.probe({}, ctx))
@@ -1271,8 +1282,14 @@ class TestPanelRender(unittest.TestCase):
         v1.7.1 改为标准 `---` 分割线 + **盯盘**/**舆情** 各自成块。
         """
         pl = self._snapshot_stub(self._plugin("markdown"))
-        pl._panel_sentiment_flag = lambda d: "🔴 **浦发银行 舆情背离**：研报偏多但融资余额连降"
-        out = pl.panel_content("portfolio", {})
+        # 面板渲染已拆到 astock_panel（v2.1.2），所以打桩要打在模块函数上，
+        # 不是插件实例的同名方法——后者已不存在，打桩会静默无效。
+        import unittest.mock as _mock
+        import astock_panel as _panel
+        with _mock.patch.object(
+                _panel, "render_sentiment_flag",
+                lambda d: "🔴 **浦发银行 舆情背离**：研报偏多但融资余额连降"):
+            out = pl.panel_content("portfolio", {})
         # 标准 markdown 分割线（不是自造 ──）
         self.assertIn("\n---\n", out)
         self.assertNotIn("──", out)
@@ -2109,10 +2126,18 @@ class TestSettingsConsistency(unittest.TestCase):
         """
         import astock_hints as h
         body = self.src.replace(self.block, "")       # 排除声明块本身
-        # 通知类键由 astock_notify.build_mail_config 读取（另一个模块）
-        with open(os.path.join(_HERE, "astock_notify.py"), encoding="utf-8") as _f:
-            notify_src = _f.read()
-        combined = body + notify_src
+        # **扫描整个插件目录**：设置项会被任意模块读取（notify / panel / plan …）。
+        # v2.1.2 拆分后仍只拼 notify 一个模块，会让 panel_style 这类
+        # "挪到面板模块去读"的键被误判成"无人读取"。
+        parts = [body]
+        for fn in sorted(os.listdir(_HERE)):
+            if not fn.endswith(".py") or fn.startswith("test_"):
+                continue
+            if fn in ("plugin.py", "astock_hints.py"):
+                continue        # plugin 已由 self.src 提供；hints 是纯算法层
+            with open(os.path.join(_HERE, fn), encoding="utf-8") as _f:
+                parts.append(_f.read())
+        combined = "\n".join(parts)
         hint_fields = set(h.HintsConfig().__dataclass_fields__)
         unused = [k for k in self.declared
                   if f'"{k}"' not in combined and k not in hint_fields]

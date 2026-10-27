@@ -27,14 +27,23 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_sync       成交回单同步（粘贴回单→解析多笔→匹配计划→校价→落账）
     astock_watch      自选股增删查 + 盯盘开关
 
-模块分层（v2.0.0 起）
-    astock_quant / astock_quant_tool    纯计算引擎 + 取数/缓存/渲染
+模块分层（v2.0.0 起；v2.1.2 把装配层再拆细）
+    ── 纯函数 / 取数层（喂数据出结果、零网络，便于离线单测）
+    astock_quant / astock_quant_tool    打分引擎 + 取数/缓存/渲染
     astock_backtest / _tool             回测（防未来函数）+ 推荐率
     astock_archive                      本地存档（不复权口径，累积窗口）
     astock_actions                      操作指示（先卖后买）
     astock_data                         行情层（腾讯主源 + 东财 K 线备源）
-    前几者是**纯函数模块**（喂数据出结果、零网络），便于离线单测；
-    取数与缓存集中在 `*_tool` 层，不污染算法。
+    astock_advise                       策略推荐器（三套 → 一句人话结论）
+    ── 本插件专用的支撑层（v2.1.2 从本文件拆出）
+    astock_common                       配置读取 / 格式化 / 表格（最底层）
+    astock_tools                        16 个工具的 schema 声明（纯静态，450 行）
+    astock_panel                        右栏面板渲染（持仓两形态 + 选股对比）
+    astock_report                       组合舆情报告 + 事件推荐 + 自选体检
+    astock_plan                         宿主盯梢计划的自动创建/维护/体检
+    拆这些是为了让本文件只留**装配与业务编排**：面板/报告/声明各自独立，
+    改一处不必在几千行里翻找。支撑层不 import 本文件（避免循环依赖）——
+    需要的能力通过参数注入（如 `PanelContext`、`company_resolver`）。
 
 扩展点
     AStockWatch       盯梢源：自选股/持仓出现异动时才唤醒 Agent（不烧 token 盯盘）
@@ -120,13 +129,16 @@ import astock_hints as hints
 import astock_market as mkt
 import astock_notify as notify
 import astock_orders as orders
+import astock_panel as panel
 import astock_plan as plan_ctl
+import astock_report as report
 import astock_quant as quant
 import astock_quant_tool as quant_tool
 import astock_receipt as receipt
 import astock_sentiment as senti
 import astock_sentiment_data as senti_data
 import astock_sentiment_tool as senti_tool
+import astock_tools as tools_decl
 from astock_ledger import Ledger, LedgerError, default_ledger_path
 
 logger = logging.getLogger("litework.plugins.astock")
@@ -135,144 +147,63 @@ PLUGIN_NAME = "astock-plugin"
 
 #: 一次行情请求最多带多少个标的（腾讯接口实测 60+ 仍正常，留余量）
 MAX_QUOTE_BATCH = 50
-#: 面板/提示默认最多展示多少只持仓
-MAX_ROWS = 30
+# 面板展示条数上限已随渲染逻辑移到 astock_panel.MAX_ROWS（v2.1.2）：
+# 那里是窄栏可读性上限（12），与"提示最多扫多少只"不是同一件事。
 
 
 # ---------------------------------------------------------------- 配置读取
+# v2.1.2 起实现在 astock_common（面板/报告等模块也要用，避免互相 import）。
+# 这里 re-export 保持 `plugin._cfg` / `plugin.fee_config` 等旧引用不变。
 
-
-def _cfg(app: Any, key: str, default: Any = None) -> Any:
-    """读 `app.config["astock-plugin"][key]`（设置页经通用插件 UI 协议写入该命名空间）。"""
-    if app is None:
-        return default
-    cfg = getattr(app, "config", None) or {}
-    own = cfg.get(PLUGIN_NAME) if isinstance(cfg, dict) else None
-    if not isinstance(own, dict):
-        return default
-    value = own.get(key, default)
-    return default if value is None or value == "" else value
-
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    """宽容布尔解析（配置可能来自 JSON 布尔、字符串或数字）。
-
-    必要性：`bool("false")` 在 Python 里是 `True`。用户手改 config.json 写
-    `"enable_add": "false"` 时会意外打开摊平提示——这类"配置读反"的 bug
-    排查成本极高，因此统一走这个函数。
-    """
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return value != 0
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "是", "开"}
-
-
-def _num(app: Any, key: str, default: float) -> float:
-    try:
-        return float(_cfg(app, key, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _bool(app: Any, key: str, default: bool) -> bool:
-    """读插件配置里的布尔项（复用 _as_bool 的宽容解析）。"""
-    return _as_bool(_cfg(app, key, default), default)
-
-
-def fee_config(app: Any) -> mkt.FeeConfig:
-    base = mkt.FeeConfig()
-    return mkt.FeeConfig(
-        commission_rate=_num(app, "commission_rate", base.commission_rate),
-        min_commission=_num(app, "min_commission", base.min_commission),
-        stamp_tax_rate=_num(app, "stamp_tax_rate", base.stamp_tax_rate),
-        transfer_fee_rate=_num(app, "transfer_fee_rate", base.transfer_fee_rate),
-        other_rate=_num(app, "other_rate", base.other_rate),
-    )
-
-
-def hints_config(app: Any) -> hints.HintsConfig:
-    base = hints.HintsConfig()
-    out = hints.HintsConfig()
-    for key in list(out.__dataclass_fields__):
-        default = getattr(base, key)
-        if isinstance(default, bool):
-            setattr(out, key, _bool(app, key, default))
-        else:
-            setattr(out, key, _num(app, key, default))
-    return out
-
+from astock_common import (  # noqa: E402
+    _as_bool, _bool, _cfg, _num, fee_config, hints_config,
+)
 
 # ---------------------------------------------------------------- 格式化小工具
+# v2.1.2 起实现在 astock_common（面板等模块也用它，避免互相 import）。
+# 这里 re-export 保持 `plugin._f` / `plugin._table` 等旧引用与测试不变。
+
+from astock_common import (  # noqa: E402  (放在此处以保持原有文件布局)
+    _f, _money, _pct, _ratio, _span_years, _table,
+    _as_bool, _bool, _num, _cfg, fee_config, hints_config,
+)
 
 
-def _f(value: Any, digits: int = 2, dash: str = "-") -> str:
-    """安全格式化数字（None → 破折号，避免把"没有"显示成 0）。"""
-    if value is None or value == "":
-        return dash
+# ---------------------------------------------------------------- 快讯实体识别
+
+
+async def company_in_text(text: str) -> Optional[Dict[str, str]]:
+    """快讯文本 → 上市公司（搜索接口定位代码）。
+
+    两级提取（实测 17:59 快讯修订）：
+    ① 【公司名：…】——新浪个股快讯的标准格式，最可靠；
+    ② 句首「公司名+行业后缀」——无【】时的兜底（部分源不带括号）。
+    搜索接口验证唯一性：命中 A 股代码才认，搜索不到/歧义则放弃该条。
+
+    模块级函数（而非类方法）：它不依赖实例状态，却被盯梢源与插件两处用；
+    留在类里会诱导出 `AstockPlugin()` 新建实例的写法，从而制造循环依赖。
+    """
+    import re as _re
+    cand = ""
+    m = _re.search(r"【([\u4e00-\u9fa5A-Za-z0-9]{2,10})：", text)
+    if m:
+        cand = m.group(1)
+    else:
+        m2 = _re.match(r"^([\u4e00-\u9fa5A-Za-z]{2,8}?"
+                       r"(?:股份|集团|科技|生物|制药|电子|光电|能源|"
+                       r"银行|证券|控股|电力|健康|环保|新材|咨询))", text)
+        cand = m2.group(1) if m2 else ""
+    if not cand:
+        return None
     try:
-        return f"{float(value):,.{digits}f}"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _pct(value: Any) -> str:
-    """带符号百分比（涨跌幅用；换手率/占比这类无方向的指标请用 _ratio）。"""
-    if value is None:
-        return "-"
-    try:
-        return f"{float(value):+.2f}%"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _ratio(value: Any) -> str:
-    """无方向百分比（换手率、占比、振幅）——加 + 号会让人误以为是涨跌幅。"""
-    if value is None:
-        return "-"
-    try:
-        return f"{float(value):.2f}%"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _money(value: Any) -> str:
-    """金额 → 人类可读（万 / 亿）。"""
-    if value is None:
-        return "-"
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if abs(v) >= 1e8:
-        return f"{v / 1e8:.2f}亿"
-    if abs(v) >= 1e4:
-        return f"{v / 1e4:.2f}万"
-    return f"{v:.2f}"
-
-
-def _span_years(first: str, last: str) -> float:
-    """两个 YYYY-MM-DD 之间相差多少年（用于"存档覆盖多久"的展示）。"""
-    try:
-        a = dt.date.fromisoformat(str(first)[:10])
-        b = dt.date.fromisoformat(str(last)[:10])
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, (b - a).days / 365.25)
-
-
-def _table(headers: List[str], rows: List[List[Any]]) -> str:
-    """Markdown 表（Agent 与前端都能正常呈现）。"""
-    def cell(v: Any) -> str:
-        text = str(v if v is not None else "-")
-        return text.replace("|", "\\|")
-    out = ["| " + " | ".join(headers) + " |",
-           "|" + "|".join(["---"] * len(headers)) + "|"]
-    for r in rows:
-        out.append("| " + " | ".join(cell(c) for c in r) + " |")
-    return "\n".join(out)
+        rows = await asyncio.to_thread(data.search, cand, 3)
+    except Exception:
+        return None
+    for r in rows or []:
+        code = str(r.get("code") or "")
+        if len(code) == 6 and code[0] in "036":
+            return {"code": code, "name": r.get("name") or code}
+    return None
 
 
 # ---------------------------------------------------------------- 盯梢源
@@ -559,7 +490,9 @@ class AStockWatch(WatchSource):
         # 注意：_eod_report_text 走 _get_ledger()（读插件自己的台账句柄，
         # 路径配置以插件设置页为准）；盯梢上下文的 own.ledger_path 覆盖
         # 与之同源（都是 config["astock-plugin"]），不会分叉。
-        text = await portfolio_sentiment_report(self._eod_ledger(own, workspace), manual=False)
+        text = await report.build_report(
+            self._eod_ledger(own, workspace), manual=False,
+            company_resolver=company_in_text)
         if not text:
             return None
         return self._eod_wrap_probe_result(text, today)
@@ -761,7 +694,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.1.1"
+    version = "2.1.2"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -1187,454 +1120,8 @@ class AstockPlugin(ToolPlugin):
     # -------------------------------------------------- 工具定义
 
     def get_tools(self) -> List[ToolDefinition]:
-        code_prop = {
-            "type": "string",
-            "description": "股票代码：600000 / sh600000 / 000001.sz 均可",
-        }
-        return [
-            ToolDefinition(
-                name="astock_quote",
-                description=(
-                    "A 股实时行情快照：现价、涨跌幅、涨跌停价、量比、换手、市值、"
-                    "五档外的关键字段与交易时段说明。不给 codes 时返回台账里的持仓+自选股。"
-                    "批量最多 50 只。数据来源腾讯行情（失败自动换新浪）。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "codes": {
-                            "type": "array", "items": {"type": "string"},
-                            "description": "代码列表，如 [\"600000\",\"000001\"]；留空＝持仓+自选股",
-                        },
-                        "kind": {
-                            "type": "string",
-                            "enum": ["stock", "index", "etf"],
-                            "description": "标的类型；查指数必须传 index（000001 既是个股也是上证指数）",
-                        },
-                        "no_cache": {"type": "boolean", "description": "跳过本地缓存强制刷新"},
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_kline",
-                description=(
-                    "K 线 + 技术摘要：日/周/月/分钟线，默认前复权。返回均线(MA5/10/20/60)、"
-                    "区间高低、累计涨跌幅、最近 N 根量能对比。用于判断位置与趋势，但**不做预测**。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code": code_prop,
-                        "period": {
-                            "type": "string",
-                            "enum": ["day", "week", "month", "5m", "15m", "30m", "60m"],
-                            "description": "周期，默认 day",
-                        },
-                        "limit": {"type": "number", "description": "取多少根，默认 120，上限 640"},
-                        "adjust": {
-                            "type": "string", "enum": ["qfq", "hfq", "none"],
-                            "description": "复权方式，默认 qfq（前复权）；分钟线不支持复权",
-                        },
-                        "with_bars": {
-                            "type": "boolean",
-                            "description": "是否附带最近 K 线的原始数据（默认 false，只给摘要）",
-                        },
-                    },
-                    "required": ["code"],
-                },
-            ),
-            ToolDefinition(
-                name="astock_search",
-                description="按代码/名称/拼音检索 A 股标的（返回代码、类型、板块）。买入前先确认代码。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "keyword": {"type": "string", "description": "代码或名称或拼音首字母，如 浦发 / PFYH / 600000"},
-                        "limit": {"type": "number", "description": "最多几条，默认 10"},
-                    },
-                    "required": ["keyword"],
-                },
-            ),
-            ToolDefinition(
-                name="astock_screen",
-                description=(
-                    "条件选股（全市场快照排序+过滤）：按涨跌幅/成交额/换手/市值/主力净流入排序，"
-                    "可过滤涨跌幅区间、成交额、换手率、市值、是否排除 ST。金额单位：元。"
-                    "只做筛选，不构成推荐。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "universe": {"type": "string", "enum": ["all", "main", "gem", "star", "bj", "etf"],
-                                     "description": "市场范围，默认 all"},
-                        "sort_by": {"type": "string",
-                                    "enum": ["change_pct", "price", "amount", "volume", "turnover", "mcap", "pe", "main_net"],
-                                    "description": "排序字段，默认 change_pct"},
-                        "ascending": {"type": "boolean", "description": "升序（默认降序）"},
-                        "limit": {"type": "number", "description": "返回条数，默认 20"},
-                        "min_change": {"type": "number", "description": "涨跌幅下限 %"},
-                        "max_change": {"type": "number", "description": "涨跌幅上限 %"},
-                        "min_amount": {"type": "number", "description": "成交额下限（元）"},
-                        "max_amount": {"type": "number", "description": "成交额上限（元）"},
-                        "min_turnover": {"type": "number", "description": "换手率下限 %"},
-                        "max_turnover": {"type": "number", "description": "换手率上限 %"},
-                        "min_mcap": {"type": "number", "description": "总市值下限（元）"},
-                        "max_mcap": {"type": "number", "description": "总市值上限（元）"},
-                        "exclude_st": {"type": "boolean", "description": "排除 ST，默认 true"},
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_flow",
-                description="个股资金流：近 N 日主力/超大单/大单/中单/小单净流入（元）。用来看资金是否持续流入。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code": code_prop,
-                        "days": {"type": "number", "description": "取最近几天，默认 10"},
-                    },
-                    "required": ["code"],
-                },
-            ),
-            ToolDefinition(
-                name="astock_record",
-                description=(
-                    "录入一笔**已在自己券商成交**的买卖（本插件不下单、不连接券商）。"
-                    "buy/sell + 成交价 + 数量 + 成交日期；自动算费用、更新移动加权成本、"
-                    "校验 T+1 可卖与整手规则。dry_run=true 先预览校验结果不落账。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "side": {"type": "string", "enum": ["buy", "sell"], "description": "买入或卖出"},
-                        "code": code_prop,
-                        "price": {"type": "number", "description": "实际成交价（元）"},
-                        "shares": {"type": "number", "description": "成交数量（股）"},
-                        "trade_date": {"type": "string", "description": "成交日期 YYYY-MM-DD，默认今天"},
-                        "name": {"type": "string", "description": "名称（可选，首次录入时便于展示）"},
-                        "note": {"type": "string", "description": "备注（可选）"},
-                        "fee": {"type": "number", "description": "实际费用合计（可选；不给则按设置费率自动算）"},
-                        "dry_run": {"type": "boolean", "description": "true＝只预览校验，不写台账"},
-                    },
-                    "required": ["side", "code", "price", "shares"],
-                },
-            ),
-            ToolDefinition(
-                name="astock_portfolio",
-                description=(
-                    "台账总览：持仓（实时浮盈/占比/今日盈亏）+ 可用资金 + 已实现盈亏 + 累计费用。"
-                    "action=trades 查流水；action=set_cash 设资金；action=delete_trade 删错录的流水"
-                    "（会自动按剩余流水重算成本）；action=summary 只要汇总。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string",
-                                   "enum": ["list", "summary", "trades", "set_cash", "delete_trade"],
-                                   "description": "默认 list"},
-                        "cash": {"type": "number", "description": "action=set_cash 时的可用资金余额"},
-                        "trade_id": {"type": "number", "description": "action=delete_trade 时的流水 id"},
-                        "code": {"type": "string", "description": "action=trades 时按代码过滤"},
-                        "limit": {"type": "number", "description": "action=trades 返回条数，默认 30"},
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_hint",
-                description=(
-                    "**下单提示**（本插件的核心）：结合实时行情与台账，给出"
-                    "① 该不该动手（止损/止盈/回撤/涨跌停/异动是否触发）；"
-                    "② 动多少（买入股数按资金与单票上限估算、卖出股数/清仓或减半）；"
-                    "③ 参考价格区间与费用；④ T+1 今日可卖多少；⑤ 附舆情背离提醒（研报vs两融、热度vs资金等）。"
-                    "指定 code 只算该标的，留空则扫全部持仓。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "只算这一只（可选）"},
-                        "buy": {"type": "boolean", "description": "同时给出买入数量估算（需配合 code）"},
-                        "sell_ratio": {"type": "number", "description": "卖出比例，如 0.5 表示减半、1 清仓"},
-                        "no_sentiment": {"type": "boolean",
-                                         "description": "true＝跳过舆情背离速查（默认会查，慢约 1-3 秒）"},
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_sync",
-                description=(
-                    "**成交回单同步**（你在券商下单后用它）：把券商 App 的成交明细"
-                    "粘贴进来，或传导出的 CSV/TSV 内容，一次解析多笔 → 自动匹配"
-                    "之前的建议计划 → 校价（成交价与计划价偏差）→ 落账更新成本与 T+1。"
-                    "默认 dry_run 只预览不落账。识别不出的行会明确列出，不猜。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": ("回单原文。支持：带表头的 CSV/TSV（列名自动识别）；"
-                                            "或每行一笔 `600000 买入 9.53 2000 2026-10-24`"),
-                        },
-                        "dry_run": {
-                            "type": "boolean",
-                            "description": "默认 true＝只预览校验，确认后再用 false 落账",
-                        },
-                    },
-                    "required": ["text"],
-                },
-            ),
-            ToolDefinition(
-                name="astock_sentiment",
-                description=(
-                    "**投资舆情分析**（重要参考）：按七类证据归集——公司公告、机构研报、"
-                    "相关新闻、市场热度、龙虎榜、融资融券、股东户数。每条标可靠度"
-                    "（事实/观点/媒体/情绪）与影响方向，并**优先给出信号背离提示**"
-                    "（如「研报偏多但融资余额下降」）。不合成情绪分、不预测涨跌。"
-                    "可选返回行业背景与全市场快讯。"
-                    "code 传 **portfolio** ＝跑持仓+自选的全量组合报告"
-                    "（与盘后自动报告同款输出）。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code": code_prop,
-                        "scope": {
-                            "type": "array",
-                            "items": {"type": "string",
-                                      "enum": ["announce", "report", "news", "hot",
-                                               "lhb", "margin", "holder", "feed"]},
-                            "description": "只取指定类别（默认除 feed 外全部）；查行业政策时加 feed",
-                        },
-                        "days": {"type": "number",
-                                 "description": "证据回溯天数，默认 7（研报固定至少看 6 个月）"},
-                        "brief": {"type": "boolean",
-                                  "description": "true＝只要一句话结论 + 背离，不要完整证据清单"},
-                    },
-                    "required": ["code"],
-                },
-            ),
-            ToolDefinition(
-                name="astock_events",
-                description=(
-                    "**事件驱动筛股**：全市场快讯流 → 个股硬事件（回购/增持/中标/"
-                    "预增/重组/获批/分红，可选利空）→ 5日主力资金印证 → 背离标记。"
-                    "只列事实与资金行为，**不给涨跌概率、不预测、不喊单**——"
-                    "概率无数学基础，编造数字比不给更危险。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "kind": {
-                            "type": "string",
-                            "description": "事件类型过滤：回购/增持/中标/预增/重组/"
-                                           "获批/分红/利空；留空=利好类全部",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "最多列几条（默认 8）",
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_pick",
-                description=(
-                    "**量化选股 + 买入数量**（本插件新增的核心能力）："
-                    "全市场扫描 → 硬门槛过滤 → 多因子池内打分 → 按现金/单票上限"
-                    "换算成**具体股数**，输出「买哪几只、每只买多少股、挂什么止损止盈价」。"
-                    "三套策略（因子方向相反，按市况选）："
-                    "momentum 趋势动量（站上均线+放量+接近高点，趋势市用）/ "
-                    "reversal 均值回归（跌到区间低位+RSI超卖，震荡市用）/ "
-                    "quality 质量价值（低PE/PB+大市值+低波动，长期持有）。"
-                    "得分是**候选池内相对排名**（0-100），不是上涨概率、不是预期收益；"
-                    "每只都给出得分来源（各因子贡献）以便核对。"
-                    "rank_only=true 只出排行不给股数（想自己决定买哪只时用）。"
-                    "**compare=true 一次采集同时算出三套并做横向对比**"
-                    "（三套共用同一份行情，成本≈单策略，且价格同源可比）——"
-                    "用户问「三套策略对比一下」「哪个策略更合适」时用它。"
-                    "整个扫描约 6 秒（30 只 K 线，受限速）。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "strategy": {
-                            "type": "string",
-                            "enum": ["momentum", "reversal", "quality"],
-                            "description": ("策略。momentum 追强势（趋势市）/ "
-                                            "reversal 抄超跌（震荡市）/ "
-                                            "quality 低估值大盘（长期）。"
-                                            "留空＝用设置页的默认策略"),
-                        },
-                        "rank_only": {
-                            "type": "boolean",
-                            "description": "true＝只出得分排行，不给买入股数",
-                        },
-                        "compare": {
-                            "type": "boolean",
-                            "description": ("true＝一次采集同时跑三套策略并横向对比"
-                                            "（成本≈单策略，价格同源）。"
-                                            "用户想比较三套策略时用；默认只跑一套"),
-                        },
-                        "max_positions": {
-                            "type": "number",
-                            "description": "本轮最多买几只（默认取设置页，通常 5）",
-                        },
-                        "cash_usage_pct": {
-                            "type": "number",
-                            "description": ("本轮最多动用可用现金的百分比"
-                                            "（默认取设置页，通常 80）"),
-                        },
-                        "universe": {
-                            "type": "string",
-                            "enum": ["main", "all", "gem", "star"],
-                            "description": "选股范围，默认 main（沪深主板+创业板）",
-                        },
-                        "fresh": {
-                            "type": "boolean",
-                            "description": "true＝跳过缓存强制重新扫描（默认用 3 分钟内缓存）",
-                        },
-                        "top_n": {
-                            "type": "number",
-                            "description": "rank_only 时显示前几名，默认 10",
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_backtest",
-                description=(
-                    "**策略回测 + 推荐率**：把选股策略放回历史逐期重放，统计"
-                    "「按这套策略选股，历史上多少期跑赢沪深300」——这个比例就是"
-                    "**推荐率**，它来自历史数据，不是主观打分。"
-                    "输出：推荐率、每期平均收益、平均超额、累计收益（策略 vs 基准）、"
-                    "最大回撤、最好/最差单期、逐期明细（可选）。"
-                    "**能力边界（重要）**：历史只有约 2.6 年（641 根日 K，接口上限），"
-                    "不含退市股（幸存者偏差，真实表现会略差），quality 策略的 PE/PB "
-                    "无历史序列故回测不完整。结论衡量的是**策略**，不是单只股票"
-                    "上涨的概率。历史不代表未来。约 6-14 秒（需拉 25 只历史 K 线）。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "strategy": {
-                            "type": "string",
-                            "enum": ["momentum", "reversal", "quality"],
-                            "description": "要回测的策略；留空＝设置页默认策略",
-                        },
-                        "rebalance_days": {
-                            "type": "number",
-                            "description": "多少交易日调仓一次，默认 10（约两周）",
-                        },
-                        "top_k": {
-                            "type": "number",
-                            "description": "每期买入几只，默认 3",
-                        },
-                        "hold_days": {
-                            "type": "number",
-                            "description": "持有多少交易日，默认 10",
-                        },
-                        "pool_size": {
-                            "type": "number",
-                            "description": "回测股票池大小，默认 25（每只 1 次 K 线请求）",
-                        },
-                        "detail_periods": {
-                            "type": "number",
-                            "description": "附带最近 N 期逐期明细（默认 0＝不看明细）",
-                        },
-                        "fresh": {
-                            "type": "boolean",
-                            "description": "true＝跳过 30 分钟缓存重新回测",
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_archive",
-                description=(
-                    "**本地历史行情存档**：把日 K 落到本地 SQLite，让回测能突破"
-                    "在线接口「只有约 2.6 年」的硬上限。"
-                    "action=update 增量更新（默认标的：台账持仓+自选，可指定 codes）；"
-                    "status 看存档覆盖情况（多少只/多少根/起止日期/占用空间）；"
-                    "prune 清理（必须指定 before 或 codes，否则拒绝执行）。"
-                    "**重要**：存档只存「不复权」原始价（前复权会随分红重算整段历史，"
-                    "存了会自相矛盾）；**它不会立刻变长**——今天开始存，一年后多一年，"
-                    "所以建议每天跑一次。回测会自动优先使用存档数据。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["update", "status", "prune"],
-                            "description": "默认 status",
-                        },
-                        "codes": {
-                            "type": "array", "items": {"type": "string"},
-                            "description": ("update：要更新的代码（留空＝台账持仓+自选）；"
-                                            "prune：要清空的代码"),
-                        },
-                        "limit": {
-                            "type": "number",
-                            "description": "update 时每只取最近多少根，默认 640",
-                        },
-                        "before": {
-                            "type": "string",
-                            "description": "prune：删除该日期（YYYY-MM-DD）之前的数据",
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_act",
-                description=(
-                    "**操作指示**（傻瓜化的最后一步）：把「选股结果」和「当前持仓」"
-                    "合成为一份**照着做就行**的清单——先卖什么（卖多少股、什么价、为什么）、"
-                    "再买什么（买多少股、止损止盈价）、操作后现金剩多少。"
-                    "执行顺序固定「先卖后买」，因为 A 股卖出资金当日可用于买入，"
-                    "反过来先买会因资金不足失败。卖出仅基于明确规则：触发止损/止盈、"
-                    "不在本轮选股名单且浮亏（换仓）、单票超仓；"
-                    "数量已按 T+1 可卖约束裁剪，不会给出卖不掉的废单。"
-                    "**本插件不连接券商、不下单**，只产出给人看的指示。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "strategy": {
-                            "type": "string",
-                            "enum": ["momentum", "reversal", "quality"],
-                            "description": "用哪套策略选股；留空＝设置页默认",
-                        },
-                        "max_positions": {
-                            "type": "number",
-                            "description": "本轮最多买几只（默认取设置页）",
-                        },
-                        "fresh": {
-                            "type": "boolean",
-                            "description": "true＝跳过缓存重新选股",
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            ToolDefinition(
-                name="astock_watch",
-                description=(
-                    "盯盘与自选股管理。action=list 看自选；add/remove 增删自选；"
-                    "**status 看盯盘状态**（是否在盯、当前时段、下次开始时间）；"
-                    "**start 启动盯盘**（开启定时探测，非交易时段自动跳过不耗 token）；"
-                    "**stop 暂停盯盘**。盯盘按 A 股交易时段自律：工作日 9:10–15:00、"
-                    "午休跳过、收盘自动停。"),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["list", "add", "remove", "status", "start", "stop"],
-                            "description": "默认 list",
-                        },
-                        "code": code_prop,
-                        "name": {"type": "string", "description": "名称（可选）"},
-                        "note": {"type": "string", "description": "备注（可选）"},
-                    },
-                    "required": [],
-                },
-            ),
-        ]
+        """工具声明（16 个 schema）。schema 在 astock_tools（v2.1.2 拆出）。"""
+        return tools_decl.build_tools()
 
     # -------------------------------------------------- 事件驱动筛股
 
@@ -1716,34 +1203,14 @@ class AstockPlugin(ToolPlugin):
         return "\n".join(out_lines)
 
     async def _company_in_text(self, text: str) -> Optional[Dict[str, str]]:
-        """快讯文本 → 上市公司（搜索接口定位代码）。
+        """快讯文本 → 上市公司（薄封装，实现在模块级 `company_in_text`）。
 
-        两级提取（实测 17:59 快讯修订）：
-        ① 【公司名：…】——新浪个股快讯的标准格式，最可靠；
-        ② 句首「公司名+行业后缀」——无【】时的兜底（部分源不带括号）。
-        搜索接口验证唯一性：命中 A 股代码才认，搜索不到/歧义则放弃该条。
+        **为什么移出类**：它不依赖任何实例状态（只用 `data.search`），却被
+        `AStockWatch`（盘后报告）与 `AstockPlugin`（事件筛股）两处需要。
+        留在类里会逼出 `AstockPlugin()` 新建实例那种写法——拆分后立刻变成
+        循环依赖 + 属性缺失（实测踩到：`AStockWatch` 没有这个方法）。
         """
-        import re as _re
-        cand = ""
-        m = _re.search(r"【([\u4e00-\u9fa5A-Za-z0-9]{2,10})：", text)
-        if m:
-            cand = m.group(1)
-        else:
-            m2 = _re.match(r"^([\u4e00-\u9fa5A-Za-z]{2,8}?"
-                           r"(?:股份|集团|科技|生物|制药|电子|光电|能源|"
-                           r"银行|证券|控股|电力|健康|环保|新材|咨询))", text)
-            cand = m2.group(1) if m2 else ""
-        if not cand:
-            return None
-        try:
-            rows = await asyncio.to_thread(data.search, cand, 3)
-        except Exception:
-            return None
-        for r in rows or []:
-            code = str(r.get("code") or "")
-            if len(code) == 6 and code[0] in "036":
-                return {"code": code, "name": r.get("name") or code}
-        return None
+        return await company_in_text(text)
 
     # -------------------------------------------------- 执行分发
 
@@ -2690,7 +2157,9 @@ class AstockPlugin(ToolPlugin):
                     "跑持仓+自选全量请传 code=portfolio。")
         # 组合模式：持仓+自选全量舆情报告（与盘后自动报告同一实现）
         if code_raw.lower() == "portfolio":
-            return await portfolio_sentiment_report(self._get_ledger(), manual=True)
+            return await report.build_report(
+                self._get_ledger(), manual=True,
+                company_resolver=self._company_in_text)
         code, _ = mkt.normalize_code(code_raw)
         scope = args.get("scope") or []
         if isinstance(scope, str):
@@ -3396,578 +2865,17 @@ class AstockPlugin(ToolPlugin):
     # -------------------------------------------------- 右栏面板
 
     def panel_content(self, panel_id: str, config: Dict[str, Any]) -> str:
-        """右栏「持仓」面板。任何异常都降级为提示，不影响主流程。
+        """右栏面板入口（渲染实现在 `astock_panel`，v2.1.2 拆分）。
 
-        两种形态由设置项 `panel_style` 切换（宿主只支持 Markdown 或 lite-tree
-        决策树二选一，插件无法自定义 HTML）：
-        - `markdown`（默认）：紧凑表格，横向数值对齐好，适合盘后核对；
-        - `tree`：一只股一张卡片，卡内直接写"触发规则 + 建议动作"，按严重度
-          着色，适合盘中扫一眼。
-        形态是偏好问题而非对错问题，所以做成开关而不是替你决定。
+        这里只做**依赖注入**：面板需要取快照、读提示配置、拿台账，而这些
+        能力都长在插件实例上。让 panel 模块反过来 import plugin 会形成循环
+        （plugin → panel → plugin），所以用 PanelContext 把能力传进去。
         """
-        if panel_id == "pick" or panel_id.startswith("pick-"):
-            return self._panel_pick(panel_id)
-        if panel_id != "portfolio":
-            return ""
-        try:
-            # include_watch：自选股行情一并拉——面板要画自选区（此前只画持仓，
-            # 与聊天看板行为不一致：聊天里有「无需关注」列，右栏却没有）
-            snap = self._snapshot(include_watch=True)
-        except Exception as exc:
-            logger.warning("[astock] 面板渲染失败: %s", exc)
-            return f"台账读取失败：{exc}\n\n检查设置页「台账文件路径」，或先用 `astock_record` 录入持仓。"
-        d = snap["data"]
-        style = str(_cfg(self._app, "panel_style", "markdown") or "markdown").lower()
-        flag = self._panel_sentiment_flag(d)
-        if style == "tree":
-            return self._panel_tree(d, flag)
-        return self._panel_markdown(d, flag)
+        ctx = panel.PanelContext(
+            app=self._app,
+            snapshot=self._snapshot,
+            hints_cfg=self._hints_cfg,
+            ledger=self._get_ledger,
+        )
+        return panel.render_panel(ctx, panel_id, config)
 
-    # -------------------------------------------------- 面板渲染（两种形态）
-
-    def _panel_pick(self, panel_id: str) -> str:
-        """量化选股面板。
-
-        v2.1.0 起是**一个「选股」tab + 三策略对比视图**，不再是三个 tab
-        各看各的。理由：面板只读、不能触发扫描，而设置页按钮原先一次只跑
-        一套策略 → 另外两个 tab 永远显示「尚未生成」，用户要改设置再点三次
-        才能完成一次对比。现在一次跑三套、一屏内摆出分歧。
-
-        **兼容旧 id**：`pick-momentum` / `pick-reversal` / `pick-quality`
-        仍可访问，渲染该策略的详情视图（旧书签/习惯不失效）。
-
-        **绝不在这里跑扫描**：面板 5 秒刷新，而一次扫描要拉 30 只 K 线 ≈ 6 秒
-        + 会把公共接口打到限流。这里只读 `quant_tool` 的进程内缓存；
-        没缓存就提示"去设置页点一下/说一句让我跑"，把耗时的决定权交给用户。
-        """
-        strategy = ""
-        if panel_id.startswith("pick-"):
-            strategy = panel_id.split("-", 1)[1]
-            # 未知的 pick-xxx 不该静默降级成对比视图——那会让"面板 id 写错"
-            # 变成一个看不出来的 bug。只有已知策略才走详情视图。
-            if strategy not in quant.STRATEGIES:
-                return ""
-        # 全部缓存的推荐率（只读，绝不在这里跑回测——那是 25 只 K 线的开销）
-        recs: Dict[str, Any] = {}
-        for key in quant.STRATEGIES:
-            try:
-                bt = backtest_tool.get_cached(key)
-                if bt:
-                    recs[key] = bt.get("recommendation")
-            except Exception:
-                logger.debug("[astock] 面板读回测缓存失败", exc_info=True)
-
-        # 旧 id → 单策略详情视图
-        if strategy in quant.STRATEGIES:
-            try:
-                cached = quant_tool.pick_cached(strategy)
-            except Exception:
-                logger.warning("[astock] 选股面板缓存读取失败", exc_info=True)
-                cached = None
-            return self._render_pick_detail(strategy, cached, recs.get(strategy))
-
-        # 新「选股」tab → 三策略对比
-        results: Dict[str, Any] = {}
-        try:
-            for key in quant.STRATEGIES:
-                cached = quant_tool.pick_cached(key)
-                if cached:
-                    results[key] = cached
-        except Exception:
-            logger.warning("[astock] 选股面板缓存读取失败", exc_info=True)
-        return quant_tool.render_compare(results, recs=recs)
-
-    def _render_pick_detail(self, strategy: str, cached: Optional[Dict[str, Any]],
-                            rec: Any) -> str:
-        """单策略详情视图（旧 `pick-<strategy>` 入口，保留兼容）。"""
-        # 卡片形态：有选股结果 + 用户没要求 Markdown 时，走 lite-tree 卡片看板
-        # （「像炒股软件那样」的诉求）。卡片能以进度条表达推荐率/仓位，
-        # 表格在 331px 窄栏里做不到这一点。
-        style = str(_cfg(self._app, "pick_panel_style", "card") or "card").lower()
-        if cached and (cached.get("allocations") or cached.get("skipped")) \
-                and style != "markdown":
-            try:
-                return backtest_tool.build_recommendation_cards(
-                    cached.get("allocations") or [], rec,
-                    quant.STRATEGIES[strategy].label)
-            except Exception as exc:
-                logger.warning("[astock] 选股卡片渲染失败，退回 markdown: %s", exc)
-        try:
-            return quant_tool.render_panel(cached, strategy, rec=rec)
-        except Exception as exc:
-            logger.warning("[astock] 选股面板渲染失败: %s", exc)
-            return (f"**量化选股 · {strategy}**\n\n"
-                    f"面板渲染出错：{type(exc).__name__}: {exc}\n\n"
-                    f"可在对话里说「帮我选股」直接拿结果。")
-
-    # -------------------------------------------------- 面板渲染（两种形态）
-
-    def _panel_head(self, d: Dict[str, Any]) -> str:
-        return (f"**{len(d['positions'])} 只持仓**｜市值 {_money(d['total_market_value'])}｜"
-                f"浮盈 {_f(d['float_pnl'])}（今日 {_f(d['today_pnl'])}）｜"
-                f"可用 {_money(d['cash'])}")
-
-    def _panel_sentiment_flag(self, d: Dict[str, Any]) -> str:
-        """首要持仓的舆情背离速查。
-
-        面板每 5 秒刷新 → 必须限流：只查 1 只、只取 4 个便宜类别（不查新闻/公告，
-        那两类请求重且变化慢），失败静默（面板不能因为舆情接口挂了而空白）。
-        """
-        if not d["positions"]:
-            return ""
-        try:
-            top = max(d["positions"], key=lambda p: p["shares"] *
-                      ((d["quotes"].get(p["code"]) or {}).get("price")
-                       or p["cost_price"]))
-            collected = senti_data.collect(top["code"], top.get("name") or "",
-                                          scope=("margin", "holder", "lhb", "report"))
-            rep = senti.summarize(collected["items"], top["code"],
-                                 top.get("name") or "",
-                                 collected["errors"], collected["extras"])
-            label = top.get("name") or top["code"]
-            if rep.conflicts:
-                c = rep.conflicts[0]
-                mark = "🔴" if c.severity == "high" else "🟠"
-                return f"{mark} **{label} 舆情背离**：{c.title}"
-            if rep.tone != "thin":
-                return f"⚪ **{label} 舆情**：{senti_tool.render_brief(rep)}"
-        except Exception:
-            logger.debug("[astock] 面板舆情速查失败", exc_info=True)
-        return ""
-
-    def _panel_markdown(self, d: Dict[str, Any], flag: str) -> str:
-        """markdown 形态：富围栏版（宿主面板已支持 ```kpi / ```progress 渲染）。
-
-        结构：
-        - 头部一句纯文本合计（面板标题条之外的眼睛锚点）；
-        - ```kpi：4 张指标卡（总资产/持仓市值/浮动盈亏/可用资金）——数字大、
-          一眼看到钱；
-        - 每只持仓一段：名称行（markdown）+ ```progress（仓位占比、距止损余量
-          两根进度条，超限自动红）；
-        - 老环境兜底：宿主若不支持富围栏（旧版 lite-work），围栏内容会显示为
-          代码块——仍可读（JSON 里的数字都在），不至于空白。v2.0.4+ 已支持。
-        """
-        import json as _jsonlib
-        head = self._panel_head(d)
-        watch_line = self._panel_watch_line()
-        if not d["positions"]:
-            empty = head + ("\n\n当前空仓。录入成交："
-                            "`astock_record side=buy code=... price=... shares=...`")
-            if watch_line.strip():
-                empty += "\n\n---\n\n**盯盘**\n\n" + watch_line.strip()
-            return empty
-
-        # ── KPI 卡：先回答"我的钱怎么样了" ──
-        equity = (d.get("total_market_value") or 0) + (d.get("cash") or 0)
-        pnl_v = d.get("float_pnl") or 0
-        kpi = {
-            "items": [
-                {"label": "总资产", "value": _f(equity),
-                 "delta": f"今日 {_f(d.get('today_pnl') or 0)}",
-                 "trend": "up" if (d.get("today_pnl") or 0) >= 0 else "down"},
-                {"label": "持仓市值", "value": _money(d.get("total_market_value") or 0),
-                 "trend": "flat"},
-                {"label": "浮动盈亏", "value": _f(pnl_v),
-                 "delta": self._pnl_pct_of(d), "trend": "up" if pnl_v >= 0 else "down"},
-                {"label": "可用资金", "value": _money(d.get("cash") or 0),
-                 "trend": "flat"},
-            ]}
-        out = [head, "", "```kpi", _jsonlib.dumps(kpi, ensure_ascii=False), "```", ""]
-
-        # ── 每股：名称行 + progress 双条（仓位/距止损） ──
-        cfg = self._hints_cfg()
-        total_mv = d.get("total_market_value") or 0
-        # 单票占比的分母＝账户总资产（持仓市值 + 可用现金），与 hint 引擎同口径。
-        # 用持仓市值当分母时，只持一只股就恒为 100%，仓位条永远画成「已超限」。
-        equity_base = equity if equity > 0 else total_mv
-        for p in d["positions"][:MAX_ROWS]:
-            q = d["quotes"].get(p["code"]) or {}
-            price = q.get("price") or p["cost_price"]
-            cost = float(p["cost_price"] or 0)
-            shares = int(p["shares"] or 0)
-            mv = price * shares
-            pnl = (price - cost) * shares
-            pnl_pct = mkt.pct_change(price, cost)
-            chg_pct = q.get("change_pct")
-            arrow = "▲" if (chg_pct or 0) > 0 else ("▼" if (chg_pct or 0) < 0 else "—")
-            out.append(f"**{p['name'] or p['code']}**　{_f(price)}　{arrow}{_pct(chg_pct)}"
-                       f"　{shares}股 · 成本{_f(cost, 3)} · 浮盈{_f(pnl)}（{_pct(pnl_pct)}）")
-            # progress 语义对齐宿主色阶（<40 红 / ≥80 绿，为「健康度」设计）：
-            # 一律喂**安全余量**——越高越安全越绿，触线/超限 = 0% = 红。
-            # 此前喂「已消耗量」（浮亏触到止损线 → 100% 满条**绿色**，看着
-            # 最健康实际最危险——语义反转，真实报障）。
-            items: List[Dict[str, Any]] = []
-            if equity_base > 0:
-                weight = mv / equity_base * 100
-                cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
-                headroom = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
-                items.append({"label": f"仓位空间（上限 {cap:g}%）",
-                              "value": round(headroom, 1),
-                              "note": (f"现占 {weight:.1f}%" +
-                                       (" · 超限" if weight > cap else ""))})
-            stop_pct = abs(float(cfg.stop_loss_pct or 0))
-            if pnl_pct is not None and stop_pct > 0:
-                used = max(0.0, min(100.0, -pnl_pct / stop_pct * 100)) if pnl_pct < 0 else 0
-                items.append({"label": f"距止损余量（跌破 -{stop_pct:g}% 触发）",
-                              "value": round(100.0 - used, 1),
-                              "note": _pct(pnl_pct) if pnl_pct < 0 else "浮盈中"})
-            if items:
-                out += ["```progress", _jsonlib.dumps({"items": items}, ensure_ascii=False), "```", ""]
-        # ── 自选区（未持仓）：紧凑表 + 备注提示。与聊天看板「无需关注」列对齐——
-        #    面板此前只画持仓，自选完全不出现，用户换 tab 看不到候选池。
-        wq = d.get("watch_quotes") or {}
-        wcount = int(d.get("watch_count") or 0)
-        if wq:
-            out.append("**自选观察**（未持仓）")
-            rows = []
-            for code, q in list(wq.items())[:MAX_ROWS]:
-                chg = q.get("change_pct")
-                arrow = "▲" if (chg or 0) > 0 else ("▼" if (chg or 0) < 0 else "—")
-                rows.append([f"{q.get('name') or code}（{code}）", _f(q.get("price")),
-                             f"{arrow}{_pct(chg)}", _f(q.get("low")), _f(q.get("high"))])
-            out.append(_table(["名称", "现价", "涨跌", "日低", "日高"], rows))
-            out.append("")
-        elif wcount > 0:
-            # 行情拉取失败不得静默消失（此前 if wq: 直接跳过整节，用户
-            # 无从分辨「没自选」还是「拉挂了」——真实报障：自选表不见了）。
-            # 注意：只出提示行，不再画表（此时没有行情数据可画）。
-            out.append(f"**自选观察**（未持仓）：{wcount} 只行情未取到"
-                       "（接口限流或断网），稍后自动重试")
-            out.append("")
-
-        # ── 状态区：盯盘与舆情是两个语义不同的部分，各自成块、各带小标题。
-        #    要点：① 分隔用标准 markdown 分割线 `---`（自造的 `──` 只是普通
-        #    文本，渲染器不认）；② 块内行间用空行分段——单换行会被 markdown
-        #    合并成一行，三行状态就会粘在一起（v1.7.1 修复的真正原因）。
-        blocks: List[str] = []
-        if watch_line.strip():
-            blocks.append("**盯盘**\n\n" + watch_line.strip())
-        if flag and flag.strip():
-            blocks.append("**舆情**\n\n" + flag.strip())
-        if blocks:
-            out += ["", "---", ""]
-            out.append("\n\n".join(blocks))
-        return "\n".join(x for x in out if x is not None).rstrip() + "\n"
-
-    def _pnl_pct_of(self, d: Dict[str, Any]) -> str:
-        """组合层浮动盈亏率（成本基数为 0 时显示 '-'）。"""
-        cost_base = sum(float(p.get("cost_price") or 0) * int(p.get("shares") or 0)
-                        for p in d.get("positions") or [])
-        if cost_base <= 0:
-            return "-"
-        return _pct((d.get("float_pnl") or 0) / cost_base * 100)
-
-    def _panel_watch_line(self) -> str:
-        """面板里的盯盘状态行（含"去哪儿点按钮"的指引）。
-
-        宿主面板是**只读**的（Markdown / lite-tree 都点不了），按钮只能放
-        设置页——所以这里必须明确告诉用户点哪里，否则他会以为看板上能点。
-        行首不再自帶 \n\n（空仓位分支手工拼接用），由调用方决定分隔——
-        状态区统一用 `──` 分隔线与数据块拉开层次。
-        """
-        try:
-            enabled = _as_bool(_cfg(self._app, "watch_enabled", True), True)
-            ok_now, why = mkt.should_watch_now()
-            st = mkt.trading_status()
-        except Exception:
-            return ""
-        if not enabled:
-            return ("⏸ **盯盘已暂停**　到「设置 → 插件 → A股助手」点"
-                    "「启动 / 暂停盯盘」恢复")
-        if ok_now:
-            return f"🟢 **正在盯盘**（{st['phase']}）"
-        # 块内空行分段：单换行会被 markdown 渲染器合并成一行（v1.7.1）
-        return (f"⚪ **当前不盯盘**：{why}　下次 {mkt.next_watch_window()}"
-                f"\n\n　时段自律：工作日 9:10–15:00，午休跳过，收盘自动停")
-
-    def _panel_tree(self, d: Dict[str, Any], flag: str) -> str:
-        """lite-tree 决策树形态：一只股一张卡，卡内写触发规则与建议动作。
-
-        `trees[].options` 在原协议里表示"多个候选方案及其概率"。持仓提示不是
-        概率选择，因此每卡的第一条 option 承载"当前建议动作"，prob 恒为 1.0、
-        chosen=true；`kind` 承载信号类型，`question` 承载规则标题，`tone` 承载
-        严重度——既复用现成渲染，又不伪造概率语义。
-
-        **`prob` 会被前端渲染成一条彩色进度条**（label + 横条 + 百分比，宿主实测）。
-        这是面板里**唯一能被"看见"的图形元素**，因此把它当可视化通道复用：不表示
-        概率，而表示**仓位占比 / 距止损的余量**这类 0-100 的刻度。卡片于是从
-        "一段文字"变成"一眼看出位置"。每卡最多 3 条 option，再多会盖过正文。
-        """
-
-        import json as _json
-
-        def _scale(label: str, value: float, tone: str = "alt") -> Dict[str, Any]:
-            """把 0-100 的刻度值借 option.prob 通道渲染成进度条。"""
-            return {"label": label,
-                    "prob": max(0.0, min(1.0, float(value) / 100.0)),
-                    "tone": tone, "chosen": False}
-
-        positions = d["positions"][:MAX_ROWS]
-        if not positions:
-            wl = self._panel_watch_line().strip()
-            return ("**0 只持仓**｜当前空仓\n\n"
-                    "录入成交：`astock_record side=buy code=... price=... shares=...`"
-                    + (f"\n\n---\n\n**盯盘**\n\n{wl}" if wl else ""))
-        cfg = self._hints_cfg()
-        total_mv = d["total_market_value"] or 0
-        # 单票占比的分母＝账户总资产（持仓市值 + 可用现金）。
-        # 用持仓市值当分母时，只持一只股就恒为 100%，正常仓位会被标成超限。
-        equity_base = ((d.get("equity") or 0)
-                       or (total_mv + (d.get("cash") or 0)))
-        cards: List[Dict[str, Any]] = []
-        for p in positions:
-            q = d["quotes"].get(p["code"]) or {}
-            price = q.get("price") or p["cost_price"]
-            pnl = (price - p["cost_price"]) * p["shares"]
-            pct = mkt.pct_change(price, p["cost_price"])
-            hs = hints.build_position_hints(p, q, cfg, total_market_value=total_mv,
-                                            total_equity=equity_base)
-            t1 = hints.build_t1_hint(p, int(p.get("available_today") or 0))
-            if t1:
-                hs.append(t1)
-            # 只展示最要紧的一条：卡片是"扫一眼"场景，堆 4 条反而看不出重点
-            top_h = max(hs, key=lambda h: {"urgent": 2, "action": 1}.get(h.severity, 0)) if hs else None
-            if top_h:
-                tone = {"urgent": "danger", "action": "warn"}.get(top_h.severity, "neutral")
-                kind, question, label = top_h.kind, top_h.title, top_h.suggestion
-            else:
-                tone = "neutral"
-                kind = "holding"
-                question = "未触发规则区间"
-                label = f"继续持有（止损 -{cfg.stop_loss_pct}% / 止盈 +{cfg.take_profit_pct}%）"
-            # 刻度语义与 markdown 形态对齐（v1.7.2）：一律「安全余量」——
-            # 条越长越安全；触线/超限 → 0 → 短条。此前「已消耗量」画满条
-            # 反而像"很健康"（语义反转）。
-            # 刻度①：仓位空间 = 距上限的余量（超限 = 0）
-            weight = (p["shares"] * price / equity_base * 100) if equity_base > 0 else 0.0
-            cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
-            room = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
-            # 刻度②：距止损余量 = 1 - 浮亏消耗（触线 = 0）
-            # 阈值配成 0 ＝ 关闭止损提示，此时不画（避免除零）
-            stop_pct = abs(float(cfg.stop_loss_pct or 0))
-            used = (max(0.0, min(100.0, -pct / stop_pct * 100.0))
-                    if (pct is not None and pct < 0 and stop_pct > 0) else 0.0)
-
-            opts: List[Dict[str, Any]] = [
-                {"label": (label or "")[:80], "prob": 1.0,
-                 "tone": tone, "chosen": True}]
-            if equity_base > 0:
-                opts.append(_scale(f"仓位空间 {room:.0f}%（现占 {weight:.1f}% / 上限 {cap:g}%）",
-                                   room, "danger" if weight > cap else "alt"))
-            if pct is not None and stop_pct > 0:
-                opts.append(_scale(
-                    (f"距止损余量 {100 - used:.0f}%（浮亏 {abs(pct):.1f}% / 阈值 −{stop_pct:g}%）"
-                     if pct < 0 else f"浮盈 {pct:+.1f}%（未接近止损）"),
-                    100.0 - used, "danger" if used >= 100.0 else "alt"))
-            cards.append({
-                "title": f"{p['name'] or p['code']}  {_f(price)}  {_pct(pct)}",
-                "context": (f"{p['shares']}股 · 成本{_f(p['cost_price'], 3)}"
-                            f" · 浮盈{_f(pnl)} · 可卖{int(p.get('available_today') or 0)}"
-                            f" · 市值{_money(p['shares'] * price)}"),
-                "kind": kind,
-                "question": question,
-                "options": opts[:3],
-                "confidence": 1.0,
-                "accepted": True,
-            })
-        payload = {
-            "type": "lite-tree",
-            "status": {
-                "text": f"{len(positions)} 只持仓",
-                "tone": "ok" if (d["float_pnl"] or 0) >= 0 else "warn",
-                "meta": [f"市值 {_money(d['total_market_value'])}",
-                         f"浮盈 {_f(d['float_pnl'])}",
-                         f"今日 {_f(d['today_pnl'])}",
-                         f"可用 {_money(d['cash'])}"],
-                "chips": ([flag.split("：")[0].replace("*", "").strip()]
-                          if flag else []) + [
-                    "盯盘中" if mkt.should_watch_now()[0] else mkt.next_watch_window(),
-                    "每 5 秒刷新"],
-            },
-            "trees": cards,
-            "total": len(cards),
-        }
-        return _json.dumps(payload, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------- 排版辅助
-
-
-# ---------------------------------------------------------------- 组合舆情报告
-
-async def portfolio_sentiment_report(ledger: "Ledger",
-                                     manual: bool = False) -> str:
-    """持仓+自选的全量舆情报告（盘后自动与对话手动共用一份实现）。
-
-    - 每只标的：七类证据收集 → tone 判定 → 首要背离；
-    - 组合层：背离清单 + 同向清单 + 操作纪律提示；
-    - 名称以台账为准（舆情接口按代码查询常不给名称）；
-    - 覆盖 ≤10 只（更多无意义且请求太重）。
-    """
-    name_by_code: Dict[str, str] = {}
-    codes: List[str] = []
-    for p in ledger.list_positions():
-        codes.append(p["code"])
-        name_by_code[p["code"]] = p.get("name") or ""
-    for w in ledger.list_watch():
-        if w["code"] not in codes:
-            codes.append(w["code"])
-        name_by_code.setdefault(w["code"], w.get("name") or "")
-    if not codes:
-        return "台账里没有持仓或自选，先录入（astock_record / astock_watch）。"
-
-    import datetime as _dt
-    today = _dt.date.today().isoformat()
-    parts: List[str] = [
-        f"## 📊 {'组合舆情报告' if manual else '盘后舆情报告'}（{today}）",
-        "",
-        f"覆盖 {len(codes)} 只标的（持仓+自选）。数据来源七类证据，"
-        f"**只列事实与背离，不预测涨跌**。",
-        "",
-    ]
-    aligned: List[str] = []
-    conflicted: List[str] = []
-    for code in codes[:10]:
-        try:
-            collected = await asyncio.to_thread(
-                senti_data.collect, code, "")   # scope 留空=默认全量七类
-            rep = await asyncio.to_thread(
-                senti.summarize, collected["items"], code, "",
-                collected["errors"], collected["extras"])
-        except Exception:
-            continue
-        name = name_by_code.get(code) or next(
-            (getattr(x, "name", "") for x in collected.get("items", [])
-             if getattr(x, "name", "")), code)
-        tone_mark = {"aligned_positive": "🟢", "conflicted": "🟡",
-                     "aligned_negative": "🔴", "thin": "⚪"}.get(rep.tone, "⚪")
-        parts.append(f"- {tone_mark} **{name}（{code}）**：{rep.tone_text or rep.tone}")
-        if rep.conflicts:
-            conflicted.append(f"{name}（{code}）")
-            for c in rep.conflicts[:1]:
-                parts.append(f"  - ⚠️ 背离：{c.title}")
-        elif rep.tone == "aligned_positive":
-            aligned.append(f"{name}（{code}）")
-    parts.append("")
-    if conflicted:
-        parts.append(f"**⚠️ 背离标的（{len(conflicted)} 只）**：{'、'.join(conflicted)}"
-                     f" —— 按「以客观数据为准」原则，融资余额止跌回升前不宜据研报加仓。")
-    if aligned:
-        parts.append(f"**✅ 同向偏正（{len(aligned)} 只）**：{'、'.join(aligned)}")
-    if not conflicted and not aligned:
-        parts.append("今日证据量普遍偏薄（thin），无明确方向。")
-
-    # ── 联动①：事件推荐区（快讯硬事件 × 资金同向，且不在池）——只推荐不自动加：
-    #    自动改自选会让「观察池」变成机器的池，用户说「加」才加。
-    try:
-        ev_recos = await _event_reco_for_report(ledger, set(codes))
-    except Exception:
-        ev_recos = []
-    if ev_recos:
-        parts += ["", f"**📌 事件推荐（{len(ev_recos)} 只，未在池）**——说「加自选」即入池："]
-        for r in ev_recos:
-            parts.append(f"- {r['mark']} **{r['name']}（{r['code']}）**｜{r['kind']}：{r['text']}"
-                         f"（{r['flow']}）")
-
-    # ── 联动②：自选健康检查——按池内 note 的既定约定标「建议移除」，只建议不删。
-    try:
-        drops = await _watch_health_check(ledger)
-    except Exception:
-        drops = []
-    if drops:
-        parts += ["", f"**🧹 建议移除（{len(drops)} 只）**——说「移除」即删："]
-        for d in drops:
-            parts.append(f"- {d}")
-    return "\n".join(parts)
-
-
-async def _event_reco_for_report(ledger, existing_codes: set) -> List[Dict[str, Any]]:
-    """盘后报告联动①：快讯硬事件 → 推荐候选（排除在池/持仓；资金须同向）。"""
-    feed = await asyncio.to_thread(senti_data.fetch_feed, 40, "")
-    recos: List[Dict[str, Any]] = []
-    seen: set = set()
-    _pl = AstockPlugin()
-    for ev in feed:
-        text = (ev.summary or ev.title or "")
-        for k_name, k_words in AstockPlugin.EVENT_KINDS.items():
-            if k_name == "利空":
-                continue
-            if not any(w in text for w in k_words):
-                continue
-            company = await _pl._company_in_text(text)
-            if not company or company["code"] in existing_codes | seen:
-                break
-            seen.add(company["code"])
-            try:
-                flows = await asyncio.to_thread(data.fetch_money_flow, company["code"], 5)
-                net5 = sum(float(f.get("main_net") or 0) for f in flows) if flows else None
-                await asyncio.sleep(0.4)
-            except Exception:
-                net5 = None
-            if net5 is None or net5 <= 0:
-                break          # 资金未印证/背离 → 不进推荐位
-            recos.append({
-                "kind": k_name, "code": company["code"], "name": company["name"],
-                "text": ev.title or text[:60],
-                "flow": f"5日主力净流入 {net5 / 1e8:+.2f} 亿", "mark": "✅"})
-            break
-        if len(recos) >= 3:
-            break
-    return recos
-
-
-async def _watch_health_check(ledger) -> List[str]:
-    """盘后报告联动②：自选淘汰建议（只建议，不删）。
-
-    规则全部基于入池时写进 note 的约定——机器只执行用户自己定的纪律：
-    1. 买点失效：note 有「回踩XX.X」而现价高于买点 8% 以上（追高成本
-       过高，原观察逻辑不成立）；
-    2. 背离持续：note 注明「背离」的候选，舆情仍 conflicted → 提醒
-       （不判死刑：背离消除日可能正是买点，交给用户）。
-    """
-    import re as _re
-    drops: List[str] = []
-    held = {p["code"] for p in ledger.list_positions()}
-    # 现价：批量拉一次自选行情（不逐只打接口）
-    watched = ledger.list_watch()
-    codes = [w["code"] for w in watched if w["code"] not in held]
-    quotes: Dict[str, Dict[str, Any]] = {}
-    if codes:
-        try:
-            items = []
-            for c in codes:
-                try:
-                    cc, vv = mkt.normalize_code(c)
-                    items.append((cc, vv, "stock"))
-                except ValueError:
-                    continue
-            for q in await asyncio.to_thread(data.fetch_quotes, items):
-                quotes[q.code] = q.as_dict()
-        except Exception:
-            pass
-    for w in watched:
-        code = w["code"]
-        if code in held:
-            continue
-        note = w.get("note") or ""
-        q = quotes.get(code) or {}
-        price = q.get("price")
-        # 规则1：买点失效
-        m = _re.search(r"回踩(\d+(?:\.\d+)?)", note)
-        if m and price and price > float(m.group(1)) * 1.08:
-            drops.append(f"{w.get('name') or code}（{code}）：现价 {price} 已偏离"
-                         f"买点 {m.group(1)} 超过 8%，观察前提失效")
-            continue
-        # 规则2：背离持续（只对 note 提到背离的查，控制请求量）
-        if "背离" in note:
-            try:
-                collected = await asyncio.to_thread(senti_data.collect, code, "")
-                rep = await asyncio.to_thread(
-                    senti.summarize, collected["items"], code, "",
-                    collected["errors"], collected["extras"])
-                if rep.tone == "conflicted":
-                    drops.append(f"{w.get('name') or code}（{code}）：舆情背离持续"
-                                 f"（等「背离消除」条件触发，或移除换标的）")
-            except Exception:
-                pass
-    return drops[:5]
