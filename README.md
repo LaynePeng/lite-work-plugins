@@ -21,16 +21,23 @@ lite-work-plugins/
 │   │   └── plugin.py
 │   ├── email-plugin/        #   邮件：SMTP 发信（HTML/附件，发送前审批）＋ IMAP 收件箱/搜索/读单封
 │   │   └── plugin.py
-│   ├── astock-plugin/       #   A 股助手：行情/K线/选股/资金流 + 舆情分析 + 手工交易台账 + 下单提示
-│   │   ├── plugin.py        #     装配层（10 个工具 + 盯梢源 + 右栏持仓面板）
+│   ├── astock-plugin/       #   A 股助手：选股/回测/舆情/台账/下单提示/盯盘（不接委托通道）
+│   │   ├── plugin.py        #     装配层：类定义/设置/install/面板委托（1659 行）
+│   │   ├── astock_mixin_*.py#     工具方法层（mixin：market/ledger/hint/sync/watch/quant）
 │   │   ├── astock_market.py #     代码规范化/板块/涨跌停/费用/交易时段（纯规则，零网络）
 │   │   ├── astock_data.py   #     行情/K线/选股/资金流（限速+缓存+主备源切换）
 │   │   ├── astock_ledger.py #     手工交易台账（SQLite：加权成本/T+1/已实现盈亏）
 │   │   ├── astock_hints.py  #     下单提示引擎（止损止盈/加减仓/买卖股数估算）
-│   │   ├── astock_sentiment_data.py  # 舆情七类证据采集
-│   │   ├── astock_sentiment.py       # 证据归集与信号背离检测（不做情绪打分）
-│   │   ├── astock_sentiment_tool.py  # 舆情报告渲染
-│   │   └── test_astock_plugin.py     # 108 项离线单测（零网络）
+│   │   ├── astock_quant*.py #     选股引擎（三套策略）+ 取数/缓存/渲染
+│   │   ├── astock_backtest*.py  # 回测（防未来函数）+ 推荐率分档
+│   │   ├── astock_advise.py      # 策略推荐器（三套 → 一句人话结论）
+│   │   ├── astock_panel.py       # 右栏面板渲染（持仓两形态 + 三策略对比）
+│   │   ├── astock_report.py      # 组合舆情报告 + 事件推荐 + 自选体检
+│   │   ├── astock_plan.py        # 宿主盯梢计划的自动创建/维护/体检
+│   │   ├── astock_common.py      # 配置读取 / 格式化 / 表格（最底层）
+│   │   ├── astock_tools.py       # 16 个工具的 schema 声明（纯静态）
+│   │   ├── astock_sentiment*.py  # 舆情七类证据采集 → 归集/背离 → 渲染
+│   │   └── test_astock*.py       # 395 项离线单测（零网络、零真实台账写入）
 │   └── example-greeting/    #   示例插件（演示编写格式）
 │       └── plugin.py
 └── skills/                  # 技能（SKILL.md 指令文档）
