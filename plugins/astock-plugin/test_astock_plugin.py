@@ -478,6 +478,46 @@ class TestHints(unittest.TestCase):
         # 5 万元 / 10 万元 = 50% > 25% 上限
         self.assertGreater(cap[0].meta["weight_pct"], 25)
 
+    # ---------- 回归：单票占比的分母必须是账户总资产 ----------
+
+    def test_position_cap_uses_total_equity_not_market_value(self):
+        """真实报障：只持一只股时占比被算成 100%，正常仓位被误报「超上限」。
+
+        场景：现金 11,423.07 + 格力持仓市值 3,658 → 总资产 15,081.07，
+        占比 24.3%，在上限 25% 内。旧口径拿「持仓市值 3,658」当分母，
+        占比恒为 100% → 每次都报「单票占比 100% 超上限」并建议减仓。
+        """
+        pos = {"code": "000651", "name": "格力电器", "shares": 100,
+               "cost_price": 36.58}
+        hs = hints.build_position_hints(
+            pos, _quote(36.58, 36.20, name="格力电器"), self.cfg,
+            total_market_value=3658.0, total_equity=15081.07)
+        self.assertEqual([h for h in hs if h.kind == "position_cap"], [],
+                         "24.3% 在上限 25% 内，不该报超限")
+
+    def test_position_cap_reports_true_weight(self):
+        """超限时给出的占比与减仓股数都按总资产口径算。"""
+        pos = {"code": "000651", "name": "格力电器", "shares": 800,
+               "cost_price": 36.58}
+        hs = hints.build_position_hints(
+            pos, _quote(36.58, 36.20, name="格力电器"), self.cfg,
+            total_market_value=29264.0, total_equity=40687.07)
+        cap = [h for h in hs if h.kind == "position_cap"]
+        self.assertTrue(cap)
+        # 29,264 / 40,687.07 = 71.9%
+        self.assertAlmostEqual(cap[0].meta["weight_pct"], 71.92, places=1)
+        # 减到 25%：目标市值 10,171.77 → 需减 19,092 / 36.58 ≈ 500 股（整手）
+        self.assertEqual(cap[0].shares, 500)
+
+    def test_position_cap_falls_back_to_market_value(self):
+        """拿不到总资产（≤0）时退回持仓市值——等价于「全仓无现金」。"""
+        pos = {"code": "600000", "name": "测试股", "shares": 5000,
+               "cost_price": 10.0}
+        hs = hints.build_position_hints(pos, _quote(10.1, 10.0), self.cfg,
+                                        total_market_value=100000,
+                                        total_equity=0)
+        self.assertIn("position_cap", [h.kind for h in hs])
+
     def test_add_disabled_by_default(self):
         pos = {"code": "600000", "name": "测试股", "shares": 1000, "cost_price": 10.0}
         hs = hints.build_position_hints(pos, _quote(9.6, 9.7), self.cfg)
@@ -1260,9 +1300,14 @@ class TestPanelRender(unittest.TestCase):
                  "limit_up": 10.45, "limit_down": 8.55}
         pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
                 "cost_price": 10.0, "available_today": 1000}]
+        # 注意：这里刻意用「全仓无现金」（现金 0、总资产=持仓市值 8000），
+        # 这样 100% 占比在**新口径（占总资产）**下同样真超限。
+        # 早先 fixture 写了 cash=30000/equity=38000，实际只占 21%，
+        # 是旧 bug（拿持仓市值当分母）才让它显示 100% 超限——
+        # 那种"靠 bug 制造超限"的 fixture 会把修复本身变成测试失败。
         pl._snapshot = lambda **kw: {"data": {
             "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
-            "total_market_value": 8000.0, "equity": 38000.0, "cash": 30000.0,
+            "total_market_value": 8000.0, "equity": 8000.0, "cash": 0.0,
             "float_pnl": -2000.0, "today_pnl": -1500.0, "realized_pnl": 0.0}}
         out = pl.panel_content("portfolio", {})
         pr_json = out.split("```progress\n", 1)[1].split("\n```", 1)[0]
@@ -1274,6 +1319,32 @@ class TestPanelRender(unittest.TestCase):
         room = next(it for it in pr["items"] if "仓位空间" in it["label"])
         self.assertEqual(room["value"], 0)
         self.assertIn("超限", room["note"])
+
+    def test_progress_weight_uses_total_equity_not_market_value(self):
+        """回归（真实报障）：持仓 8000 + 现金 30000 的账户，单票占 21%，
+        不该被算成「100% 超限」。
+
+        旧口径用持仓市值当分母 → 只持一只股时恒为 100%，仓位条永远画成
+        红色「已超限」，并持续建议减仓（用户会做出多余的卖出操作）。
+        """
+        import json as _json
+        pl = self._plugin("markdown")
+        quote = {"price": 8.0, "prev_close": 9.5, "change_pct": -15.8,
+                 "limit_up": 10.45, "limit_down": 8.55}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
+            "total_market_value": 8000.0, "equity": 38000.0, "cash": 30000.0,
+            "float_pnl": -2000.0, "today_pnl": -1500.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        pr_json = out.split("```progress\n", 1)[1].split("\n```", 1)[0]
+        pr = _json.loads(pr_json)
+        room = next(it for it in pr["items"] if "仓位空间" in it["label"])
+        # 8000 / 38000 = 21.05% → 余量 (25-21.05)/25 = 15.8%，未超限
+        self.assertGreater(room["value"], 0)
+        self.assertNotIn("超限", room["note"])
+        self.assertIn("21.1%", room["note"])
 
     def test_watch_quotes_renders_table_when_ok(self):
         """自选行情正常时必须画出表格（防回归：v1.7.2 曾把表格代码掉进
@@ -1966,9 +2037,16 @@ class TestNotifyIntegration(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_action_signal_silent_at_urgent(self):
-        # 现价 9.4 / 昨收 9.9 → 当日 -5.05%：触发 event(action)，未到止损(-8%)
+        """action 级信号在 urgent 阈值下不该发信。
+
+        **必须屏蔽时段信号**：14:30–15:00 的这个跌幅还会额外触发「尾盘跳水」
+        （urgent 级），那会让本测试在下午跑时莫名失败——它验证的是
+        min_level 分级，不是时段规则。真实报障过一次：CI 上午绿、傍晚红。
+        """
         self._probe([self._quote(price=9.4, prev=9.9)],
-                    cfg=self._cfg(email_min_level="urgent"))
+                    cfg=self._cfg(email_min_level="urgent",
+                                  kinds="stop_loss,take_profit,trailing,"
+                                        "limit_up,limit_down,event"))
         self.assertEqual(self.sent, [])
 
     def test_action_signal_sent_at_action(self):
@@ -2782,16 +2860,166 @@ class TestQuantStrategyRegistry(unittest.TestCase):
         self.assertIn(quant.DEFAULT_STRATEGY, quant.STRATEGIES)
 
 
+# ---------------------------------------------------------------- 一次采集多套策略
+
+
+class TestScanAll(unittest.TestCase):
+    """`scan_all`：一次数据采集产出三套策略结果。
+
+    这是 v2.1.0 的核心优化。此前看三套策略要各扫一次（3× 采集成本，
+    约 18 秒 + 90 次 K 线请求），而三套策略的差异只在 filters/weights
+    （纯 CPU）——采集结果完全共用。
+    """
+
+    def setUp(self):
+        import astock_data as d
+        import astock_quant_tool as qt
+        self.d, self.qt = d, qt
+        qt.clear_cache()
+        self.calls = {"screen": 0, "kline": 0}
+        # 造一批覆盖三种策略口径的标的：上涨趋势（动量）/ 下跌（回归）/
+        # 低估值大盘（价值）。用同一份数据供三套策略评估。
+        self.rows = [
+            {"code": "600001", "name": "上涨股", "price": 20.0, "change_pct": 1.0,
+             "pe": 30.0, "pb": 3.0, "total_mcap_yuan": 8e10,
+             "amount_yuan": 5e8, "turnover_pct": 3.0,
+             "main_net_inflow_yuan": 1e7, "_trend": 1.004},
+            {"code": "600002", "name": "下跌股", "price": 9.0, "change_pct": -1.0,
+             "pe": 15.0, "pb": 1.2, "total_mcap_yuan": 6e10,
+             "amount_yuan": 4e8, "turnover_pct": 2.0,
+             "main_net_inflow_yuan": 5e6, "_trend": 0.996},
+            {"code": "600003", "name": "价值股", "price": 40.0, "change_pct": 0.2,
+             "pe": 6.0, "pb": 0.8, "total_mcap_yuan": 3e11,
+             "amount_yuan": 6e8, "turnover_pct": 1.0,
+             "main_net_inflow_yuan": 2e7, "_trend": 1.001},
+            {"code": "600004", "name": "小额股", "price": 15.0, "change_pct": 0.0,
+             "pe": 25.0, "pb": 2.0, "total_mcap_yuan": 1e10,
+             "amount_yuan": 1e6, "turnover_pct": 0.5,
+             "main_net_inflow_yuan": 1e5, "_trend": 1.000},
+        ]
+        self._orig = (d.screen, d.fetch_klines)
+
+        def fake_screen(**kw):
+            self.calls["screen"] += 1
+            public = [{k: v for k, v in r.items() if not k.startswith("_")}
+                      for r in self.rows]
+            return {"rows": public, "universe_total": 5000}
+
+        def fake_klines(code, period="day", limit=120, **kw):
+            self.calls["kline"] += 1
+            row = next(r for r in self.rows if r["code"] == code)
+            from astock_data import Bar
+            bars = []
+            p = row["price"] / (row["_trend"] ** 120)
+            for _ in range(120):
+                p *= row["_trend"]
+                bars.append(Bar(date="2026-01-01", open=p, close=p,
+                                high=p * 1.01, low=p * 0.99, volume_lot=2000.0))
+            return bars
+
+        d.screen, d.fetch_klines = fake_screen, fake_klines
+
+    def tearDown(self):
+        self.d.screen, self.d.fetch_klines = self._orig
+        self.qt.clear_cache()
+
+    def _run(self, **kw):
+        return self.qt.scan_all(cash=100000.0, equity=200000.0,
+                                sizing=quant.SizingConfig(max_positions=2),
+                                use_cache=False, **kw)
+
+    def test_returns_all_strategies_in_one_collect(self):
+        out = self._run()
+        self.assertEqual(set(out), set(quant.STRATEGIES))
+        # 关键：K 线只拉了「标的数」次，不是「标的数 × 策略数」次
+        self.assertEqual(self.calls["kline"], len(self.rows),
+                         "三套策略必须共用一次数据采集")
+        self.assertEqual(self.calls["screen"], 1)
+
+    def test_each_result_is_independent(self):
+        """三套策略的过滤条件不同 → 候选池/结果必须各自独立。
+
+        `quant.rank_candidates` 会原地写候选对象，若共用同一批 Scored
+        实例，后一套会覆盖前一套的打分痕迹（得分全变成最后一套的）。
+        """
+        out = self._run()
+        # 结果里 strategy 字段必须各自正确，不能全变成同一个
+        for key, res in out.items():
+            self.assertEqual(res["strategy"], key)
+        # 各策略的候选数应允许不同（filters 不同）；至少策略标签不同
+        labels = {res["strategy_label"] for res in out.values()}
+        self.assertEqual(len(labels), len(quant.STRATEGIES))
+        # 同一只票在不同策略下的得分不应完全一致（权重方向相反）
+        def codes_scores(res):
+            return {s.code: s.score for s in res.get("ranked") or []}
+        mom, qual = codes_scores(out["momentum"]), codes_scores(out["quality"])
+        shared = set(mom) & set(qual)
+        if len(shared) >= 2:
+            self.assertNotEqual([mom[c] for c in sorted(shared)],
+                                [qual[c] for c in sorted(shared)],
+                                "动量与价值的打分不应完全相同")
+
+    def test_no_network_when_cache_hit(self):
+        """缓存命中时必须零请求（面板 5 秒刷新会踩到这条路径）。"""
+        self._run()
+        self.calls.update(screen=0, kline=0)
+        out = self.qt.scan_all(cash=100000.0, equity=200000.0,
+                               sizing=quant.SizingConfig(max_positions=2),
+                               use_cache=True)
+        self.assertEqual(set(out), set(quant.STRATEGIES))
+        self.assertEqual(self.calls["screen"], 0, "缓存命中不该再打快照")
+        self.assertEqual(self.calls["kline"], 0, "缓存命中不该再拉 K 线")
+        for res in out.values():
+            self.assertTrue(res["cached"])
+
+    def test_partial_cache_only_collects_pending(self):
+        """只有部分策略有缓存时，仍只采集一次（补齐缺失的那些）。"""
+        self.qt.scan("momentum", cash=100000.0, equity=200000.0,
+                     sizing=quant.SizingConfig(max_positions=2),
+                     candidate_limit=30, use_cache=False)
+        self.calls.update(screen=0, kline=0)
+        out = self.qt.scan_all(cash=100000.0, equity=200000.0,
+                               sizing=quant.SizingConfig(max_positions=2),
+                               use_cache=True)
+        self.assertTrue(out["momentum"]["cached"])
+        self.assertFalse(out["quality"]["cached"])
+        self.assertEqual(self.calls["screen"], 1, "补齐时仍应只采集一次")
+
+    def test_single_scan_still_consistent_with_scan_all(self):
+        """兼容性：单策略 `scan` 与 `scan_all` 取同一策略，结论必须一致。"""
+        import astock_quant_tool as qt
+        one = qt.scan("quality", cash=100000.0, equity=200000.0,
+                      sizing=quant.SizingConfig(max_positions=2),
+                      use_cache=False)
+        qt.clear_cache()
+        many = self._run()["quality"]
+        self.assertEqual([s.code for s in one["ranked"]],
+                         [s.code for s in many["ranked"]])
+        self.assertEqual(one["candidates"], many["candidates"])
+
+    def test_bad_strategy_rejected(self):
+        import astock_quant_tool as qt
+        with self.assertRaises(ValueError):
+            qt.scan("nope", cash=1.0, equity=1.0, use_cache=False)
+
+
 class TestQuantPanelTabs(unittest.TestCase):
-    """右栏策略切换：一个策略一个 tab（宿主面板只读，这是唯一的切换方式）。"""
+    """右栏面板：v2.1.0 起是「持仓 / 选股」两个 tab，选股 tab 内做三策略对比。
+
+    历史：此前是「持仓 / 动量 / 回归 / 价值」四个 tab。三 tab 的硬伤是
+    面板只读、不能触发扫描，而设置页按钮一次只跑一套策略 → 另两个 tab
+    永远是「尚未生成」。合并后少了两次 tab 切换，还能直接看出三套分歧。
+    """
 
     def setUp(self):
         self.plugin = astock.AstockPlugin()
+        import astock_quant_tool as qt
+        qt.clear_cache()
 
-    def test_each_strategy_has_panel(self):
+    def test_two_panels_only(self):
         ids = [p["id"] for p in self.plugin.contributes["panels"]]
-        for key in quant.STRATEGIES:
-            self.assertIn(f"pick-{key}", ids, f"策略 {key} 缺少面板 tab")
+        self.assertEqual(ids, ["portfolio", "pick"],
+                         "tab 应收敛为「持仓 / 选股」两个")
 
     def test_panel_ids_unique_and_titled(self):
         panels = self.plugin.contributes["panels"]
@@ -2800,15 +3028,139 @@ class TestQuantPanelTabs(unittest.TestCase):
         for p in panels:
             self.assertTrue(p.get("title"), p["id"])
 
-    def test_panel_content_renders_for_each_strategy(self):
+    def test_compare_panel_renders_without_cache(self):
+        text = self.plugin.panel_content("pick", {})
+        self.assertTrue(text.strip())
+        self.assertIn("量化选股", text)
+        self.assertIn("尚未生成", text)
+
+    def test_legacy_strategy_panels_still_work(self):
+        """旧 id（pick-momentum 等）保留可用——已安装用户的书签不失效。"""
         for key in quant.STRATEGIES:
             text = self.plugin.panel_content(f"pick-{key}", {})
             self.assertTrue(text.strip(), key)
             self.assertIn("量化选股", text)
 
+    def test_compare_shows_all_three_strategies_from_cache(self):
+        """三套都有缓存时，对比视图必须把三套都列出来（不是只显示默认那套）。"""
+        import astock_quant_tool as qt
+
+        class _A:
+            def __init__(self, code, name, price=10.0, score=60.0, shares=100):
+                self.code, self.name, self.price, self.score = code, name, price, score
+                self.shares = shares
+
+        import time as _t
+        stamp = _t.time()          # 必须是"现在"，否则 cache_age 会算出天文数字
+        for key in quant.STRATEGIES:
+            qt._CACHE[qt._cache_key(key, "main", 30,
+                                    quant.SizingConfig(), 1e5, 2e5, None)] = (
+                stamp,
+                {"strategy": key, "strategy_label": quant.STRATEGIES[key].label,
+                 "allocations": [_A(f"60000{len(key)}", quant.STRATEGIES[key].label + "股")],
+                 "skipped": [], "summary": {}, "scanned": 5000,
+                 "candidates": 3, "generated_at": "2026-10-25 10:00:00",
+                 "cache_age_sec": 5.0})
+        text = self.plugin.panel_content("pick", {})
+        for key in quant.STRATEGIES:
+            self.assertIn(quant.STRATEGIES[key].label, text)
+
+    def test_compare_flags_multi_strategy_overlap(self):
+        """同一只票被多套选中时要显式标出来（这是对比视图的核心价值）。"""
+        import astock_quant_tool as qt
+
+        class _A:
+            def __init__(self, code, name, price=10.0, score=60.0, shares=100):
+                self.code, self.name, self.price, self.score = code, name, price, score
+                self.shares = shares
+
+        import time as _t
+        stamp = _t.time()
+        for key in quant.STRATEGIES:
+            qt._CACHE[qt._cache_key(key, "main", 30,
+                                    quant.SizingConfig(), 1e5, 2e5, None)] = (
+                stamp,
+                {"strategy": key, "strategy_label": quant.STRATEGIES[key].label,
+                 "allocations": [_A("600000", "共识股")],
+                 "skipped": [], "summary": {}, "scanned": 5000,
+                 "candidates": 1, "generated_at": "2026-10-25 10:00:00",
+                 "cache_age_sec": 5.0})
+        text = self.plugin.panel_content("pick", {})
+        self.assertIn("多套同时选中", text)
+        self.assertIn("共识股", text)
+
     def test_unknown_panel_is_empty(self):
         self.assertEqual(self.plugin.panel_content("pick-nope", {}), "")
         self.assertEqual(self.plugin.panel_content("nope", {}), "")
+
+    def test_pick_compare_arg_runs_all_three_once(self):
+        """对话里 compare=true 必须一次采集出三套，且三套都出现在输出里。"""
+        import asyncio
+        from unittest.mock import patch
+
+        class _App:
+            workspace = "/tmp"
+            config = {"astock-plugin": {"backtest_auto_grade": False}}
+
+            def save_config(self, _u):
+                pass
+
+        pl = astock.AstockPlugin()
+        pl._app = _App()
+        fake = {k: {"strategy": k,
+                    "strategy_label": quant.STRATEGIES[k].label,
+                    "allocations": [], "skipped": [], "summary": {},
+                    "scanned": 5000, "candidates": 0,
+                    "generated_at": "2026-10-27 14:00:00",
+                    "cache_age_sec": 1.0} for k in quant.STRATEGIES}
+
+        async def _no_grade(_s, fresh=False):      # 推荐率会联网，这里屏蔽
+            return ""
+
+        with patch.object(pl, "_quant_scan_all", return_value=fake), \
+                patch.object(pl, "_attach_grade", _no_grade):
+            loop = asyncio.new_event_loop()
+            try:
+                out = loop.run_until_complete(pl._tool_pick({"compare": True}))
+            finally:
+                loop.close()
+        for key in quant.STRATEGIES:
+            self.assertIn(quant.STRATEGIES[key].label, out)
+        self.assertIn("三策略对比", out)
+
+    def test_pick_default_does_not_scan_three(self):
+        """默认「帮我选股」仍只跑一套——不该悄悄把成本翻三倍。"""
+        import asyncio
+        from unittest.mock import patch
+
+        class _App:
+            workspace = "/tmp"
+            config = {"astock-plugin": {"backtest_auto_grade": False}}
+
+            def save_config(self, _u):
+                pass
+
+        pl = astock.AstockPlugin()
+        pl._app = _App()
+        called = {"all": 0}
+
+        def boom(args=None):
+            called["all"] += 1
+            raise AssertionError("默认路径不该走三套")
+
+        one = {"strategy": "momentum", "strategy_label": "趋势动量",
+               "allocations": [], "skipped": [], "summary": {},
+               "scanned": 5000, "candidates": 0,
+               "generated_at": "2026-10-27 14:00:00", "cache_age_sec": 1.0}
+
+        with patch.object(pl, "_quant_scan_all", boom), \
+                patch.object(pl, "_quant_scan", return_value=one):
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(pl._tool_pick({}))
+            finally:
+                loop.close()
+        self.assertEqual(called["all"], 0)
 
     def test_panel_never_scans_network(self):
         """面板 5 秒刷新 × 30 只 K 线 = 打死接口。渲染路径必须零网络。"""
@@ -2824,6 +3176,7 @@ class TestQuantPanelTabs(unittest.TestCase):
         d.screen, d.fetch_klines = boom, boom
         qt.clear_cache()
         try:
+            self.plugin.panel_content("pick", {})
             for key in quant.STRATEGIES:
                 self.plugin.panel_content(f"pick-{key}", {})
         finally:
@@ -2866,18 +3219,23 @@ class TestQuantSettingsAndAction(unittest.TestCase):
         self.assertLessEqual(cfg.cash_usage_pct, 100.0)
 
     def test_action_reports_error_gracefully(self):
-        """接口失败要给人话，不能抛栈。"""
+        """接口失败要给人话，不能抛栈。
+
+        注意打桩的是 `scan_all`（v2.1.0 起设置页按钮一次跑三套策略），
+        不再是 `scan`——打错目标会让测试真的去联网，既慢又不稳。
+        """
         import astock_quant_tool as qt
-        orig = qt.scan
+        orig = qt.scan_all
 
         def boom(*a, **k):
             raise RuntimeError("接口炸了")
 
-        qt.scan = boom
+        self.plugin._app.config["astock-plugin"]["backtest_auto_grade"] = False
+        qt.scan_all = boom
         try:
             res = self.plugin.settings_action("pick_run", self.plugin._app.config)
         finally:
-            qt.scan = orig
+            qt.scan_all = orig
         self.assertFalse(res["ok"])
         self.assertIn("接口炸了", res["message"])
         self.assertIn("限流", res["message"])
@@ -2885,24 +3243,64 @@ class TestQuantSettingsAndAction(unittest.TestCase):
     def test_action_reports_insufficient_cash_as_ok(self):
         """钱不够买一手是**资金约束**，不是错误——ok 必须为 True。"""
         import astock_quant_tool as qt
-        orig = qt.scan
+        orig = qt.scan_all
 
-        def fake(strategy, **k):
-            return {"strategy": strategy, "strategy_label": "趋势动量",
+        def fake(**k):
+            out = {}
+            for key in quant.STRATEGIES:
+                out[key] = {
+                    "strategy": key, "strategy_label": "趋势动量",
                     "allocations": [], "skipped": [
                         quant.Allocation(code="600001", name="甲", price=5000.0,
                                          score=50.0, skipped=True,
                                          skip_reason="预算 100 元不足一手")],
                     "summary": {"cash": 100.0, "budget": 80.0},
                     "scanned": 5000, "candidates": 3}
+            return out
 
-        qt.scan = fake
+        self.plugin._app.config["astock-plugin"]["backtest_auto_grade"] = False
+        qt.scan_all = fake
         try:
             res = self.plugin.settings_action("pick_run", self.plugin._app.config)
         finally:
-            qt.scan = orig
+            qt.scan_all = orig
         self.assertTrue(res["ok"], res)
         self.assertIn("资金不足", res["message"])
+
+    def test_pick_run_covers_all_strategies(self):
+        """点一次「立即跑一轮选股」必须把三套策略都算出来并各自汇报。
+
+        这是 v2.1.0 的核心体验修正：此前只跑设置页选中的那一套，
+        另外两个 tab 永远是「尚未生成结果」，要来回改设置再点三次。
+        """
+        import astock_quant_tool as qt
+        orig = qt.scan_all
+        got = {}
+
+        def fake(**k):
+            out = {}
+            for key in quant.STRATEGIES:
+                out[key] = {
+                    "strategy": key,
+                    "strategy_label": quant.STRATEGIES[key].label,
+                    "allocations": [], "skipped": [],
+                    "summary": {"cash": 1e5, "budget": 8e4},
+                    "scanned": 5000, "candidates": 0}
+            got.update(out)
+            return out
+
+        # 关掉「自动附推荐率」：那是 25 只 K 线的回测，属于另一个测试的范围，
+        # 开着会让本测试真的联网（慢且不稳）。
+        self.plugin._app.config["astock-plugin"]["backtest_auto_grade"] = False
+        qt.scan_all = fake
+        try:
+            res = self.plugin.settings_action("pick_run", self.plugin._app.config)
+        finally:
+            qt.scan_all = orig
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(set(got), set(quant.STRATEGIES))
+        for key in quant.STRATEGIES:
+            self.assertIn(quant.STRATEGIES[key].label, res["message"])
 
 
 # ---------------------------------------------------------------- 回测与推荐率（v1.9.0）

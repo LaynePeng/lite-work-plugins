@@ -17,7 +17,9 @@
 4. `limit_up/down` —— 触及涨跌停（不可成交，提示"别挂单"）
 5. `add_position`  —— 浮亏分批加仓机会（跌到 -5% / -10% 档，且需用户开启）
 6. `reduce`        —— 盈利分批减仓（涨到 +10% / +20% 档，且需用户开启）
-7. `position_cap`  —— 单票市值占组合比例超上限（默认 25%）
+7. `position_cap`  —— 单票市值占**账户总资产**（持仓市值 + 可用现金）超上限（默认 25%）。
+                       ⚠️ 分母必须是总资产，不是持仓市值——只持一只股时
+                       「占持仓市值」恒为 100%，会把正常仓位误报成超限。
 8. `t1_locked`     —— 今日买入不可卖（回答"现在能卖吗"）
 9. `event`         —— 异常信号：放量（量比>2）、大跌(-5%)、大涨(+7%)
 """
@@ -99,8 +101,15 @@ def build_position_hints(position: Dict[str, Any], quote: Dict[str, Any],
                          cfg: HintsConfig,
                          highest_price: Optional[float] = None,
                          total_market_value: Optional[float] = None,
-                         watch_only: bool = False) -> List[Hint]:
+                         watch_only: bool = False,
+                         total_equity: Optional[float] = None) -> List[Hint]:
     """单只持仓 → 提示列表。quote 为 `astock_data.Quote.as_dict()` 的结果。
+
+    `total_equity`（账户总资产 = 持仓市值 + 可用现金）是**单票占比的真分母**。
+    `total_market_value` 是持仓市值，只在拿不到总资产时作兜底——
+    用它当分母是历史 bug：只持一只股时占比恒为 100%，正常仓位被误报超限
+    （真实报障：总资产 15,081（现金 11,423 + 持仓 3,658），占比 24.3% 本在上限内，
+    却被报成「单票占比 100% 超上限」并建议减仓）。
 
     `watch_only=True`（或 shares<=0）时只产出**与仓位无关**的信号（涨跌停、
     当日异动、放量）——自选股也关心这些。盈亏/止损/加仓类必须有持仓才有意义，
@@ -241,20 +250,27 @@ def build_position_hints(position: Dict[str, Any], quote: Dict[str, Any],
                 suggestion=f"分批减仓可降低择时压力；减仓后记得把止损上移。",
                 shares=cut, basis=f"浮盈 {pnl_pct:+.2f}% ≥ 第 {tiers} 档"))
 
-    # ⑦ 单票占比
-    if positional and total_market_value and total_market_value > 0:
-        weight = shares * price / total_market_value * 100.0
+    # ⑦ 单票占比（分母＝账户总资产 = 持仓市值 + 可用现金）
+    # 历史 bug：这里曾用 total_market_value（持仓市值）当分母，只持一只股时
+    # 占比恒为 100%，即使只有 24% 也会被报成「超上限」并建议减仓。
+    # equity 拿不到（≤0）时才退回持仓市值——那种情况等价于「全仓、无现金」。
+    cap_base = float(total_equity or 0) or float(total_market_value or 0)
+    if positional and cap_base > 0:
+        mv = shares * price
+        weight = mv / cap_base * 100.0
         if weight > cfg.position_cap_pct:
+            # 卖出量按「超出上限的市值」折算，再用同一分母反推目标市值
+            target_mv = cfg.position_cap_pct / 100.0 * cap_base
             hints.append(Hint(
                 kind="position_cap", code=code, name=name, severity="action",
                 title=f"{name} 单票占比 {weight:.1f}% 超上限",
-                detail=(f"该股市值 {shares * price:,.0f} 元，占账户总市值 "
-                        f"{total_market_value:,.0f} 元的 {weight:.1f}%，"
+                detail=(f"该股市值 {mv:,.0f} 元，占账户总资产（持仓 "
+                        f"{float(total_market_value or 0):,.0f} 元 + 可用现金）"
+                        f"{cap_base:,.0f} 元的 {weight:.1f}%，"
                         f"超过上限 {cfg.position_cap_pct}%。"),
                 suggestion=f"建议至少减至 {cfg.position_cap_pct}% 以内以控制单票风险。",
-                shares=round_lot((weight - cfg.position_cap_pct) / 100.0 *
-                                 total_market_value / price, code),
-                basis=f"持仓占比 {weight:.1f}% > 上限 {cfg.position_cap_pct}%",
+                shares=round_lot((mv - target_mv) / price, code),
+                basis=f"占总资产 {weight:.1f}% > 上限 {cfg.position_cap_pct}%",
                 meta={"weight_pct": round(weight, 2)}))
 
     # ⑧ 当日异动

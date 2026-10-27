@@ -129,12 +129,18 @@ def decide_sells(positions: Sequence[Dict[str, Any]],
                  pick_codes: Sequence[str],
                  cfg: Any,
                  total_market_value: float = 0.0,
+                 total_equity: float = 0.0,
                  fee_cfg: Optional[FeeConfig] = None,
                  ) -> List[SellAction]:
     """判定该卖什么。只依据明确规则，不做主观判断。
 
     `cfg` 为 `astock_hints.HintsConfig`（复用同一套阈值，避免两处配置不一致）。
     `pick_codes` = 本轮选中的标的；**不在此列**且亏损超阈值的持仓会被建议换仓。
+
+    `total_equity` = 账户总资产（持仓市值 + 可用现金）＝**单票占比的真分母**。
+    传 0 时退回 `total_market_value`（持仓市值）——那种情况等价于「全仓无现金」。
+    曾用持仓市值当分母：只持一只股时占比恒为 100%，24% 的正常仓位被误报
+    「超上限」并建议减仓（真实报障）。
 
     注意：这里只给"建议卖出量"，实际可卖数受 T+1 约束（见 `available_today`）。
     """
@@ -144,6 +150,7 @@ def decide_sells(positions: Sequence[Dict[str, Any]],
     stop_pct = abs(float(getattr(cfg, "stop_loss_pct", 8.0) or 8.0))
     take_pct = abs(float(getattr(cfg, "take_profit_pct", 15.0) or 15.0))
     cap_pct = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
+    cap_base = float(total_equity or 0) or float(total_market_value or 0)
 
     for p in positions or []:
         code = str(p.get("code") or "")
@@ -210,16 +217,16 @@ def decide_sells(positions: Sequence[Dict[str, Any]],
                 out.append(a)
             continue
 
-        # ④ 仓位超限：减到上限内
-        if total_market_value > 0 and cap_pct > 0:
+        # ④ 仓位超限：减到上限内（分母＝账户总资产）
+        if cap_base > 0 and cap_pct > 0:
             mv = held * price
-            weight = mv / total_market_value * 100.0
+            weight = mv / cap_base * 100.0
             if weight > cap_pct:
-                target_mv = cap_pct / 100.0 * total_market_value
+                target_mv = cap_pct / 100.0 * cap_base
                 excess_shares = int((mv - target_mv) / price)
                 a = _mk(excess_shares,
                         f"单票占比 {weight:.1f}% 超上限 {cap_pct:g}%，减到上限内",
-                        f"占比 {weight:.1f}% > {cap_pct:g}%")
+                        f"占总资产 {weight:.1f}% > {cap_pct:g}%")
                 if a:
                     out.append(a)
 
@@ -264,18 +271,25 @@ def build_action_plan(positions: Sequence[Dict[str, Any]],
                       cfg: Any,
                       strategy: Any = None,
                       total_market_value: float = 0.0,
+                      total_equity: float = 0.0,
                       fee_cfg: Optional[FeeConfig] = None,
                       ) -> ActionPlan:
     """生成完整操作指示：先卖后买 + 资金闭环核算。
 
     资金核算必须能对上账：`cash_after = cash + 卖出净额 - 买入总成本`。
     对不上就说明有笔账算错了，所以这里会把差额写进 notes 让人看见。
+
+    `total_equity` 不传时自动按 `total_market_value + cash` 推算——
+    单票占比的分母必须是总资产，不能是持仓市值（见 `decide_sells`）。
     """
     plan = ActionPlan(cash_before=float(cash or 0))
     pick_codes = [getattr(a, "code", "") for a in (allocations or [])]
 
     sells = decide_sells(positions, quotes, pick_codes, cfg,
                          total_market_value=total_market_value,
+                         total_equity=(float(total_equity or 0) or
+                                       (float(total_market_value or 0) +
+                                        float(cash or 0))),
                          fee_cfg=fee_cfg)
     plan.sells = sells
     # 卖出净额 = 成交额 - 卖出费用

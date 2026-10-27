@@ -154,6 +154,10 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
     quotes: Dict[str, Any] = dict(data.get("watch_quotes") or {})
     quotes.update(data.get("quotes") or {})
     total_mv = float(data.get("total_market_value") or 0)
+    # 单票占比的分母＝**账户总资产**（持仓市值 + 可用现金），不是持仓市值。
+    # 用持仓市值当分母时，只持一只股就恒为 100%，看板会把正常仓位全部标「超限」。
+    total_equity = float(data.get("equity") or 0) or (
+        total_mv + float(data.get("cash") or 0))
 
     buckets: Dict[str, List[Dict[str, Any]]] = {
         COLUMN_URGENT: [], COLUMN_HOLDING: [], COLUMN_IDLE: []}
@@ -167,7 +171,8 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
         cost = float(p.get("cost_price") or 0)
         pnl = (price - cost) * shares
         pct = pct_change(price, cost)
-        hs = hint_builder(p, q, hints_cfg, total_market_value=total_mv)
+        hs = hint_builder(p, q, hints_cfg, total_market_value=total_mv,
+                          total_equity=total_equity)
         t1 = t1_builder(p, int(p.get("available_today") or 0))
         if t1:
             hs.append(t1)
@@ -190,7 +195,7 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
             # tag 只有一个位置：放"仓位占比"（组合层面最有用的风险指标）。
             # 收益率已在 desc 首行，重复写会浪费 tag
             # （踩过：tag 写成 "占仓 3.18" 其实是收益率 3.18%，语义完全错）。
-            weight = (shares * price / total_mv * 100) if total_mv > 0 else None
+            weight = (shares * price / total_equity * 100) if total_equity > 0 else None
             buckets[COLUMN_HOLDING].append({
                 "title": _clip(f"{p.get('name') or code}（{code}）", 80),
                 "desc": _clip(head + f"\n→ 未触发规则区间（止损 "

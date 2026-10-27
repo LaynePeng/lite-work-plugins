@@ -39,7 +39,8 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
 扩展点
     AStockWatch       盯梢源：自选股/持仓出现异动时才唤醒 Agent（不烧 token 盯盘）
     contributes.panels 「持仓」右栏面板：Markdown 表格实时浮盈
-                       + 「动量/回归/价值」三个策略面板（点 tab 即切策略）
+                       + 「选股」面板（v2.1.0：一个 tab 内三策略对比，
+                       一次数据采集同时算三套，价格同源可比）
 
 设计约束（遵循本仓库 AGENTS.md）
 - **零第三方依赖**：httpx/pandas 都不用，纯标准库（urllib/sqlite3/json/dataclasses）。
@@ -417,6 +418,20 @@ class AStockWatch(WatchSource):
         except data.DataError as exc:
             return ProbeResult(ok=False, error=f"行情获取失败：{exc}")
 
+        # 单票占比的分母＝账户总资产（持仓市值 + 台账可用现金），
+        # 与面板/聊天同口径。探针此前**完全没传分母**，所以盯盘路径上
+        # 仓位类提示永远不触发——而它恰好是最该在盘中提醒的一类。
+        try:
+            probe_cash = float(ledger.get_cash().get("balance") or 0)
+        except Exception:
+            probe_cash = 0.0
+        probe_mv = 0.0
+        for _q in quotes:
+            _p = positions.get(_q.code) or {}
+            if int(_p.get("shares") or 0) > 0 and _q.price:
+                probe_mv += float(_q.price) * int(_p["shares"])
+        probe_equity = probe_mv + probe_cash
+
         hcfg = hints.HintsConfig()
         for key in hcfg.__dataclass_fields__:
             raw = own.get(key, getattr(hcfg, key))
@@ -467,7 +482,9 @@ class AStockWatch(WatchSource):
                         "suggestion": "关注是否有公告/行业消息；自选股未持仓，仅作观察。",
                     })
                 continue
-            hs = hints.build_position_hints(pos, qd, hcfg)
+            hs = hints.build_position_hints(pos, qd, hcfg,
+                                            total_market_value=probe_mv,
+                                            total_equity=probe_equity)
             for h in hs:
                 if h.kind not in want_kinds:
                     continue
@@ -742,7 +759,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.0.0"
+    version = "2.1.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -836,9 +853,10 @@ class AstockPlugin(ToolPlugin):
                      "没收到说明 email-plugin 的邮箱尚未配好"},
 
             # ── 量化选股（v1.8.0）───────────────────────────────────────
-            # 策略本身**不在设置页选**：右栏有三个策略面板 tab，点 tab 即切换，
-            # 面板里直接看该策略的选股结果。这里的 pick_strategy 只决定
-            # 「Agent 未指定 strategy 时用哪套」与「tools/命令的默认值」。
+            # 策略本身**不在设置页选**：右栏「选股」tab 一屏展示三套对比
+            # （v2.1.0 前是三个 tab，但面板不能触发扫描，另外两个永远是空的）。
+            # 这里的 pick_strategy 只决定「Agent 未指定 strategy 时用哪套」
+            # 与「tools/命令的默认值」——它**不**决定面板显示哪一套。
             {"key": "pick_strategy", "type": "select", "label": "默认选股策略",
              "default": "momentum",
              "options": ["momentum", "reversal", "quality"],
@@ -912,13 +930,14 @@ class AstockPlugin(ToolPlugin):
         ],
         "panels": [
             {"id": "portfolio", "title": "持仓"},
-            # 三个策略各一个 tab：点 tab ＝ 切策略。
-            # 宿主面板只读（Markdown / lite-tree 都点不了），因此"在面板里切换
-            # 策略"只能靠"一个策略一个面板"来实现——这是协议能力内的最优解，
-            # 而不是额外去点按钮。
-            {"id": "pick-momentum", "title": "动量"},
-            {"id": "pick-reversal", "title": "回归"},
-            {"id": "pick-quality", "title": "价值"},
+            # v2.1.0：三个策略 tab 合并为一个「选股」tab，内部做三策略对比。
+            # 之前的「动量/回归/价值」三 tab 有个硬伤：面板只读、不能触发扫描，
+            # 而设置页按钮一次只跑一套 → 另外两个 tab 永远显示「尚未生成」，
+            # 要改设置再点三次才能对比。现在按钮一次跑三套 + 一个对比视图，
+            # 既少了两次 tab 切换，也能直接看出三套的分歧。
+            # 保留旧的 pick-<strategy> id 入口（见 _panel_pick），
+            # 已安装用户的书签/习惯不会失效。
+            {"id": "pick", "title": "选股"},
         ],
         # 斜杠命令：宿主把它们放进输入框的 / 命令面板（快捷提示）。
         # 输入后原样透传给 Agent——靠 description 引导 Agent 调对应工具，
@@ -1107,6 +1126,40 @@ class AstockPlugin(ToolPlugin):
         # 外层流动性下限（策略默认门槛已在引擎里生效，这里只叠加用户配置）
         result["min_amount_yuan"] = min_amount
         return result
+
+    def _quant_scan_all(self, args: Optional[Dict[str, Any]] = None
+                        ) -> Dict[str, Dict[str, Any]]:
+        """一次采集、三套策略（同步，调用方包 to_thread）。
+
+        与 `_quant_scan` 的差别只在「跑几套」：数据采集只做一次，
+        三套策略在同一份行情上打分。**三套结果必然基于同一时点价格**——
+        这点比省时间更重要：分别扫出来的三套价格不同源，横向对比时
+        "这只动量第一、那只价值第三"可能只是几十秒的价差造成的假象。
+        """
+        args = args or {}
+        ledger = self._get_ledger()
+        snap = self._snapshot()
+        cash = float(snap["data"].get("cash") or 0)
+        total_mv = float(snap["data"].get("total_market_value") or 0)
+        equity = total_mv + cash
+        universe = str(args.get("universe")
+                       or _cfg(self._app, "pick_universe", "main") or "main").lower()
+        if universe not in quant_tool.__dict__.get("UNIVERSES",
+                                                   ("main", "all", "gem", "star")):
+            universe = "main"
+        cand = int(_num(self._app, "pick_candidates",
+                        quant.MAX_KLINE_CANDIDATES))
+        out = quant_tool.scan_all(
+            cash=cash, equity=equity, universe=universe,
+            sizing=self._sizing_cfg(args),
+            candidate_limit=max(5, min(cand, 60)),
+            fee_cfg=ledger.fee,
+            use_cache=not bool(args.get("fresh")),
+        )
+        min_amount = _num(self._app, "pick_min_amount_yuan", 1e8)
+        for res in out.values():
+            res["min_amount_yuan"] = min_amount
+        return out
 
     # -------------------------------------------------- 工具定义
 
@@ -1369,6 +1422,9 @@ class AstockPlugin(ToolPlugin):
                     "得分是**候选池内相对排名**（0-100），不是上涨概率、不是预期收益；"
                     "每只都给出得分来源（各因子贡献）以便核对。"
                     "rank_only=true 只出排行不给股数（想自己决定买哪只时用）。"
+                    "**compare=true 一次采集同时算出三套并做横向对比**"
+                    "（三套共用同一份行情，成本≈单策略，且价格同源可比）——"
+                    "用户问「三套策略对比一下」「哪个策略更合适」时用它。"
                     "整个扫描约 6 秒（30 只 K 线，受限速）。"),
                 parameters={
                     "type": "object",
@@ -1384,6 +1440,12 @@ class AstockPlugin(ToolPlugin):
                         "rank_only": {
                             "type": "boolean",
                             "description": "true＝只出得分排行，不给买入股数",
+                        },
+                        "compare": {
+                            "type": "boolean",
+                            "description": ("true＝一次采集同时跑三套策略并横向对比"
+                                            "（成本≈单策略，价格同源）。"
+                                            "用户想比较三套策略时用；默认只跑一套"),
                         },
                         "max_positions": {
                             "type": "number",
@@ -2231,6 +2293,11 @@ class AstockPlugin(ToolPlugin):
         lines = [f"**下单提示**（{ctx['text']}）", ""]
         all_hints: List[hints.Hint] = []
         total_mv = snap["data"]["total_market_value"] or 0
+        # 单票占比的分母必须是**账户总资产**（持仓市值 + 可用现金）。
+        # 曾误用 total_mv（持仓市值）→ 只持一只股时占比恒为 100%，
+        # 24% 的正常仓位也会被报成「超上限」并建议减仓。
+        total_equity = float(snap["data"].get("equity") or 0) or (
+            float(total_mv) + float(snap["data"].get("cash") or 0))
 
         for code in codes:
             q = quotes.get(code)
@@ -2240,7 +2307,8 @@ class AstockPlugin(ToolPlugin):
             if pos:
                 hs = hints.build_position_hints(pos, q, cfg,
                                                highest_price=highest.get(code),
-                                               total_market_value=total_mv)
+                                               total_market_value=total_mv,
+                                               total_equity=total_equity)
                 t1 = hints.build_t1_hint(pos, int(pos.get("available_today") or 0))
                 if t1:
                     hs.append(t1)
@@ -2693,10 +2761,27 @@ class AstockPlugin(ToolPlugin):
                      "「无变化」，**不消耗 token**。")
         lines.append("")
         lines.append("### 还需要你做一次（只需一次）")
-        lines.append("插件无权创建宿主的盯梢计划，请在 **右栏「盯梢」页 → 新建计划** 中：")
+        lines.append("")
+        lines.append("**「启动盯盘」只打开了插件侧的开关**——它决定探针被调用时"
+                     "要不要干活。真正让探针被**周期性调用**的，是宿主的盯梢计划；"
+                     "插件无权创建它（宿主没开放该 API）。")
+        lines.append("")
+        lines.append("所以请到 **右栏「盯梢」页 → 新建计划**（图形界面，不用命令行）：")
         lines.append("- 数据源选 **A股持仓/自选异动**（source_kind = `astock`）")
-        lines.append("- 间隔填 **300 秒**（5 分钟）；或选 cron `*/5 9-14 * * 1-5`")
+        lines.append("- 调度模式选 **间隔**，填 **300 秒**（5 分钟）——推荐，够用且最直观")
         lines.append("- 权限档保持 **read**（无人值守，不需要写权限）")
+        lines.append("")
+        lines.append("> **关于 cron**：计划编辑器里还有一个「cron」模式（填 `*/5 9-14 * * 1-5`"
+                     "这类 5 段表达式），那是**宿主内置的调度格式**，"
+                     "与系统 crontab **完全无关**——不需要你编辑 crontab 文件、"
+                     "也不需要 `crontab -e`。两者效果等价（都能每 5 分钟跑一次），"
+                     "**选「间隔 300 秒」即可**，不必碰 cron。")
+        lines.append("")
+        lines.append("### 这个计划是邮件通知的前提")
+        lines.append("")
+        lines.append("高风险邮件通知**不是独立进程**：它由探针在发现信号时直接调用 "
+                     "email-plugin 发信（探针跑不起来 = 永远不会有邮件）。"
+                     "所以「收不到邮件」时先看本页**是否在盯 = 是**，再查 email-plugin 凭据。")
         lines.append("")
         lines.append("建好后它会长期生效，你不需要每天启动——"
                      "时段判断在插件侧做，收盘后自动静默。")
@@ -2819,40 +2904,44 @@ class AstockPlugin(ToolPlugin):
         同步执行约 6 秒（30 只 K 线 + 限速）。按钮由用户显式点击，因此
         同步可接受；但**必须把结果说清楚**——尤其是"钱不够买一手"这种
         看起来像出错、其实是资金约束的情况，否则用户会以为插件坏了。
+
+        **一次跑三套策略**（v2.1.0）：三套共用一次数据采集，成本与只跑
+        一套几乎相同（多出的只是毫秒级打分）。这样三个策略 tab 立刻
+        都有结果，不需要来回改设置页再点三次。
         """
-        key = str(own.get("pick_strategy") or self._default_strategy()).strip().lower()
-        if key not in quant.STRATEGIES:
-            key = quant.DEFAULT_STRATEGY
         try:
-            result = self._quant_scan(key, {"fresh": True})
+            results = self._quant_scan_all({"fresh": True})
         except Exception as exc:
             logger.warning("[astock] 设置页选股失败: %s", exc)
             return {"ok": False,
                     "message": f"选股失败：{type(exc).__name__}: {exc}。"
                                f"若为接口限流，等 10-30 秒再点一次"}
+        parts: List[str] = []
+        for key in quant.STRATEGIES:
+            result = results.get(key)
+            if not result:
+                continue
+            parts.append(self._pick_run_line(key, result))
+        return {"ok": True, "message": "　｜　".join(parts)}
+
+    def _pick_run_line(self, key: str, result: Dict[str, Any]) -> str:
+        """把单套策略的结果压成一行人类可读的结论。"""
         strat = quant.STRATEGIES[key]
         allocs = result.get("allocations") or []
         summary = result.get("summary") or {}
         if not allocs:
             skipped = result.get("skipped") or []
             if skipped:
-                msg = (f"{strat.label}：{len(skipped)} 只通过筛选但资金不足一手"
-                       f"（可用 {summary.get('cash', 0):,.0f} 元，"
-                       f"预算 {summary.get('budget', 0):,.0f} 元）。"
-                       f"可提高现金使用比例或减少买入只数")
-            else:
-                msg = (f"{strat.label}：本轮无标的通过门槛"
-                       f"（扫描 {result.get('scanned', 0)} 只 / "
-                       f"候选 {result.get('candidates', 0)} 只）。"
-                       f"可换策略或放宽最低成交额")
-            return {"ok": True, "message": msg}
-        names = "、".join(f"{a.name} {a.shares}股" for a in allocs[:3])
-        more = f" 等 {len(allocs)} 只" if len(allocs) > 3 else ""
-        return {"ok": True, "message": (
-            f"{strat.label}：选出 {len(allocs)} 只（{names}{more}），"
-            f"计划投入 {summary.get('allocated_amount', 0):,.0f} 元 / "
-            f"预算 {summary.get('budget', 0):,.0f} 元。"
-            f"详见右栏「{strat.label[:2]}」面板")}
+                return (f"{strat.label}：{len(skipped)} 只过筛但资金不足一手"
+                        f"（可用 {summary.get('cash', 0):,.0f} 元）")
+            return (f"{strat.label}：无标的过门槛"
+                    f"（扫描 {result.get('scanned', 0)} / "
+                    f"候选 {result.get('candidates', 0)} 只）")
+        names = "、".join(f"{a.name} {a.shares}股" for a in allocs[:2])
+        more = f" 等 {len(allocs)} 只" if len(allocs) > 2 else ""
+        return (f"{strat.label}：{names}{more}"
+                f"（投 {summary.get('allocated_amount', 0):,.0f} / "
+                f"预算 {summary.get('budget', 0):,.0f} 元）")
 
     def _action_test_mail(self, own: Dict[str, Any],
                           _config: Dict[str, Any]) -> Dict[str, Any]:
@@ -2917,8 +3006,17 @@ class AstockPlugin(ToolPlugin):
             logger.warning("[astock] 写配置失败: %s", exc)
             return f"{type(exc).__name__}: {exc}"
 
+
     async def _tool_pick(self, args: Dict[str, Any]) -> str:
-        """量化选股：全市场扫描 → 打分 → 换算股数（可带推荐率）。"""
+        """量化选股：全市场扫描 → 打分 → 换算股数（可带推荐率）。
+
+        `compare=true` 时一次采集同时产出三套并做对比（v2.1.0）——数据采集
+        只做一次，成本与单策略几乎相同。默认仍只跑一套：多数人问「帮我选股」
+        只想看一个结论，三套一起给反而要他自己挑。**要看分歧时**明确说
+        「三套对比一下」，模型会带上这个参数。
+        """
+        if args.get("compare"):
+            return await self._tool_pick_compare(args)
         try:
             result = await asyncio.to_thread(self._quant_scan, None, args)
         except data.DataError as exc:
@@ -2935,6 +3033,33 @@ class AstockPlugin(ToolPlugin):
             if grade:
                 text = grade + "\n\n---\n\n" + text
         return text
+
+    async def _tool_pick_compare(self, args: Dict[str, Any]) -> str:
+        """三策略对比（一次采集，成本≈单策略）。"""
+        try:
+            results = await asyncio.to_thread(self._quant_scan_all, args)
+        except data.DataError as exc:
+            return f"[Error] 选股扫描失败：{exc}"
+        recs: Dict[str, Any] = {}
+        for key in quant.STRATEGIES:
+            try:
+                cached = backtest_tool.get_cached(key)
+                if cached:
+                    recs[key] = cached.get("recommendation")
+            except Exception:
+                logger.debug("[astock] 读回测缓存失败: %s", key, exc_info=True)
+        head = quant_tool.render_compare(results, recs=recs, max_rows=5)
+        # 对话里空间足够，附上每套的推荐率摘要（面板为了窄栏只留数字）
+        grades: List[str] = []
+        for key in quant.STRATEGIES:
+            if key not in results:
+                continue
+            grade = await self._attach_grade(key)
+            if grade:
+                grades.append(grade)
+        tail = ("\n\n---\n\n### 各策略推荐率（历史表现，不是上涨概率）\n\n"
+                + "\n\n".join(grades)) if grades else ""
+        return head + tail
 
     async def _attach_grade(self, strategy: str,
                             fresh: bool = False) -> str:
@@ -3012,6 +3137,7 @@ class AstockPlugin(ToolPlugin):
         strategy_key = scan.get("strategy") or self._default_strategy()
         strat = quant.STRATEGIES.get(strategy_key)
 
+        total_mv = float(d.get("total_market_value") or 0)
         plan = actions.build_action_plan(
             positions=positions,
             quotes=quotes,
@@ -3019,7 +3145,9 @@ class AstockPlugin(ToolPlugin):
             cash=float(d.get("cash") or 0),
             cfg=self._hints_cfg(),
             strategy=strat,
-            total_market_value=float(d.get("total_market_value") or 0),
+            total_market_value=total_mv,
+            total_equity=float(d.get("equity") or 0) or (
+                total_mv + float(d.get("cash") or 0)),
             fee_cfg=self._get_ledger().fee)
 
         text = actions.render_action_plan(
@@ -3189,7 +3317,7 @@ class AstockPlugin(ToolPlugin):
           着色，适合盘中扫一眼。
         形态是偏好问题而非对错问题，所以做成开关而不是替你决定。
         """
-        if panel_id.startswith("pick-"):
+        if panel_id == "pick" or panel_id.startswith("pick-"):
             return self._panel_pick(panel_id)
         if panel_id != "portfolio":
             return ""
@@ -3210,34 +3338,60 @@ class AstockPlugin(ToolPlugin):
     # -------------------------------------------------- 面板渲染（两种形态）
 
     def _panel_pick(self, panel_id: str) -> str:
-        """量化选股面板（三个策略 tab）。
+        """量化选股面板。
 
-        **为什么要做成三个 tab**：宿主面板是**只读**的——Markdown 与 lite-tree
-        都点不了，插件在右栏唯一能提供的交互就是"切换 tab"。所以"在面板里
-        切换策略"的正确实现是「一个策略一个面板」，点 tab 即切换，而不是
-        想办法塞一个下拉框或按钮（协议不支持，做了也是死控件）。
+        v2.1.0 起是**一个「选股」tab + 三策略对比视图**，不再是三个 tab
+        各看各的。理由：面板只读、不能触发扫描，而设置页按钮原先一次只跑
+        一套策略 → 另外两个 tab 永远显示「尚未生成」，用户要改设置再点三次
+        才能完成一次对比。现在一次跑三套、一屏内摆出分歧。
+
+        **兼容旧 id**：`pick-momentum` / `pick-reversal` / `pick-quality`
+        仍可访问，渲染该策略的详情视图（旧书签/习惯不失效）。
 
         **绝不在这里跑扫描**：面板 5 秒刷新，而一次扫描要拉 30 只 K 线 ≈ 6 秒
         + 会把公共接口打到限流。这里只读 `quant_tool` 的进程内缓存；
         没缓存就提示"去设置页点一下/说一句让我跑"，把耗时的决定权交给用户。
         """
-        strategy = panel_id.split("-", 1)[1] if "-" in panel_id else ""
-        if strategy not in quant.STRATEGIES:
-            return ""
+        strategy = ""
+        if panel_id.startswith("pick-"):
+            strategy = panel_id.split("-", 1)[1]
+            # 未知的 pick-xxx 不该静默降级成对比视图——那会让"面板 id 写错"
+            # 变成一个看不出来的 bug。只有已知策略才走详情视图。
+            if strategy not in quant.STRATEGIES:
+                return ""
+        # 全部缓存的推荐率（只读，绝不在这里跑回测——那是 25 只 K 线的开销）
+        recs: Dict[str, Any] = {}
+        for key in quant.STRATEGIES:
+            try:
+                bt = backtest_tool.get_cached(key)
+                if bt:
+                    recs[key] = bt.get("recommendation")
+            except Exception:
+                logger.debug("[astock] 面板读回测缓存失败", exc_info=True)
+
+        # 旧 id → 单策略详情视图
+        if strategy in quant.STRATEGIES:
+            try:
+                cached = quant_tool.pick_cached(strategy)
+            except Exception:
+                logger.warning("[astock] 选股面板缓存读取失败", exc_info=True)
+                cached = None
+            return self._render_pick_detail(strategy, cached, recs.get(strategy))
+
+        # 新「选股」tab → 三策略对比
+        results: Dict[str, Any] = {}
         try:
-            cached = quant_tool.pick_cached(strategy)
+            for key in quant.STRATEGIES:
+                cached = quant_tool.pick_cached(key)
+                if cached:
+                    results[key] = cached
         except Exception:
             logger.warning("[astock] 选股面板缓存读取失败", exc_info=True)
-            cached = None
-        # 回测推荐率（只读缓存，绝不在这里跑回测——那是 25 只 K 线的开销）
-        rec = None
-        try:
-            bt_cached = backtest_tool.get_cached(strategy)
-            if bt_cached:
-                rec = bt_cached.get("recommendation")
-        except Exception:
-            logger.debug("[astock] 面板读回测缓存失败", exc_info=True)
+        return quant_tool.render_compare(results, recs=recs)
 
+    def _render_pick_detail(self, strategy: str, cached: Optional[Dict[str, Any]],
+                            rec: Any) -> str:
+        """单策略详情视图（旧 `pick-<strategy>` 入口，保留兼容）。"""
         # 卡片形态：有选股结果 + 用户没要求 Markdown 时，走 lite-tree 卡片看板
         # （「像炒股软件那样」的诉求）。卡片能以进度条表达推荐率/仓位，
         # 表格在 331px 窄栏里做不到这一点。
@@ -3335,6 +3489,9 @@ class AstockPlugin(ToolPlugin):
         # ── 每股：名称行 + progress 双条（仓位/距止损） ──
         cfg = self._hints_cfg()
         total_mv = d.get("total_market_value") or 0
+        # 单票占比的分母＝账户总资产（持仓市值 + 可用现金），与 hint 引擎同口径。
+        # 用持仓市值当分母时，只持一只股就恒为 100%，仓位条永远画成「已超限」。
+        equity_base = equity if equity > 0 else total_mv
         for p in d["positions"][:MAX_ROWS]:
             q = d["quotes"].get(p["code"]) or {}
             price = q.get("price") or p["cost_price"]
@@ -3352,8 +3509,8 @@ class AstockPlugin(ToolPlugin):
             # 此前喂「已消耗量」（浮亏触到止损线 → 100% 满条**绿色**，看着
             # 最健康实际最危险——语义反转，真实报障）。
             items: List[Dict[str, Any]] = []
-            if total_mv > 0:
-                weight = mv / total_mv * 100
+            if equity_base > 0:
+                weight = mv / equity_base * 100
                 cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
                 headroom = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
                 items.append({"label": f"仓位空间（上限 {cap:g}%）",
@@ -3465,13 +3622,18 @@ class AstockPlugin(ToolPlugin):
                     + (f"\n\n---\n\n**盯盘**\n\n{wl}" if wl else ""))
         cfg = self._hints_cfg()
         total_mv = d["total_market_value"] or 0
+        # 单票占比的分母＝账户总资产（持仓市值 + 可用现金）。
+        # 用持仓市值当分母时，只持一只股就恒为 100%，正常仓位会被标成超限。
+        equity_base = ((d.get("equity") or 0)
+                       or (total_mv + (d.get("cash") or 0)))
         cards: List[Dict[str, Any]] = []
         for p in positions:
             q = d["quotes"].get(p["code"]) or {}
             price = q.get("price") or p["cost_price"]
             pnl = (price - p["cost_price"]) * p["shares"]
             pct = mkt.pct_change(price, p["cost_price"])
-            hs = hints.build_position_hints(p, q, cfg, total_market_value=total_mv)
+            hs = hints.build_position_hints(p, q, cfg, total_market_value=total_mv,
+                                            total_equity=equity_base)
             t1 = hints.build_t1_hint(p, int(p.get("available_today") or 0))
             if t1:
                 hs.append(t1)
@@ -3489,7 +3651,7 @@ class AstockPlugin(ToolPlugin):
             # 条越长越安全；触线/超限 → 0 → 短条。此前「已消耗量」画满条
             # 反而像"很健康"（语义反转）。
             # 刻度①：仓位空间 = 距上限的余量（超限 = 0）
-            weight = (p["shares"] * price / total_mv * 100) if total_mv > 0 else 0.0
+            weight = (p["shares"] * price / equity_base * 100) if equity_base > 0 else 0.0
             cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
             room = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
             # 刻度②：距止损余量 = 1 - 浮亏消耗（触线 = 0）
@@ -3501,7 +3663,7 @@ class AstockPlugin(ToolPlugin):
             opts: List[Dict[str, Any]] = [
                 {"label": (label or "")[:80], "prob": 1.0,
                  "tone": tone, "chosen": True}]
-            if total_mv > 0:
+            if equity_base > 0:
                 opts.append(_scale(f"仓位空间 {room:.0f}%（现占 {weight:.1f}% / 上限 {cap:g}%）",
                                    room, "danger" if weight > cap else "alt"))
             if pct is not None and stop_pct > 0:
