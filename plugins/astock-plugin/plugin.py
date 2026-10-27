@@ -111,6 +111,7 @@ except ImportError:  # 旧宿主降级
 
 import astock_board as board
 import astock_actions as actions
+import astock_advise as advise
 import astock_backtest as backtest
 import astock_backtest_tool as backtest_tool
 import astock_archive as archive_mod
@@ -119,6 +120,7 @@ import astock_hints as hints
 import astock_market as mkt
 import astock_notify as notify
 import astock_orders as orders
+import astock_plan as plan_ctl
 import astock_quant as quant
 import astock_quant_tool as quant_tool
 import astock_receipt as receipt
@@ -759,7 +761,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.1.0"
+    version = "2.1.1"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -817,6 +819,11 @@ class AstockPlugin(ToolPlugin):
              "hint": "markdown＝紧凑表格（横向数值对齐，适合盘后核对）；"
                      "tree＝一只股一张卡，卡内写触发规则与建议动作并按严重度着色"
                      "（适合盘中扫一眼）。两者数据完全相同，只是排版不同"},
+            {"key": "watch_interval_seconds", "type": "number",
+             "label": "盯盘探测间隔（秒）", "default": 300,
+             "hint": "插件会自动按这个间隔创建/维护宿主盯梢计划（最小 60 秒）。"
+                     "300 秒＝5 分钟：够快发现问题，又不至于把公共行情接口打到限流。"
+                     "改完点「启动 / 暂停盯盘」或说「启动盯盘」即时生效"},
             {"key": "watch_enabled", "type": "boolean", "label": "启用盯盘",
              "default": True,
              "hint": "关掉后盯梢探针直接返回「无变化」，不会再唤醒你。"
@@ -1016,6 +1023,22 @@ class AstockPlugin(ToolPlugin):
                 _bool(self._app, "archive_auto_update", True))
         except Exception:
             logger.warning("[astock] 回测台账/存档注入失败", exc_info=True)
+        # 盯盘计划自愈：插件重新加载（重启/升级/切工作区）时检查计划还在不在。
+        # 为什么要做：计划被禁用或工作区变了之后，盯盘会**静默停摆**——没有报错，
+        # 用户只会觉得"邮件怎么不来了"。只在开关打开时修复：关着说明用户主动
+        # 暂停了，不该擅自建。
+        try:
+            if _as_bool(_cfg(self._app, "watch_enabled", True), True):
+                res = plan_ctl.ensure_plan(
+                    self._app, self._workspace(),
+                    interval=int(_num(self._app, "watch_interval_seconds", 300)))
+                if res.get("action") in ("created", "repaired"):
+                    logger.info("[astock] 盯盘计划自愈：%s", res.get("message"))
+                elif not res.get("ok"):
+                    logger.info("[astock] 盯盘计划不可自动维护：%s",
+                                res.get("message"))
+        except Exception:
+            logger.debug("[astock] 盯盘计划自愈失败（不影响插件加载）", exc_info=True)
         super().install(kernel)
 
     # -------------------------------------------------- 基础设施
@@ -2716,19 +2739,25 @@ class AstockPlugin(ToolPlugin):
     # -------------------------------------------------- 自选股
 
     async def _watch_control(self, action: str) -> str:
-        """盯盘状态查询 / 启动 / 暂停。
+        """盯盘状态查询 / 启动 / 暂停（v2.1.1：自动创建并维护盯梢计划）。
 
-        「开始盯盘」的两层含义，这里都覆盖到并如实说明：
-        ① **插件侧开关**（`watch_enabled`）：关掉时探针直接返回空快照，不产生信号；
-        ② **宿主调度计划**：真正让探针被周期性调用的是 lite-work 的「盯梢/定时」
-           计划（source=astock）。**插件无权创建它**（宿主没开放该 API 给插件），
-           所以启动时明确告诉你还需要在盯梢页建一次计划（只是建一次，长期有效）。
+        「开始盯盘」其实要两件事同时成立：
+        ① **插件侧开关**（`watch_enabled`）：关掉时探针直接返回空快照、不产生信号；
+        ② **宿主盯梢计划**：真正让探针被周期性调用的是 lite-work 的计划（source=astock）。
+
+        旧版本只做 ①，把 ② 推给用户手动建——结果是「点了启动盯盘，什么都没发生」
+        这个最典型的静默失败。现在 `astock_plan` 会在 install() 拿到的 app 上
+        自动建/修计划（与宿主路由层同一条 `schedule_store` 路径），所以 start
+        一次就把两件事都办完；拿不到 app 时才退回手动指引（并明确说明原因）。
         """
         st = mkt.trading_status()
         ok_now, why = mkt.should_watch_now()
         enabled = _as_bool(_cfg(self._app, "watch_enabled", True), True)
         only_hours = _as_bool(_cfg(self._app, "watch_only_trading_hours", True), True)
+        workspace = str(getattr(self._app, "workspace", "") or "")
+        interval = int(_num(self._app, "watch_interval_seconds", 300))
 
+        plan_note = ""
         if action in ("start", "stop"):
             want = action == "start"
             err = self._save_plugin_config({"watch_enabled": want})
@@ -2736,19 +2765,28 @@ class AstockPlugin(ToolPlugin):
                 return (f"[Error] 无法写入盯盘开关：{err}\n"
                         f"请手动在设置页把「启用盯盘」设为 {str(want).lower()}。")
             enabled = want
-            if not want:
-                return "⏸ 盯盘已暂停。探针将直接返回「无变化」，不会再唤醒你。\n" \
-                       "（用 `astock_watch action=start` 恢复）"
+            # 同步计划：启动=确保存在且启用；暂停=禁用（不删，保留指纹基线，
+            # 否则恢复时会把当前所有信号当"新变化"重报一遍）
+            if want:
+                res = plan_ctl.ensure_plan(self._app, workspace, interval=interval,
+                                           probe_cfg=self._probe_cfg())
+                plan_note = res.get("message") or ""
+                if not res.get("ok"):
+                    plan_note = ("⚠️ 自动创建盯梢计划失败：" + plan_note
+                                 + "　请按下面的步骤手动建一次。")
+            else:
+                res = plan_ctl.set_enabled(self._app, False)
+                plan_note = res.get("message") or ""
+                return ("⏸ 盯盘已暂停。探针将直接返回「无变化」，不会再唤醒你。\n"
+                        f"（{plan_note}；用 `astock_watch action=start` 恢复）")
 
-        lines = []
-        if action == "status":
-            lines.append("## 盯盘状态")
-            lines.append("")
-        else:
-            lines.append("## 已启动盯盘")
-            lines.append("")
+        diag = plan_ctl.diagnose(self._app, enabled and ok_now, only_hours)
+        lines = ["## 盯盘状态" if action == "status" else "## 已启动盯盘", ""]
         lines.append(_table(["项目", "状态"], [
             ["插件盯盘开关", "✅ 开启" if enabled else "⏸ 已暂停"],
+            ["盯梢计划", ("✅ 运行中（每 %d 秒）" % diag["plan_interval"]
+                          if diag["plan_ok"] else "❌ 未就绪或已禁用")],
+            ["最近一次探测", diag.get("last_run_text") or "还没探测过"],
             ["当前时刻", f"{st['now']}（{st['phase']}）"],
             ["现在是否在盯", ("✅ 是" if ok_now else f"❌ 否 —— {why}")],
             ["下次开始", mkt.next_watch_window()],
@@ -2756,36 +2794,49 @@ class AstockPlugin(ToolPlugin):
                           if only_hours else "⚠️ 已关闭（全天盯，会消耗 token）")],
         ]))
         lines.append("")
+        lines.append(f"**体检结论**：{diag['verdict']}")
+        if plan_note:
+            lines.append("")
+            lines.append(f"**计划**：{plan_note}")
+        for act in diag["actions"]:
+            lines.append(f"- {act}")
+
+        if not diag["plan_ok"]:
+            lines.append("")
+            lines.append("### 手动建计划（自动创建不可用时）")
+            lines.append("")
+            lines.append("到 **右栏「盯梢」页 → 新建计划**（图形界面，不用命令行）：")
+            lines.append("- 数据源选 **A股持仓/自选异动**（source_kind = `astock`）")
+            lines.append("- 调度模式选 **间隔**，填 **300 秒**（5 分钟）")
+            lines.append("- 权限档保持 **read**（无人值守，不需要写权限）")
+            lines.append("")
+            lines.append("> **关于 cron**：计划编辑器里的「cron」模式（`*/5 9-14 * * 1-5`）"
+                         "是**宿主内置的调度格式**，与系统 crontab **完全无关**——"
+                         "不需要 `crontab -e`。选「间隔 300 秒」即可。")
+
+        lines.append("")
         lines.append("**盯盘按 A 股交易时段自动作息**：开盘前 5 分钟开始，"
                      "午休自动跳过，15:00 收盘自动停。非交易时段探针直接返回"
                      "「无变化」，**不消耗 token**。")
         lines.append("")
-        lines.append("### 还需要你做一次（只需一次）")
+        lines.append("### 邮件通知依赖这条链路")
         lines.append("")
-        lines.append("**「启动盯盘」只打开了插件侧的开关**——它决定探针被调用时"
-                     "要不要干活。真正让探针被**周期性调用**的，是宿主的盯梢计划；"
-                     "插件无权创建它（宿主没开放该 API）。")
-        lines.append("")
-        lines.append("所以请到 **右栏「盯梢」页 → 新建计划**（图形界面，不用命令行）：")
-        lines.append("- 数据源选 **A股持仓/自选异动**（source_kind = `astock`）")
-        lines.append("- 调度模式选 **间隔**，填 **300 秒**（5 分钟）——推荐，够用且最直观")
-        lines.append("- 权限档保持 **read**（无人值守，不需要写权限）")
-        lines.append("")
-        lines.append("> **关于 cron**：计划编辑器里还有一个「cron」模式（填 `*/5 9-14 * * 1-5`"
-                     "这类 5 段表达式），那是**宿主内置的调度格式**，"
-                     "与系统 crontab **完全无关**——不需要你编辑 crontab 文件、"
-                     "也不需要 `crontab -e`。两者效果等价（都能每 5 分钟跑一次），"
-                     "**选「间隔 300 秒」即可**，不必碰 cron。")
-        lines.append("")
-        lines.append("### 这个计划是邮件通知的前提")
-        lines.append("")
-        lines.append("高风险邮件通知**不是独立进程**：它由探针在发现信号时直接调用 "
-                     "email-plugin 发信（探针跑不起来 = 永远不会有邮件）。"
-                     "所以「收不到邮件」时先看本页**是否在盯 = 是**，再查 email-plugin 凭据。")
-        lines.append("")
-        lines.append("建好后它会长期生效，你不需要每天启动——"
-                     "时段判断在插件侧做，收盘后自动静默。")
+        lines.append("高风险邮件**不是独立进程**：探针发现信号时顺带调 email-plugin 发信。"
+                     "所以「收不到邮件」的排查顺序是：① 看本页**盯梢计划是否运行中**；"
+                     "② 设置页点「发送测试邮件」验证通道；③ 看阈值与收件人。")
         return "\n".join(lines)
+
+    def _probe_cfg(self) -> Dict[str, Any]:
+        """把设置页里与探针相关的阈值带进计划（计划侧优先，设置页兜底）。"""
+        keys = ("stop_loss_pct", "take_profit_pct", "trailing_pct",
+                "drop_alert_pct", "rise_alert_pct", "volume_ratio_alert",
+                "min_level")
+        out: Dict[str, Any] = {}
+        for key in keys:
+            val = _cfg(self._app, key, None)
+            if val not in (None, ""):
+                out[key] = val
+        return out
 
     def settings_action(self, key: str, config: Dict[str, Any]) -> Dict[str, Any]:
         """设置页动作按钮：盯盘开关 + 发送测试邮件。
@@ -2824,14 +2875,23 @@ class AstockPlugin(ToolPlugin):
             return {"ok": False, "message": f"写入失败：{err}"}
         st = mkt.trading_status()
         ok_now, why = mkt.should_watch_now()
+        # 按钮与 `astock_watch action=start/stop` 走同一套计划逻辑：
+        # 启动＝自动建/修计划，暂停＝禁用计划（不删，保留指纹基线）
+        interval = int(float(own.get("watch_interval_seconds") or 300))
         if want:
+            res = plan_ctl.ensure_plan(self._app, self._workspace(),
+                                       interval=interval,
+                                       probe_cfg=self._probe_cfg())
             tail = (f"现在在盯着（{st['phase']}）" if ok_now
                     else f"现在不盯：{why}；下次 {mkt.next_watch_window()}")
-            msg = f"已启动盯盘。{tail}"
-            msg += ("。注意：还需在右栏「盯梢」页建一次 source=astock 的计划"
-                    "（间隔 300 秒），它才会被周期调用")
+            msg = f"已启动盯盘，{res.get('message')}。{tail}"
+            if not res.get("ok"):
+                msg += ("　⚠️ 自动建计划不可用，请到右栏「盯梢」页手动新建"
+                        "（数据源选 A股持仓/自选异动，间隔 300 秒）")
         else:
-            msg = "已暂停盯盘：探针将直接返回「无变化」，不会再唤醒你。"
+            res = plan_ctl.set_enabled(self._app, False)
+            msg = ("已暂停盯盘：探针将直接返回「无变化」，不会再唤醒你。"
+                   f"（{res.get('message')}）")
         return {"ok": True, "message": msg, "watch_enabled": want}
 
     def _action_archive_run(self) -> Dict[str, Any]:
@@ -3035,11 +3095,19 @@ class AstockPlugin(ToolPlugin):
         return text
 
     async def _tool_pick_compare(self, args: Dict[str, Any]) -> str:
-        """三策略对比（一次采集，成本≈单策略）。"""
+        """三策略对比：选股与回测**都只取一次数据**。
+
+        两条链路原本各有一份重复取数，这里一并收掉：
+          ① 选股：`scan_all` 一次采集跑三套（v2.1.0）；
+          ② 回测：`run_all` 一次取 25 只历史 K 线 + 基准跑三套（v2.1.1）。
+        否则「对比一下」会变成 30 只 K 线 ×1 + 25 只 K 线 ×3，等一分钟以上。
+        """
         try:
             results = await asyncio.to_thread(self._quant_scan_all, args)
         except data.DataError as exc:
             return f"[Error] 选股扫描失败：{exc}"
+
+        # 推荐率：只读缓存；缺的用 run_all 一次补齐（不在关键路径上阻塞过久）
         recs: Dict[str, Any] = {}
         for key in quant.STRATEGIES:
             try:
@@ -3048,18 +3116,38 @@ class AstockPlugin(ToolPlugin):
                     recs[key] = cached.get("recommendation")
             except Exception:
                 logger.debug("[astock] 读回测缓存失败: %s", key, exc_info=True)
-        head = quant_tool.render_compare(results, recs=recs, max_rows=5)
-        # 对话里空间足够，附上每套的推荐率摘要（面板为了窄栏只留数字）
+        missing = [k for k in quant.STRATEGIES if k not in recs]
+        if missing and not args.get("no_grade", False) \
+                and _bool(self._app, "backtest_auto_grade", True):
+            try:
+                got = await asyncio.to_thread(
+                    backtest_tool.run_all, strategies=missing,
+                    use_cache=True)
+                for key, val in got.items():
+                    rec = val.get("recommendation")
+                    if rec is not None:
+                        recs[key] = rec
+            except Exception as exc:
+                logger.info("[astock] 对比模式的推荐率回测失败（不影响选股）: %s", exc)
+
+        head = quant_tool.render_compare(results, recs=recs, max_rows=5,
+                                           with_advice=False)
+        # 「该用哪套」的完整版（含理由与风险提示）——这才是"哪个效果好"的答案，
+        # 面板里只放得下结论，这里把完整论证给出来。
+        advice = ""
+        try:
+            adv = advise.advise(recs)
+            advice = advise.render_advice(adv)
+        except Exception:
+            logger.debug("[astock] 策略建议生成失败", exc_info=True)
         grades: List[str] = []
         for key in quant.STRATEGIES:
-            if key not in results:
-                continue
-            grade = await self._attach_grade(key)
-            if grade:
-                grades.append(grade)
+            if key in recs:
+                grades.append(quant_tool.render_grade_line(recs[key]))
         tail = ("\n\n---\n\n### 各策略推荐率（历史表现，不是上涨概率）\n\n"
-                + "\n\n".join(grades)) if grades else ""
-        return head + tail
+                + "\n\n".join([g for g in grades if g])) if grades else ""
+        mid = (f"\n\n---\n\n### 该用哪套\n\n{advice}") if advice else ""
+        return head + mid + tail
 
     async def _attach_grade(self, strategy: str,
                             fresh: bool = False) -> str:

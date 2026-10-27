@@ -232,10 +232,16 @@ def fetch_benchmark() -> List[Dict[str, Any]]:
 def run(strategy_key: str, *, pool_size: int = DEFAULT_POOL,
         candidates: Optional[Sequence[Dict[str, Any]]] = None,
         cfg: Optional[bt.BacktestConfig] = None,
-        use_cache: bool = True) -> Dict[str, Any]:
+        use_cache: bool = True,
+        pool: Optional[Sequence[Dict[str, Any]]] = None,
+        bench: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """跑一轮回测（同步，调用方包 to_thread）。
 
     `candidates` 不传时自己拉一次全市场快照（按成交额降序）来决定回测池。
+
+    `pool` / `bench` 用于**跳过取数**：多套策略回测同一批标的时，历史 K 线
+    与基准完全相同，重复拉一遍纯属浪费（默认池 25 只 = 26 次请求）。
+    `run_all()` 就是先取一次再分别喂给各策略。
     """
     key = f"{strategy_key}|{pool_size}|{hash(str((cfg or bt.BacktestConfig()).as_dict()))}"
     if use_cache:
@@ -246,24 +252,80 @@ def run(strategy_key: str, *, pool_size: int = DEFAULT_POOL,
                     "fetch_failed": failed, "cached": True,
                     "cache_age_sec": round(time.time() - hit[0], 1)}
 
-    if candidates is None:
-        candidates = _default_candidates(pool_size)
-    if not candidates:
-        raise data.DataError(
-            "无法构建回测池：全市场快照接口被限流，且台账里也没有持仓/自选股。"
-            "请等 30 秒后重试，或先用 astock_record / astock_watch 录入标的")
-
-    pool, failed = fetch_universe(candidates, pool_size=pool_size)
+    failed = 0
+    if pool is None:
+        if candidates is None:
+            candidates = _default_candidates(pool_size)
+        if not candidates:
+            raise data.DataError(
+                "无法构建回测池：全市场快照接口被限流，且台账里也没有持仓/自选股。"
+                "请等 30 秒后重试，或先用 astock_record / astock_watch 录入标的")
+        pool, failed = fetch_universe(candidates, pool_size=pool_size)
     if len(pool) < 4:
         raise ValueError(f"仅取到 {len(pool)} 只标的历史数据，不足以回测")
 
-    bench = fetch_benchmark()
-    result = bt.run_backtest(strategy_key, pool, bench, cfg=cfg)
+    if bench is None:
+        bench = fetch_benchmark()
+    result = bt.run_backtest(strategy_key, list(pool), list(bench), cfg=cfg)
     rec = bt.grade_recommendation(result)
 
     _CACHE[key] = (time.time(), (result, rec, failed))
     return {"result": result, "recommendation": rec, "fetch_failed": failed,
-            "cached": False, "cache_age_sec": 0.0}
+            "cached": False, "cache_age_sec": 0.0, "pool_size": pool_size}
+
+
+def run_all(*, pool_size: int = DEFAULT_POOL,
+            candidates: Optional[Sequence[Dict[str, Any]]] = None,
+            cfg: Optional[bt.BacktestConfig] = None,
+            strategies: Optional[Sequence[str]] = None,
+            use_cache: bool = True) -> Dict[str, Dict[str, Any]]:
+    """**一次取数、多套策略**回测：返回 {strategy_key: run(...) 同结构}。
+
+    **为什么需要**：回测里最贵的是历史 K 线（每股一次请求，默认 25 只），
+    而它**与策略无关**——三套策略用的是同一批标的的同一段历史。原先
+    `compare` 面板分别调 `run()` 三次，等于把 25 只 K 线拉三遍。
+
+    实现上复用了 `run(candidates=...)`：第一次把历史数据取出来交给后续策略，
+    池子固定后各策略只做打分与统计（纯 CPU）。
+
+    缓存逐个策略独立判定：全命中时零网络请求。
+    """
+    keys = [k for k in (strategies or list(bt.STRATEGIES)) if k in bt.STRATEGIES]
+    if not keys:
+        raise ValueError("没有可用的策略")
+    out: Dict[str, Dict[str, Any]] = {}
+    pending: List[str] = []
+    if use_cache:
+        for key in keys:
+            hit = get_cached(key)
+            # 池大小/配置不同则不复用（那会得出不可比的结论）
+            if hit and hit.get("pool_size") in (None, pool_size):
+                out[key] = hit
+            else:
+                pending.append(key)
+    else:
+        pending = list(keys)
+    if not pending:
+        return out
+
+    # 取一次池子的历史数据 + 基准，各策略共用（这是本函数存在的唯一理由）
+    cands = (list(candidates) if candidates is not None
+             else _default_candidates(pool_size))
+    if not cands:
+        raise data.DataError(
+            "无法构建回测池：全市场快照接口被限流，且台账里也没有持仓/自选股。"
+            "请等 30 秒后重试，或先用 astock_record / astock_watch 录入标的")
+    pool, failed = fetch_universe(cands, pool_size=pool_size)
+    if len(pool) < 4:
+        raise ValueError(f"仅取到 {len(pool)} 只标的历史数据，不足以回测")
+    bench = fetch_benchmark()
+    for key in pending:
+        res = run(key, pool_size=pool_size, cfg=cfg, use_cache=False,
+                  pool=pool, bench=bench)
+        res["fetch_failed"] = failed
+        res["pool_size"] = pool_size
+        out[key] = res
+    return out
 
 
 def get_cached(strategy_key: str) -> Optional[Dict[str, Any]]:
@@ -277,8 +339,15 @@ def get_cached(strategy_key: str) -> Optional[Dict[str, Any]]:
     if best is None:
         return None
     result, rec, failed = best[1]
+    # key 形如 "<strategy>|<pool_size>|<cfg-hash>"：把池大小带回去，让 run_all
+    # 能判断"这份缓存是不是同一口径"（池子不同则两套策略不可比）
+    try:
+        pool_size = int(key.split("|")[1])
+    except (IndexError, ValueError):
+        pool_size = None
     return {"result": result, "recommendation": rec, "fetch_failed": failed,
-            "cached": True, "cache_age_sec": round(time.time() - best[0], 1)}
+            "cached": True, "cache_age_sec": round(time.time() - best[0], 1),
+            "pool_size": pool_size}
 
 
 # ====================================================================== 渲染

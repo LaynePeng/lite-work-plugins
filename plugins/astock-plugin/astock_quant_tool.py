@@ -331,7 +331,8 @@ def render_ranking(result: Dict[str, Any], n: int = 10) -> str:
 
 def render_compare(results: Dict[str, Dict[str, Any]],
                    recs: Optional[Dict[str, Any]] = None,
-                   max_rows: int = 3) -> str:
+                   max_rows: int = 3,
+                   with_advice: bool = True) -> str:
     """**三策略横向对比**（右栏选股 tab 的主视图）。
 
     设计取舍（为什么不是三个 tab 各看各的）：
@@ -359,6 +360,19 @@ def render_compare(results: Dict[str, Dict[str, Any]],
     age = max(float(results[k].get("cache_age_sec") or 0) for k in keys)
     out.append(f"{first.get('generated_at', '')[-8:] or '-'} 生成｜"
                f"{age:.0f}s 前｜扫描 {first.get('scanned', 0)} 只")
+    # 「该用哪套」放在最顶端：用户看到三个百分比后的第一反应就是这个。
+    # 面板是窄栏，所以只出结论 + 最多一条警告。
+    # `with_advice=False` 由对话侧使用——那里会单独输出**完整版**建议
+    # （含理由、风险与用法），内嵌一份会造成同一段话出现两次。
+    if with_advice:
+        try:
+            import astock_advise as advise_mod
+            adv = advise_mod.advise(recs)
+            if adv.get("headline"):
+                out.append("")
+                out.append(advise_mod.render_advice(adv, compact=True))
+        except Exception:
+            logger.debug("[astock] 策略建议渲染失败", exc_info=True)
     if age > CACHE_TTL:
         out.append("")
         out.append(f"> 数据已过期（>{CACHE_TTL:.0f}s），点「立即跑一轮选股」刷新。")
@@ -369,7 +383,7 @@ def render_compare(results: Dict[str, Dict[str, Any]],
         res = results[key]
         strat = quant.STRATEGIES[key]
         allocs = list(res.get("allocations") or [])[:max_rows]
-        grade = _grade_line(recs.get(key))
+        grade = render_grade_line(recs.get(key))
         head = f"**{strat.label}**"
         if grade:
             import re as _re
@@ -424,7 +438,7 @@ def render_panel(result: Optional[Dict[str, Any]], strategy_key: str,
     strat = quant.STRATEGIES.get(strategy_key) or quant.STRATEGIES[
         quant.DEFAULT_STRATEGY]
     out: List[str] = []
-    grade_line = _grade_line(rec)
+    grade_line = render_grade_line(rec)
     if result is None:
         out.append(f"**量化选股 · {strat.label}**")
         out.append("")
@@ -497,7 +511,7 @@ def render_panel(result: Optional[Dict[str, Any]], strategy_key: str,
     return "\n".join(out)
 
 
-def _grade_line(rec: Any) -> str:
+def render_grade_line(rec: Any) -> str:
     """推荐率一行文案（无回测数据时返回空串）。
 
     措辞刻意写全"策略"二字：推荐率衡量的是**这套选股规则**的历史表现，
