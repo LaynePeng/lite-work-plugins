@@ -125,7 +125,7 @@ def render_pick_panel(app: Any, panel_id: str) -> str:
             cached = None
         return render_pick_detail(app, strategy, cached, recs.get(strategy))
 
-    # 新「选股」tab → 三策略对比
+    # 新「选股」tab → 三策略对比（v2.2.0：卡片看板，不再是缩进纯文本）
     results: Dict[str, Any] = {}
     try:
         for key in quant.STRATEGIES:
@@ -134,6 +134,14 @@ def render_pick_panel(app: Any, panel_id: str) -> str:
                 results[key] = cached
     except Exception:
         logger.warning("[astock] 选股面板缓存读取失败", exc_info=True)
+    style = str(_cfg(app, "pick_panel_style", "card") or "card").lower()
+    if results and style != "markdown":
+        try:
+            payload = quant_tool.build_compare_tree(results, recs=recs)
+            if payload:
+                return payload
+        except Exception as exc:
+            logger.warning("[astock] 对比卡片渲染失败，退回 markdown: %s", exc)
     return quant_tool.render_compare(results, recs=recs)
 
 

@@ -22,6 +22,12 @@ import astock_market as mkt
 #: 本插件在 app.config 里的命名空间（设置页经通用插件 UI 协议写入）
 PLUGIN_NAME = "astock-plugin"
 
+#: 一次行情请求最多带多少个标的（腾讯接口实测 60+ 仍正常，留余量）。
+#: v2.2.0 起在这里定义：此前只写在 `plugin.py`，而 `astock_mixin_market`
+#: 直接引用该名字却没 import（模块级 NameError），导致 `astock_quote` /
+#: `astock_hint` 传了多个代码时整条链路报错。
+MAX_QUOTE_BATCH = 50
+
 
 def _cfg(app: Any, key: str, default: Any = None) -> Any:
     """读 `app.config["astock-plugin"][key]`。

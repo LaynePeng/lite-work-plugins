@@ -294,14 +294,23 @@ def _last_run(sched: Any) -> Dict[str, Any]:
     return out
 
 
-def diagnose(app: Any, now_watching: bool, only_hours: bool) -> Dict[str, Any]:
+def diagnose(app: Any, now_watching: bool, only_hours: bool,
+             in_window: bool = True, window_note: str = "") -> Dict[str, Any]:
     """盯盘体检：把「插件开关 / 计划 / 邮件」三处状态合成一句话结论。
 
     这三处任何一处没配好，用户看到的都是同一个症状——"说了要盯着，结果
     什么都没发生"。所以必须有一处集中告诉他**到底卡在哪一环**。
+
+    `now_watching` 的语义是**插件开关是否打开**（`watch_enabled`），
+    `in_window` / `window_note` 才是"此刻是否在交易时段"。
+
+    **这两个必须分开**（v2.2.0 修的真实误报）：调用方此前传的是
+    `enabled and ok_now`，于是**收盘后体检必然报"插件盯盘开关是关闭的"**——
+    可用户明明开着。更糟的是它给出一条错误动作（"点按钮打开开关"），
+    而开关本来就没关，用户会以为插件坏了。收盘不是故障，是正常作息。
     """
     out: Dict[str, Any] = {
-        "plugin_on": bool(now_watching),
+        "plugin_on": bool(now_watching), "in_window": bool(in_window),
         "plan_ok": False, "plan_id": "", "plan_interval": 0,
         "plan_enabled": False, "plan_count": 0,
         "verdict": "", "actions": [],
@@ -328,6 +337,12 @@ def diagnose(app: Any, now_watching: bool, only_hours: bool) -> Dict[str, Any]:
     elif not only_hours:
         out["verdict"] = "盯盘中；但「仅交易时段」已关闭，非交易时段也会跑并消耗 token"
         out["actions"].append("建议在设置页打开「仅交易时段盯盘」")
+    elif not in_window:
+        # 收盘/午休/周末：链路是好的，只是按自律本来就不该跑。
+        # 这里必须说"就绪"，否则用户会去修一个没坏的东西。
+        out["verdict"] = ("全链路就绪，当前不在盯盘时段"
+                          + (f"（{window_note}）" if window_note else "")
+                          + f" —— 到点自动开始，非交易时段不消耗 token")
     else:
         out["verdict"] = (f"全链路就绪 —— 每 {out['plan_interval']} 秒探测一次，"
                           f"仅工作日 9:10–15:00 生效")

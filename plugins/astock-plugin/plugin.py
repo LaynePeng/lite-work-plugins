@@ -39,6 +39,7 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_common                       配置读取 / 格式化 / 表格（最底层）
     astock_tools                        16 个工具的 schema 声明（纯静态，450 行）
     astock_panel                        右栏面板渲染（持仓两形态 + 选股对比）
+    astock_rich                         聊天侧富围栏渲染（kpi + board + table，v2.2.0）
     astock_report                       组合舆情报告 + 事件推荐 + 自选体检
     astock_plan                         宿主盯梢计划的自动创建/维护/体检
     ── 工具方法层（v2.1.3：mixin，本文件只留装配）
@@ -170,8 +171,10 @@ logger = logging.getLogger("litework.plugins.astock")
 
 PLUGIN_NAME = "astock-plugin"
 
-#: 一次行情请求最多带多少个标的（腾讯接口实测 60+ 仍正常，留余量）
-MAX_QUOTE_BATCH = 50
+#: 一次行情请求最多带多少个标的。
+#: v2.2.0 起权威定义在 `astock_common`（mixin 也要用，见那边的注释），
+#: 这里 re-export 保持旧引用与测试不变。
+from astock_common import MAX_QUOTE_BATCH  # noqa: E402,F401
 # 面板展示条数上限已随渲染逻辑移到 astock_panel.MAX_ROWS（v2.1.2）：
 # 那里是窄栏可读性上限（12），与"提示最多扫多少只"不是同一件事。
 
@@ -815,7 +818,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.1.4"
+    version = "2.2.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"

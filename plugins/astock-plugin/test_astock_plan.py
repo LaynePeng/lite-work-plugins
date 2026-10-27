@@ -275,6 +275,31 @@ class TestDiagnose(unittest.TestCase):
         self.assertTrue(d["plan_ok"])
         self.assertIn("token", d["verdict"])
 
+    def test_after_close_is_not_a_fault(self):
+        """收盘后体检不能说"开关是关闭的"——那是把正常作息当成故障。
+
+        真实误报（v2.1.4）：调用方传 `enabled and ok_now`，于是 15:00 之后
+        必然报"插件盯盘开关是关闭的"并给出"点按钮打开开关"的错误动作，
+        而用户明明开着；用户会以为插件坏了。
+        """
+        app = FakeApp()
+        plan.ensure_plan(app, "/ws", interval=300)
+        d = plan.diagnose(app, now_watching=True, only_hours=True,
+                          in_window=False, window_note="已收盘（15:00 后价格不再变动）")
+        self.assertTrue(d["plugin_on"], "开关是开着的")
+        self.assertTrue(d["plan_ok"])
+        self.assertNotIn("开关是关闭", d["verdict"])
+        self.assertIn("就绪", d["verdict"])
+        self.assertIn("已收盘", d["verdict"])
+        self.assertEqual(d["actions"], [], "链路没坏就不该给修复动作")
+
+    def test_in_window_verdict_still_says_ready(self):
+        app = FakeApp()
+        plan.ensure_plan(app, "/ws", interval=300)
+        d = plan.diagnose(app, now_watching=True, only_hours=True, in_window=True)
+        self.assertIn("全链路就绪", d["verdict"])
+        self.assertNotIn("不在盯盘时段", d["verdict"])
+
 
 class TestLastRun(unittest.TestCase):
     """「它真的在跑」比「计划存在」更让用户安心——所以要把最近一次探测显示出来。"""

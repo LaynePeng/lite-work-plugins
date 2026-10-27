@@ -289,7 +289,12 @@ def pick_cached(strategy_key: str) -> Optional[Dict[str, Any]]:
 
 
 def render_scan(result: Dict[str, Any], max_rows: int = 10) -> str:
-    """把一次扫描结果渲染成聊天里的报告（含股数与止损止盈）。"""
+    """单策略选股的文字版报告（含股数与止损止盈）。
+
+    **v2.2.0 起聊天侧改走 `astock_rich.render_pick`**（kpi + board + table
+    富围栏）。本函数保留为纯文字兜底：宿主不渲染富围栏、或需要把结果
+    粘到邮件/文档里时用它更稳妥。
+    """
     strat = quant.STRATEGIES.get(result["strategy"]) or quant.STRATEGIES[
         quant.DEFAULT_STRATEGY]
     text = quant.format_pick_report(
@@ -309,7 +314,11 @@ def render_scan(result: Dict[str, Any], max_rows: int = 10) -> str:
 
 
 def render_ranking(result: Dict[str, Any], n: int = 10) -> str:
-    """只出得分排行（不给股数）——用于"我想自己决定买哪只"。"""
+    """只出得分排行（不给股数）——用于"我想自己决定买哪只"。
+
+    **v2.2.0 起聊天侧改走 `astock_rich.render_ranking`**（```table 富围栏，
+    8 列数值在窄屏也能对齐）。本函数保留为纯文字兜底。
+    """
     ranked: Sequence[quant.Scored] = result.get("top") or []
     if not ranked:
         return "本轮没有候选通过策略筛选。"
@@ -540,3 +549,131 @@ def _money(value: Any) -> str:
     if abs(v) >= 1e4:
         return f"{v / 1e4:.1f}万"
     return f"{v:,.0f}"
+
+
+# ====================================================================== 面板卡片
+
+
+def build_compare_tree(results: Dict[str, Dict[str, Any]],
+                       recs: Optional[Dict[str, Any]] = None,
+                       max_rows: int = 4) -> str:
+    """三策略对比 → 右栏 `lite-tree` 卡片看板（v2.2.0）。
+
+    **为什么从 markdown 换成 lite-tree**：面板只有约 331px，markdown 版是
+    一串 `　名称 400股 @8.24（得分 88）` 的全角缩进行——三套策略的六行字
+    长得一模一样，扫不出「这只被两套同时选中」这个**唯一有价值的信号**。
+    lite-tree 卡片的 `options[].prob` 是宿主面板里唯一会被画成图形的字段，
+    于是用它承载「得分」与「仓位空间」两根进度条：条越长越靠前/越安全，
+    不用读数字。
+
+    **卡片分组＝策略**：`trees` 是一条瀑布流，所以每张卡的 `kind` 写策略 key、
+    `question` 写「为什么是它」（得分来源），并在**多套共识**的卡上加 `chips`
+    同款标注（`accepted=false` 表示"非共识"，视觉上弱化）。
+
+    刻意不给"该选哪个策略"的结论——见 `render_compare` 的说明。
+    """
+    import json as _json
+
+    recs = recs or {}
+    keys = [k for k in quant.STRATEGIES if k in results]
+    if not keys:
+        return ""
+
+    picked_by: Dict[str, List[str]] = {}
+    for key in keys:
+        for a in (results[key].get("allocations") or []):
+            picked_by.setdefault(a.code, []).append(key)
+    multi = {c: ks for c, ks in picked_by.items() if len(ks) > 1}
+
+    trees: List[Dict[str, Any]] = []
+    for key in keys:
+        strat = quant.STRATEGIES[key]
+        rec = recs.get(key)
+        win = getattr(rec, "win_rate", None) if rec is not None else None
+        # 推荐率放进卡片的 question：卡片里唯一能写"这套策略靠不靠谱"的位置。
+        # 措辞强调「策略」——推荐率衡量的是选股规则的历史表现，不是这只票。
+        rate = (f"策略推荐率 {win:.0f}%" if win is not None else "推荐率待回测")
+        allocs = list(results[key].get("allocations") or [])[:max_rows]
+        if not allocs:
+            skipped = results[key].get("skipped") or []
+            trees.append({
+                "title": f"{strat.label}：无入选",
+                "context": (f"{len(skipped)} 只过筛但资金不足一手" if skipped
+                            else f"候选 {results[key].get('candidates', 0)} 只均未过门槛"),
+                "kind": key,
+                "question": strat.description[:60],
+                "options": [{"label": "本轮无买入建议", "prob": 0.0,
+                             "tone": "neutral", "chosen": True}],
+                "confidence": 0.5,
+                "accepted": False,
+            })
+            continue
+        for a in allocs:
+            labels = [quant.STRATEGIES[k].label for k in picked_by.get(a.code, [])]
+            # 用 getattr 兜底：`allocations` 里放的是少量字段的哑对象时
+            # （单测桩、旧缓存）不该整块渲染炸掉，缺字段就按缺省值画。
+            shares = int(getattr(a, "shares", 0) or 0)
+            price = float(getattr(a, "price", 0) or 0)
+            score = float(getattr(a, "score", 0) or 0)
+            amount = float(getattr(a, "amount", 0) or 0)
+            weight = float(getattr(a, "weight_pct", 0) or 0)
+            opts: List[Dict[str, Any]] = [
+                {"label": f"买入 {shares} 股 @ {price:.2f}",
+                 "prob": 1.0, "tone": "good", "chosen": True}]
+            # 刻度①：得分（池内相对排名 → 条越长越靠前）
+            opts.append({"label": f"得分 {score:.0f}（池内排名）",
+                         "prob": round(max(0.0, min(1.0, score / 100.0)), 4),
+                         "tone": ("good" if score >= 70
+                                  else "alt" if score >= 50 else "danger"),
+                         "chosen": False})
+            # 刻度②：仓位空间（与持仓面板同一「安全余量」语义）
+            cap = float((results[key].get("summary") or {})
+                        .get("position_cap_pct") or 25.0)
+            room = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
+            opts.append({"label": f"仓位空间（占 {weight:.1f}%）",
+                         "prob": round(max(0.0, min(1.0, room / 100.0)), 4),
+                         "tone": "danger" if weight > cap else "alt",
+                         "chosen": False})
+            context = f"{shares} 股 ≈ {_money(amount)} 元"
+            sl = getattr(a, "stop_loss", None)
+            tp = getattr(a, "take_profit", None)
+            if sl:
+                context += f" · 止损 {sl:.2f}"
+            if tp:
+                context += f" / 止盈 {tp:.2f}"
+            trees.append({
+                "title": f"{a.name}  {price:.2f}",
+                "context": context,
+                "kind": key,
+                "question": (f"另被 {'/'.join(l for l in labels if l != strat.label)}"
+                             f" 选中 · {rate}" if len(labels) > 1
+                             else f"仅 {strat.label} 选中 · {rate}"),
+                "options": opts[:3],
+                "confidence": max(0.0, min(1.0, score / 100.0)),
+                "accepted": len(labels) > 1,
+            })
+
+    first = results[keys[0]]
+    total_picks = sum(len(results[k].get("allocations") or []) for k in keys)
+    # 共识标的的**名字**直接进 chips：这是对比视图里唯一"一看就知道"的结论，
+    # 藏在卡片 desc 的「另被 X 选中」里要逐卡去读，等于没给。
+    names_by_code: Dict[str, str] = {}
+    for key in keys:
+        for a in (results[key].get("allocations") or []):
+            names_by_code.setdefault(a.code, getattr(a, "name", a.code))
+    consensus = [names_by_code[c] for c in multi]
+    payload = {
+        "type": "lite-tree",
+        "status": {
+            "text": "三策略对比",
+            "tone": "ok" if multi else "warn" if picked_by else "neutral",
+            "meta": [f"{len(keys)} 套策略",
+                     f"共 {total_picks} 只次",
+                     f"扫描 {int(first.get('scanned') or 0):,} 只"],
+            "chips": ([f"多套同时选中：{'/'.join(consensus[:3])}"]
+                      if consensus else ["暂无共识标的"]),
+        },
+        "trees": trees,
+        "total": len(trees),
+    }
+    return _json.dumps(payload, ensure_ascii=False)

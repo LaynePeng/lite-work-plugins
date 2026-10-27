@@ -22,6 +22,7 @@ import astock_backtest_tool as backtest_tool
 import astock_data as data
 import astock_quant as quant
 import astock_quant_tool as quant_tool
+import astock_rich as rich
 from astock_common import _bool, _span_years
 
 logger = logging.getLogger("litework.astock.mixin")
@@ -46,8 +47,12 @@ class QuantToolsMixin:
             return f"[Error] 选股扫描失败：{exc}"
         if args.get("rank_only"):
             n = int(args.get("top_n") or 10)
-            return quant_tool.render_ranking(result, max(1, min(n, 20)))
-        text = quant_tool.render_scan(result)
+            # 排行是纯数值对比（8 列），表格富围栏才对齐得起来
+            return rich.render_ranking(result, max(1, min(n, 20)))
+        # v2.2.0：聊天侧改富围栏（kpi + board + table）。
+        # 为什么不沿用 format_pick_report 的文字表：全角缩进列表在中文标点下
+        # 根本不对齐，"400股"与"100股"错位，且三策略混在一块灰字里扫不出层级。
+        text = rich.render_pick(result)
         # 推荐率：默认附上该策略的回测结论（只读缓存，不额外拉网络）。
         # 为什么默认附：用户要的是"该不该买"的判断，只给得分仍要他自己解读。
         if not args.get("no_grade", False) \
@@ -93,8 +98,7 @@ class QuantToolsMixin:
             except Exception as exc:
                 logger.info("[astock] 对比模式的推荐率回测失败（不影响选股）: %s", exc)
 
-        head = quant_tool.render_compare(results, recs=recs, max_rows=5,
-                                           with_advice=False)
+        head = rich.render_compare(results, recs=recs, max_rows=5)
         # 「该用哪套」的完整版（含理由与风险提示）——这才是"哪个效果好"的答案，
         # 面板里只放得下结论，这里把完整论证给出来。
         advice = ""

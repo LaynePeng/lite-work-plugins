@@ -725,6 +725,51 @@ class TestWatchControl(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_status_after_close_does_not_report_switch_off(self):
+        """收盘后 `astock_watch status` 不得说"开关是关闭的"（v2.2.0 修）。
+
+        真实误报：`diagnose` 收到的是 `enabled and ok_now`，收盘后
+        `ok_now=False` → 体检报"插件盯盘开关是关闭的"并让你去点按钮，
+        而开关明明开着。用户会以为插件坏了。
+        """
+        import asyncio
+        from unittest.mock import patch
+        pl = astock.AstockPlugin()
+        app = self._app(watch=True)          # 开关是开的
+        pl._app = app
+        with patch("astock_market.should_watch_now",
+                   return_value=(False, "已收盘（15:00 后价格不再变动）")), \
+                patch("astock_market.next_watch_window", return_value="2026-10-28 09:15"):
+            loop = asyncio.new_event_loop()
+            try:
+                out = loop.run_until_complete(
+                    pl.execute("astock_watch", {"action": "status"}))
+            finally:
+                loop.close()
+        self.assertIn("✅ 开启", out, "开关开着就要显示开启")
+        self.assertNotIn("插件盯盘开关是关闭的", out)
+        self.assertIn("就绪", out)
+        self.assertIn("已收盘", out)
+
+    def test_status_after_close_marks_plan_idle(self):
+        """计划那行要区分「运行中」与「已就绪但当前非交易时段」。"""
+        import asyncio
+        from unittest.mock import patch
+        pl = astock.AstockPlugin()
+        app = self._app(watch=True)
+        pl._app = app
+        app.schedule_store = None            # 无计划 → 计划行显示未就绪
+        with patch("astock_market.should_watch_now",
+                   return_value=(False, "已收盘")), \
+                patch("astock_market.next_watch_window", return_value="2026-10-28 09:15"):
+            loop = asyncio.new_event_loop()
+            try:
+                out = loop.run_until_complete(
+                    pl.execute("astock_watch", {"action": "status"}))
+            finally:
+                loop.close()
+        self.assertNotIn("运行中（每", out)
+
     def test_probe_respects_disabled_switch(self):
         """暂停后探针直接返回空快照（不唤醒 Agent）。"""
         import asyncio
@@ -2943,6 +2988,174 @@ class TestQuantRendering(unittest.TestCase):
         text = ranked[0].explain(5)
         self.assertNotIn("e-", text)
         self.assertIn("贡献", text)
+
+
+class TestRichFences(unittest.TestCase):
+    """聊天侧富围栏（v2.2.0）：选股结果必须是 ```kpi + ```board + ```table。
+
+    历史：此前是**全角空格缩进的纯文本列表**（`　天娱数科 400股 @8.24`），
+    窄屏/中文标点下完全不对齐，三策略六只票是同一块灰字，扫不出「哪只是
+    共识」。改成富围栏后按职责分工：kpi 答规模与钱、board 答买什么、
+    table 答逐项核对。
+    """
+
+    def _alloc(self, code="600001", name="甲", price=10.0, score=80.0,
+               shares=1000, sl=9.2, tp=11.5, weight=10.0):
+        return quant.Allocation(code=code, name=name, price=price, score=score,
+                                shares=shares, amount=price * shares, fee=5.0,
+                                stop_loss=sl, take_profit=tp,
+                                weight_pct=weight)
+
+    def _result(self, strategy="momentum", allocs=None):
+        return {"strategy": strategy,
+                "strategy_label": quant.STRATEGIES[strategy].label,
+                "scanned": 5576, "candidates": 12,
+                "generated_at": "2026-10-27 17:19:05", "cache_age_sec": 3.0,
+                "allocations": allocs if allocs is not None else [self._alloc()],
+                "skipped": [],
+                "summary": {"cash": 11400.0, "equity": 15060.0, "budget": 9120.0,
+                            "budget_source": "现金使用比例",
+                            "allocated_amount": 10000.0, "allocated_fee": 5.0,
+                            "remaining_cash": 1395.0,
+                            "position_cap_amount": 3765.0,
+                            "position_cap_pct": 25.0, "position_count": 1,
+                            "skipped_count": 0, "stop_loss_pct": 8.0,
+                            "take_profit_pct": 15.0}}
+
+    def _fence(self, text, name):
+        import json as _json
+        self.assertIn(f"```{name}", text, f"缺少 {name} 围栏")
+        body = text.split(f"```{name}\n", 1)[1].split("\n```", 1)[0]
+        return _json.loads(body)             # 必须合法 JSON，否则前端降级成代码块
+
+    def test_pick_has_kpi_board_table(self):
+        import astock_rich as rich
+        out = rich.render_pick(self._result())
+        kpi = self._fence(out, "kpi")
+        self.assertEqual(len(kpi["items"]), 4)
+        labels = [it["label"] for it in kpi["items"]]
+        self.assertIn("本轮可买", labels)
+        self.assertIn("计划投入", labels)
+
+        board = self._fence(out, "board")
+        cards = board["columns"][0]["cards"]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("甲", cards[0]["title"])
+        # 卡片必须能读出"买多少股"和"挂什么价"——这是用户真正要照抄的
+        self.assertIn("1000 股", cards[0]["desc"])
+        self.assertIn("止损 9.20", cards[0]["desc"])
+
+        table = self._fence(out, "table")
+        self.assertIn("股数", table["columns"])
+        self.assertEqual(table["rows"][0][2], "1000")
+
+    def test_pick_keeps_disclaimer_and_budget(self):
+        """富围栏不能把免责口径与预算说明挤掉——那是可信度的一部分。"""
+        import astock_rich as rich
+        out = rich.render_pick(self._result())
+        self.assertIn("不构成投资建议", out)
+        self.assertIn("本轮预算", out)
+        self.assertIn("单票上限", out)
+
+    def test_pick_empty_explains_why(self):
+        import astock_rich as rich
+        skipped = [self._alloc(code="600009", name="贵票", price=500.0,
+                               shares=0, weight=0.0)]
+        skipped[0].skip_reason = "一手需 50000 元，超过本轮预算"
+        res = self._result(allocs=[])
+        res["skipped"] = skipped
+        out = rich.render_pick(res)
+        self.assertIn("没有产生可执行的买入计划", out)
+        self.assertIn("贵票", out)
+        self.assertIn("不构成投资建议", out)
+        self.assertNotIn("```board", out, "没有可买标的时不该画空看板")
+
+    def test_compare_board_one_column_per_strategy(self):
+        """三套策略 = board 的三列（横向比较才有意义）。"""
+        import astock_rich as rich
+        results = {k: self._result(k, [self._alloc(f"60000{i}", f"股{i}")])
+                   for i, k in enumerate(quant.STRATEGIES)}
+        out = rich.render_compare(results)
+        board = self._fence(out, "board")
+        self.assertEqual(len(board["columns"]), 3)
+        for col in board["columns"]:
+            self.assertTrue(col["name"])
+            self.assertTrue(col["cards"])
+
+    def test_compare_flags_consensus(self):
+        """共识标的要显式标出来——这是对比视图唯一的价值。"""
+        import astock_rich as rich
+        shared = self._alloc("600000", "共识股")
+        results = {k: self._result(k, [shared]) for k in quant.STRATEGIES}
+        out = rich.render_compare(results)
+        self.assertIn("多套同时选中", out)
+        self.assertIn("共识股", out)
+        board = self._fence(out, "board")
+        tones = [c["tone"] for col in board["columns"] for c in col["cards"]]
+        self.assertTrue(all(t == "good" for t in tones),
+                        f"共识标的应全部标绿，实际 {tones}")
+
+    def test_compare_without_cache_prompts(self):
+        import astock_rich as rich
+        out = rich.render_compare({})
+        self.assertIn("尚未生成", out)
+
+    def test_ranking_is_table(self):
+        import astock_rich as rich
+        res = self._result()
+        res["top"] = [quant.rank_candidates(
+            [_mk_scored("600001", "甲", _mk_bars(10.0, 1.004))],
+            quant.STRATEGIES["momentum"])[0]]
+        out = rich.render_ranking(res, 5)
+        table = self._fence(out, "table")
+        self.assertIn("得分", table["columns"])
+        self.assertIn("相对排名不是上涨概率", out)
+
+    def test_compare_tree_panel_payload(self):
+        """右栏面板：lite-tree 卡片，得分/仓位走 prob 通道画进度条。"""
+        import astock_quant_tool as qt
+        import json as _json
+        results = {k: self._result(k, [self._alloc()]) for k in quant.STRATEGIES}
+        payload = _json.loads(qt.build_compare_tree(results))
+        self.assertEqual(payload["type"], "lite-tree")
+        self.assertEqual(payload["total"], 3)
+        card = payload["trees"][0]
+        self.assertTrue(card["options"][0]["chosen"])
+        self.assertEqual(card["options"][0]["prob"], 1.0)
+        # 得分条 / 仓位条都是 0-1 的刻度，且只有第一条 chosen
+        for opt in card["options"][1:]:
+            self.assertFalse(opt["chosen"])
+            self.assertGreaterEqual(opt["prob"], 0.0)
+            self.assertLessEqual(opt["prob"], 1.0)
+        self.assertLessEqual(len(card["options"]), 3)
+
+    def test_compare_tree_empty_returns_blank(self):
+        """没有缓存时返回空串——由调用方回退 markdown 提示，不是画空看板。"""
+        import astock_quant_tool as qt
+        self.assertEqual(qt.build_compare_tree({}), "")
+
+
+class TestQuoteBatchConstant(unittest.TestCase):
+    """MAX_QUOTE_BATCH 必须在 astock_common 定义并被 mixin 正确引用。
+
+    真实故障（v2.1.4）：常量只写在 `plugin.py`，而 `astock_mixin_market`
+    直接引用它却没 import → `astock_hint` / `astock_quote` 传多个代码时
+    整条链路 NameError。
+    """
+
+    def test_defined_in_common(self):
+        import astock_common as common
+        self.assertIsInstance(common.MAX_QUOTE_BATCH, int)
+        self.assertGreater(common.MAX_QUOTE_BATCH, 0)
+
+    def test_mixin_resolves_it(self):
+        import astock_mixin_market as mixin
+        self.assertEqual(mixin.MAX_QUOTE_BATCH,
+                         __import__("astock_common").MAX_QUOTE_BATCH)
+
+    def test_plugin_reexports_same_value(self):
+        import astock_common as common
+        self.assertEqual(astock.MAX_QUOTE_BATCH, common.MAX_QUOTE_BATCH)
 
 
 class TestQuantStrategyRegistry(unittest.TestCase):

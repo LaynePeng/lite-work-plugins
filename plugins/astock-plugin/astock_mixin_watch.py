@@ -68,12 +68,23 @@ class WatchToolsMixin:
                 return ("⏸ 盯盘已暂停。探针将直接返回「无变化」，不会再唤醒你。\n"
                         f"（{plan_note}；用 `astock_watch action=start` 恢复）")
 
-        diag = plan_ctl.diagnose(self._app, enabled and ok_now, only_hours)
+        # 体检：`enabled` 是插件开关（用户意图），`ok_now` 是此刻是否在交易时段。
+        # 必须分开传——此前合成 `enabled and ok_now` 传进去，收盘后体检必然
+        # 误报"开关是关闭的"并让你去点按钮，而开关本来就没关（v2.2.0 修）。
+        diag = plan_ctl.diagnose(self._app, enabled, only_hours,
+                                 in_window=ok_now, window_note=why)
         lines = ["## 盯盘状态" if action == "status" else "## 已启动盯盘", ""]
+        # 计划那行要写清"计划在运行"与"此刻是否真的在探测"是两件事：
+        # 收盘后计划仍是 enabled（保留指纹基线），但探针会直接返回「无变化」。
+        if not diag["plan_ok"]:
+            plan_cell = "❌ 未就绪或已禁用"
+        elif ok_now:
+            plan_cell = "✅ 运行中（每 %d 秒）" % diag["plan_interval"]
+        else:
+            plan_cell = "✅ 已就绪（每 %d 秒；当前非交易时段，暂时不探）" % diag["plan_interval"]
         lines.append(_table(["项目", "状态"], [
             ["插件盯盘开关", "✅ 开启" if enabled else "⏸ 已暂停"],
-            ["盯梢计划", ("✅ 运行中（每 %d 秒）" % diag["plan_interval"]
-                          if diag["plan_ok"] else "❌ 未就绪或已禁用")],
+            ["盯梢计划", plan_cell],
             ["最近一次探测", diag.get("last_run_text") or "还没探测过"],
             ["当前时刻", f"{st['now']}（{st['phase']}）"],
             ["现在是否在盯", ("✅ 是" if ok_now else f"❌ 否 —— {why}")],
