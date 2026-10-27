@@ -9,7 +9,11 @@
 AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账数据与邮箱配置，
 属于个人自用型插件——进内置只会增加主程序维护面与体积，没有内置的必要。
 
-工具面（11 个）
+工具面（16 个）
+    astock_act        **操作指示**（先卖后买 + 资金闭环；照着在券商 App 执行）
+    astock_pick       **量化选股 + 买入数量**（全市场扫描→多因子池内打分→换算股数）
+    astock_backtest   **策略回测 + 推荐率**（历史逐期重放→跑赢基准占比→分档）
+    astock_archive    **本地历史存档**（累积日 K，突破接口 2.6 年上限）
     astock_quote      实时行情快照（涨跌停价、量比、换手、市值；自动补交易时段说明）
     astock_kline      K 线 + 技术摘要（均线、区间高低、量能变化）
     astock_search     按代码/名称/拼音检索标的
@@ -19,12 +23,23 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_portfolio  持仓总览（实时浮盈、占比、当日盈亏）＋ 资金/已实现盈亏/流水/纠错
     astock_hint       下单提示（T+1 可卖、止损止盈、加减仓档位、买卖股数估算、舆情背离）
     astock_sentiment  投资舆情分析（公告/研报/新闻/热度/龙虎榜/两融/股东户数）
+    astock_events     事件驱动筛股（快讯硬事件→资金印证→背离）
     astock_sync       成交回单同步（粘贴回单→解析多笔→匹配计划→校价→落账）
-    astock_watch      自选股增删查
+    astock_watch      自选股增删查 + 盯盘开关
+
+模块分层（v2.0.0 起）
+    astock_quant / astock_quant_tool    纯计算引擎 + 取数/缓存/渲染
+    astock_backtest / _tool             回测（防未来函数）+ 推荐率
+    astock_archive                      本地存档（不复权口径，累积窗口）
+    astock_actions                      操作指示（先卖后买）
+    astock_data                         行情层（腾讯主源 + 东财 K 线备源）
+    前几者是**纯函数模块**（喂数据出结果、零网络），便于离线单测；
+    取数与缓存集中在 `*_tool` 层，不污染算法。
 
 扩展点
     AStockWatch       盯梢源：自选股/持仓出现异动时才唤醒 Agent（不烧 token 盯盘）
     contributes.panels 「持仓」右栏面板：Markdown 表格实时浮盈
+                       + 「动量/回归/价值」三个策略面板（点 tab 即切策略）
 
 设计约束（遵循本仓库 AGENTS.md）
 - **零第三方依赖**：httpx/pandas 都不用，纯标准库（urllib/sqlite3/json/dataclasses）。
@@ -94,11 +109,17 @@ except ImportError:  # 旧宿主降级
     ProbeContext = None  # type: ignore[assignment,misc]
 
 import astock_board as board
+import astock_actions as actions
+import astock_backtest as backtest
+import astock_backtest_tool as backtest_tool
+import astock_archive as archive_mod
 import astock_data as data
 import astock_hints as hints
 import astock_market as mkt
 import astock_notify as notify
 import astock_orders as orders
+import astock_quant as quant
+import astock_quant_tool as quant_tool
 import astock_receipt as receipt
 import astock_sentiment as senti
 import astock_sentiment_data as senti_data
@@ -227,6 +248,16 @@ def _money(value: Any) -> str:
     if abs(v) >= 1e4:
         return f"{v / 1e4:.2f}万"
     return f"{v:.2f}"
+
+
+def _span_years(first: str, last: str) -> float:
+    """两个 YYYY-MM-DD 之间相差多少年（用于"存档覆盖多久"的展示）。"""
+    try:
+        a = dt.date.fromisoformat(str(first)[:10])
+        b = dt.date.fromisoformat(str(last)[:10])
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, (b - a).days / 365.25)
 
 
 def _table(headers: List[str], rows: List[List[Any]]) -> str:
@@ -711,7 +742,7 @@ class AstockPlugin(ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "1.7.2"
+    version = "2.0.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -803,9 +834,91 @@ class AstockPlugin(ToolPlugin):
             {"key": "email_test_send", "type": "action", "label": "发送测试邮件",
              "hint": "点一下立即用 email-plugin 的配置发一封测试邮件。"
                      "没收到说明 email-plugin 的邮箱尚未配好"},
+
+            # ── 量化选股（v1.8.0）───────────────────────────────────────
+            # 策略本身**不在设置页选**：右栏有三个策略面板 tab，点 tab 即切换，
+            # 面板里直接看该策略的选股结果。这里的 pick_strategy 只决定
+            # 「Agent 未指定 strategy 时用哪套」与「tools/命令的默认值」。
+            {"key": "pick_strategy", "type": "select", "label": "默认选股策略",
+             "default": "momentum",
+             "options": ["momentum", "reversal", "quality"],
+             "hint": "momentum 趋势动量（追强势）/ reversal 均值回归（抄超跌）/ "
+                     "quality 质量价值（低估值大市值）。三套因子方向相反："
+                     "趋势市用 momentum，震荡市用 reversal。"
+                     "右栏每个策略各有一个面板，点 tab 即切换"},
+            {"key": "pick_universe", "type": "select", "label": "选股范围",
+             "default": "main",
+             "options": ["main", "all", "gem", "star"],
+             "hint": "main＝沪深主板+创业板（默认，避开北交所低流动性）；"
+                     "all＝含北交所；gem＝仅创业板；star＝仅科创板"},
+            {"key": "pick_max_positions", "type": "number",
+             "label": "本轮最多买几只", "default": 5,
+             "hint": "分散度。设 1 是集中押注（波动大），5 是常见分散度。"
+                     "注意：只数越多，每只分到的金额越少，可能买不起一手"},
+            {"key": "pick_cash_usage_pct", "type": "number",
+             "label": "现金使用比例（%）", "default": 80.0,
+             "hint": "本轮最多动用可用现金的百分之几。留 20% 是常识——"
+                     "T+1 补仓、手续费缓冲、以及给判断留余地。填 100 会满仓"},
+            {"key": "pick_cash_reserve_yuan", "type": "number",
+             "label": "保留现金下限（元）", "default": 0.0,
+             "hint": "与「现金使用比例」取更严格者。想强制留 5000 元不动就填 5000"},
+            {"key": "pick_min_amount_yuan", "type": "number",
+             "label": "最低成交额门槛（元）", "default": 100000000,
+             "hint": "流动性门槛，默认 1 亿。成交太清淡的标的买得进卖不出，"
+                     "且分时价格容易被一两笔单子拉动。调小会放进更多小票"},
+            {"key": "pick_candidates", "type": "number",
+             "label": "技术面分析只数", "default": 30,
+             "hint": "从成交额靠前的股票里取多少只拉日 K 算技术因子。"
+                     "每只 1 次请求、限速 5 次/秒 → 30 只约 6 秒。"
+                     "调到 50 会等 10 秒左右，收益递减"},
+            {"key": "pick_run", "type": "action", "label": "立即跑一轮选股",
+             "hint": "用上面的默认策略跑一次全市场扫描，结果写进右栏对应策略面板"
+                     "（约 6 秒）。面板平时只读缓存、不自动扫——"
+                     "5 秒刷新扛不住 30 只 K 线"},
+            {"key": "pick_panel_style", "type": "select",
+             "label": "选股面板形态", "default": "card",
+             "options": ["card", "markdown"],
+             "hint": "card＝卡片看板（一票一卡，带推荐率与仓位进度条，"
+                     "像炒股软件那样一眼看高低，推荐）；"
+                     "markdown＝紧凑文字版，适合想一次看很多只"},
+            {"key": "backtest_run", "type": "action",
+             "label": "立即回测（出推荐率）",
+             "hint": "把当前默认策略放回近 2.6 年历史逐期重放，算出"
+                     "「多少期跑赢沪深300」= 推荐率。约 6-14 秒。"
+                     "**能力边界**：历史只有约 2.6 年（接口上限）、不含退市股"
+                     "（幸存者偏差）、quality 的 PE/PB 无历史序列。"
+                     "结论衡量策略，不是单只股票上涨的概率"},
+            {"key": "backtest_auto_grade", "type": "boolean",
+             "label": "选股时自动附推荐率", "default": True,
+             "hint": "开启后 astock_pick 会附上该策略的回测推荐率"
+                     "（只读缓存，无缓存时跑一轮约 10 秒）。关掉则只给选股结果，"
+                     "更快"},
+            # ── 本地存档（v2.0.0）──────────────────────────────────────
+            {"key": "archive_path", "type": "str", "label": "存档文件路径",
+             "default": "",
+             "hint": "留空＝与台账同目录的 archive.sqlite（便于一起备份）。"
+                     "改放别处填绝对路径"},
+            {"key": "archive_auto_update", "type": "boolean",
+             "label": "回测时自动更新存档", "default": True,
+             "hint": "跑回测时顺手把用到的 K 线存下来。**建议开启**——"
+                     "存档是随时间累积的，每次自动存一点，"
+                     "一年后回测窗口就多出一年。关掉则需要手动更新"},
+            {"key": "archive_run", "type": "action",
+             "label": "立即更新存档",
+             "hint": "把台账持仓+自选的日 K 存到本地（每只 1 次请求）。"
+                     "存档**只存不复权原始价**：前复权会随分红重算整段历史，"
+                     "存了会自相矛盾。注意它不会立刻变长——"
+                     "今天开始存，一年后才多出一年"},
         ],
         "panels": [
             {"id": "portfolio", "title": "持仓"},
+            # 三个策略各一个 tab：点 tab ＝ 切策略。
+            # 宿主面板只读（Markdown / lite-tree 都点不了），因此"在面板里切换
+            # 策略"只能靠"一个策略一个面板"来实现——这是协议能力内的最优解，
+            # 而不是额外去点按钮。
+            {"id": "pick-momentum", "title": "动量"},
+            {"id": "pick-reversal", "title": "回归"},
+            {"id": "pick-quality", "title": "价值"},
         ],
         # 斜杠命令：宿主把它们放进输入框的 / 命令面板（快捷提示）。
         # 输入后原样透传给 Agent——靠 description 引导 Agent 调对应工具，
@@ -829,6 +942,18 @@ class AstockPlugin(ToolPlugin):
              "description": "事件驱动筛股：调 astock_events（快讯硬事件→个股关联"
                             "→资金印证→背离标记，只列事实不预测）",
              "argsHint": "[类型:回购|中标|预增|重组|增持|获批|分红|利空]"},
+            {"name": "astock-pick",
+             "description": "量化选股：调 astock_pick（全市场扫描→打分→"
+                            "给出买哪几只、各买多少股、止损止盈价）",
+             "argsHint": "[momentum|reversal|quality]"},
+            {"name": "astock-act",
+             "description": "操作指示：调 astock_act（先卖什么/再买什么，"
+                            "股数与价位可直接照着在券商 App 执行）",
+             "argsHint": "[momentum|reversal|quality]"},
+            {"name": "astock-backtest",
+             "description": "策略回测出推荐率：调 astock_backtest（历史上多少期"
+                            "跑赢沪深300 + 最大回撤 + 逐期明细）",
+             "argsHint": "[momentum|reversal|quality]"},
             {"name": "astock-watch",
              "description": "盯盘开关与状态：调 astock_watch action=status",
              "argsHint": "[start|stop]"},
@@ -839,6 +964,8 @@ class AstockPlugin(ToolPlugin):
         self._app: Any = None
         self._ledger: Optional[Ledger] = None
         self._ledger_key: str = ""
+        self._archive: Any = None
+        self._archive_key: str = ""
         # 邮件通知的去重/限流状态（跨 probe 复用，故挂在插件实例上）
         self._notifier = notify.Notifier()
 
@@ -861,6 +988,15 @@ class AstockPlugin(ToolPlugin):
         except Exception:      # 配置异常不应让插件加载失败
             logger.warning("[astock] 行情参数配置失败，使用默认值", exc_info=True)
         self._ledger = None    # workspace/配置可能已变，下次用时重建
+        self._archive = None   # 本地历史行情存档（同上，路径变了重建）
+        # 回测池降级时需要台账（快照接口被限流时用持仓+自选当池子）
+        try:
+            backtest_tool.set_ledger_getter(self._get_ledger)
+            backtest_tool.set_archive_getter(self._get_archive)
+            backtest_tool.set_auto_archive(
+                _bool(self._app, "archive_auto_update", True))
+        except Exception:
+            logger.warning("[astock] 回测台账/存档注入失败", exc_info=True)
         super().install(kernel)
 
     # -------------------------------------------------- 基础设施
@@ -886,6 +1022,91 @@ class AstockPlugin(ToolPlugin):
 
     def _hints_cfg(self) -> hints.HintsConfig:
         return hints_config(self._app)
+
+    # -------------------------------------------------- 存档（本地历史行情）
+
+    def _archive_path(self) -> str:
+        raw = str(_cfg(self._app, "archive_path", "") or "").strip()
+        if raw:
+            return os.path.abspath(os.path.expanduser(raw))
+        # 默认与台账同目录，便于一起备份
+        ledger_dir = os.path.dirname(self._ledger_path())
+        return os.path.join(ledger_dir, "archive.sqlite")
+
+    def _get_archive(self) -> "archive_mod.Archive":
+        """存档句柄（路径变化时自动重建）。"""
+        path = self._archive_path()
+        if self._archive is None or self._archive_key != path:
+            self._archive = archive_mod.Archive(path)
+            self._archive_key = path
+        return self._archive
+
+    # -------------------------------------------------- 量化选股配置
+
+    def _default_strategy(self) -> str:
+        """设置页的默认策略（未配置/写错时回到 momentum）。"""
+        key = str(_cfg(self._app, "pick_strategy", quant.DEFAULT_STRATEGY)
+                  or quant.DEFAULT_STRATEGY).strip().lower()
+        return key if key in quant.STRATEGIES else quant.DEFAULT_STRATEGY
+
+    def _sizing_cfg(self, args: Optional[Dict[str, Any]] = None) -> quant.SizingConfig:
+        """仓位约束：设置页为默认，工具参数可临时覆盖。"""
+        args = args or {}
+        max_pos = args.get("max_positions")
+        usage = args.get("cash_usage_pct")
+        try:
+            max_positions = int(max_pos) if max_pos not in (None, "") else int(
+                _num(self._app, "pick_max_positions", 5))
+        except (TypeError, ValueError):
+            max_positions = 5
+        try:
+            cash_usage = (float(usage) if usage not in (None, "") else
+                          _num(self._app, "pick_cash_usage_pct", 80.0))
+        except (TypeError, ValueError):
+            cash_usage = 80.0
+        return quant.SizingConfig(
+            position_cap_pct=_num(self._app, "position_cap_pct", 25.0),
+            max_positions=max(1, min(max_positions, 20)),
+            cash_usage_pct=max(1.0, min(cash_usage, 100.0)),
+            cash_reserve_yuan=max(0.0, _num(self._app, "pick_cash_reserve_yuan", 0.0)),
+        )
+
+    def _quant_scan(self, strategy: Optional[str] = None,
+                    args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """统一入口：跑一轮选股（同步，调用方包 to_thread）。
+
+        **兼容备源缺字段**：新浪备源的快照没有主力净流入，因此这里按
+        设置页「最低成交额」统一过滤后交给引擎——引擎自己会按策略门槛
+        再拦一次。两层过滤不重叠：外层控“流动性下限可配”，
+        内层控“策略固有约束”。
+        """
+        args = args or {}
+        key = (str(strategy or args.get("strategy") or "").strip().lower()
+               or self._default_strategy())
+        ledger = self._get_ledger()
+        # 现金与权益都从台账算：权益 = 持仓市值 + 现金（与 _snapshot 同口径）
+        snap = self._snapshot()
+        cash = float(snap["data"].get("cash") or 0)
+        total_mv = float(snap["data"].get("total_market_value") or 0)
+        equity = total_mv + cash
+        universe = str(args.get("universe")
+                       or _cfg(self._app, "pick_universe", "main") or "main").lower()
+        if universe not in quant_tool.__dict__.get("UNIVERSES",
+                                                   ("main", "all", "gem", "star")):
+            universe = "main"
+        min_amount = _num(self._app, "pick_min_amount_yuan", 1e8)
+        cand = int(_num(self._app, "pick_candidates",
+                        quant.MAX_KLINE_CANDIDATES))
+        result = quant_tool.scan(
+            key, cash=cash, equity=equity, universe=universe,
+            sizing=self._sizing_cfg(args),
+            candidate_limit=max(5, min(cand, 60)),
+            fee_cfg=ledger.fee,
+            use_cache=not bool(args.get("fresh")),
+        )
+        # 外层流动性下限（策略默认门槛已在引擎里生效，这里只叠加用户配置）
+        result["min_amount_yuan"] = min_amount
+        return result
 
     # -------------------------------------------------- 工具定义
 
@@ -1136,6 +1357,176 @@ class AstockPlugin(ToolPlugin):
                 },
             ),
             ToolDefinition(
+                name="astock_pick",
+                description=(
+                    "**量化选股 + 买入数量**（本插件新增的核心能力）："
+                    "全市场扫描 → 硬门槛过滤 → 多因子池内打分 → 按现金/单票上限"
+                    "换算成**具体股数**，输出「买哪几只、每只买多少股、挂什么止损止盈价」。"
+                    "三套策略（因子方向相反，按市况选）："
+                    "momentum 趋势动量（站上均线+放量+接近高点，趋势市用）/ "
+                    "reversal 均值回归（跌到区间低位+RSI超卖，震荡市用）/ "
+                    "quality 质量价值（低PE/PB+大市值+低波动，长期持有）。"
+                    "得分是**候选池内相对排名**（0-100），不是上涨概率、不是预期收益；"
+                    "每只都给出得分来源（各因子贡献）以便核对。"
+                    "rank_only=true 只出排行不给股数（想自己决定买哪只时用）。"
+                    "整个扫描约 6 秒（30 只 K 线，受限速）。"),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "strategy": {
+                            "type": "string",
+                            "enum": ["momentum", "reversal", "quality"],
+                            "description": ("策略。momentum 追强势（趋势市）/ "
+                                            "reversal 抄超跌（震荡市）/ "
+                                            "quality 低估值大盘（长期）。"
+                                            "留空＝用设置页的默认策略"),
+                        },
+                        "rank_only": {
+                            "type": "boolean",
+                            "description": "true＝只出得分排行，不给买入股数",
+                        },
+                        "max_positions": {
+                            "type": "number",
+                            "description": "本轮最多买几只（默认取设置页，通常 5）",
+                        },
+                        "cash_usage_pct": {
+                            "type": "number",
+                            "description": ("本轮最多动用可用现金的百分比"
+                                            "（默认取设置页，通常 80）"),
+                        },
+                        "universe": {
+                            "type": "string",
+                            "enum": ["main", "all", "gem", "star"],
+                            "description": "选股范围，默认 main（沪深主板+创业板）",
+                        },
+                        "fresh": {
+                            "type": "boolean",
+                            "description": "true＝跳过缓存强制重新扫描（默认用 3 分钟内缓存）",
+                        },
+                        "top_n": {
+                            "type": "number",
+                            "description": "rank_only 时显示前几名，默认 10",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
+                name="astock_backtest",
+                description=(
+                    "**策略回测 + 推荐率**：把选股策略放回历史逐期重放，统计"
+                    "「按这套策略选股，历史上多少期跑赢沪深300」——这个比例就是"
+                    "**推荐率**，它来自历史数据，不是主观打分。"
+                    "输出：推荐率、每期平均收益、平均超额、累计收益（策略 vs 基准）、"
+                    "最大回撤、最好/最差单期、逐期明细（可选）。"
+                    "**能力边界（重要）**：历史只有约 2.6 年（641 根日 K，接口上限），"
+                    "不含退市股（幸存者偏差，真实表现会略差），quality 策略的 PE/PB "
+                    "无历史序列故回测不完整。结论衡量的是**策略**，不是单只股票"
+                    "上涨的概率。历史不代表未来。约 6-14 秒（需拉 25 只历史 K 线）。"),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "strategy": {
+                            "type": "string",
+                            "enum": ["momentum", "reversal", "quality"],
+                            "description": "要回测的策略；留空＝设置页默认策略",
+                        },
+                        "rebalance_days": {
+                            "type": "number",
+                            "description": "多少交易日调仓一次，默认 10（约两周）",
+                        },
+                        "top_k": {
+                            "type": "number",
+                            "description": "每期买入几只，默认 3",
+                        },
+                        "hold_days": {
+                            "type": "number",
+                            "description": "持有多少交易日，默认 10",
+                        },
+                        "pool_size": {
+                            "type": "number",
+                            "description": "回测股票池大小，默认 25（每只 1 次 K 线请求）",
+                        },
+                        "detail_periods": {
+                            "type": "number",
+                            "description": "附带最近 N 期逐期明细（默认 0＝不看明细）",
+                        },
+                        "fresh": {
+                            "type": "boolean",
+                            "description": "true＝跳过 30 分钟缓存重新回测",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
+                name="astock_archive",
+                description=(
+                    "**本地历史行情存档**：把日 K 落到本地 SQLite，让回测能突破"
+                    "在线接口「只有约 2.6 年」的硬上限。"
+                    "action=update 增量更新（默认标的：台账持仓+自选，可指定 codes）；"
+                    "status 看存档覆盖情况（多少只/多少根/起止日期/占用空间）；"
+                    "prune 清理（必须指定 before 或 codes，否则拒绝执行）。"
+                    "**重要**：存档只存「不复权」原始价（前复权会随分红重算整段历史，"
+                    "存了会自相矛盾）；**它不会立刻变长**——今天开始存，一年后多一年，"
+                    "所以建议每天跑一次。回测会自动优先使用存档数据。"),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["update", "status", "prune"],
+                            "description": "默认 status",
+                        },
+                        "codes": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": ("update：要更新的代码（留空＝台账持仓+自选）；"
+                                            "prune：要清空的代码"),
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "update 时每只取最近多少根，默认 640",
+                        },
+                        "before": {
+                            "type": "string",
+                            "description": "prune：删除该日期（YYYY-MM-DD）之前的数据",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
+                name="astock_act",
+                description=(
+                    "**操作指示**（傻瓜化的最后一步）：把「选股结果」和「当前持仓」"
+                    "合成为一份**照着做就行**的清单——先卖什么（卖多少股、什么价、为什么）、"
+                    "再买什么（买多少股、止损止盈价）、操作后现金剩多少。"
+                    "执行顺序固定「先卖后买」，因为 A 股卖出资金当日可用于买入，"
+                    "反过来先买会因资金不足失败。卖出仅基于明确规则：触发止损/止盈、"
+                    "不在本轮选股名单且浮亏（换仓）、单票超仓；"
+                    "数量已按 T+1 可卖约束裁剪，不会给出卖不掉的废单。"
+                    "**本插件不连接券商、不下单**，只产出给人看的指示。"),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "strategy": {
+                            "type": "string",
+                            "enum": ["momentum", "reversal", "quality"],
+                            "description": "用哪套策略选股；留空＝设置页默认",
+                        },
+                        "max_positions": {
+                            "type": "number",
+                            "description": "本轮最多买几只（默认取设置页）",
+                        },
+                        "fresh": {
+                            "type": "boolean",
+                            "description": "true＝跳过缓存重新选股",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
                 name="astock_watch",
                 description=(
                     "盯盘与自选股管理。action=list 看自选；add/remove 增删自选；"
@@ -1284,6 +1675,10 @@ class AstockPlugin(ToolPlugin):
             "astock_sentiment": self._tool_sentiment,
             "astock_events": self._tool_events,
             "astock_sync": self._tool_sync,
+            "astock_pick": self._tool_pick,
+            "astock_backtest": self._tool_backtest,
+            "astock_archive": self._tool_archive,
+            "astock_act": self._tool_act,
             "astock_watch": self._tool_watch,
         }
         handler = handlers.get(name)
@@ -2318,6 +2713,22 @@ class AstockPlugin(ToolPlugin):
         own = own if isinstance(own, dict) else {}
         if key == "email_test_send":
             return self._action_test_mail(own, config or {})
+        if key == "pick_run":
+            if not _bool(self._app, "backtest_auto_grade", True):
+                return self._action_pick_run(own)
+            # 开了「自动附推荐率」时顺手把回测跑掉：否则用户点了选股、
+            # 面板上推荐率仍是空的，会以为功能坏了。
+            res = self._action_pick_run(own)
+            grade = self._action_backtest_run(own)
+            base = str(res.get("message") or "")
+            tail = str(grade.get("message") or "")
+            res["message"] = (base + f"　｜　{tail}" if grade.get("ok")
+                              else base + f"　｜　推荐率未生成：{tail}")
+            return res
+        if key == "backtest_run":
+            return self._action_backtest_run(own)
+        if key == "archive_run":
+            return self._action_archive_run()
         if key != "watch_toggle":
             return {"ok": False, "message": f"未知动作 {key}"}
 
@@ -2337,6 +2748,111 @@ class AstockPlugin(ToolPlugin):
         else:
             msg = "已暂停盯盘：探针将直接返回「无变化」，不会再唤醒你。"
         return {"ok": True, "message": msg, "watch_enabled": want}
+
+    def _action_archive_run(self) -> Dict[str, Any]:
+        """设置页「立即更新存档」按钮：把持仓+自选的日 K 落库。
+
+        同步执行（每只 1 次请求，10 只约 2-4 秒）。按钮由用户显式点击。
+        """
+        try:
+            archive = self._get_archive()
+            ledger = self._get_ledger()
+            codes = [p["code"] for p in ledger.list_positions()]
+            codes += [w["code"] for w in ledger.list_watch()]
+        except Exception as exc:
+            return {"ok": False, "message": f"读取台账/存档失败：{exc}"}
+        codes = list(dict.fromkeys(c for c in codes if c))
+        if not codes:
+            return {"ok": False,
+                    "message": "台账里没有持仓或自选股，先录入标的再更新存档"}
+
+        def fetch_fn(code: str, _adjust: str, _limit: int) -> List[Dict[str, Any]]:
+            bars = data.fetch_klines(code, period="day", limit=640, adjust="none")
+            return [b.as_dict() for b in bars]
+
+        try:
+            result = archive_mod.update_from_provider(
+                archive, codes, fetch_fn, "raw", 640)
+        except Exception as exc:
+            logger.warning("[astock] 设置页存档更新失败: %s", exc)
+            return {"ok": False, "message": f"更新失败：{exc}"}
+        return {"ok": True, "message": (
+            f"存档已更新：{len(result['updated'])} 只成功、"
+            f"{len(result['failed'])} 只失败，写入 {result['total_saved']:,} 根 K 线")}
+
+    def _action_backtest_run(self, own: Dict[str, Any]) -> Dict[str, Any]:
+        """设置页「立即回测（出推荐率）」按钮。
+
+        同步跑约 6-14 秒（25 只 × 640 根 K 线）。按钮由用户显式点击，可接受。
+
+        **失败不等于功能坏了**：接口限流、样本不足都是常态，所以失败消息
+        要给可行动作，而不是一句"失败"。
+        """
+        key = str(own.get("pick_strategy") or self._default_strategy()).strip().lower()
+        if key not in quant.STRATEGIES:
+            key = quant.DEFAULT_STRATEGY
+        try:
+            out = backtest_tool.run(key, use_cache=False)
+        except Exception as exc:
+            logger.warning("[astock] 设置页回测失败: %s", exc)
+            return {"ok": False,
+                    "message": (f"回测失败：{type(exc).__name__}: {exc}。"
+                                f"若是接口限流，等 10-30 秒再点一次")}
+        rec = out.get("recommendation")
+        bt = out.get("result")
+        if rec is None or bt is None:
+            return {"ok": False, "message": "回测未产生结论"}
+        if rec.win_rate is None:
+            return {"ok": False, "message": f"{bt.strategy_label}：{rec.reason}"}
+        return {"ok": True, "message": (
+            f"{bt.strategy_label} 推荐率 {rec.win_rate:.0f}%"
+            f"（{rec.grade} 档·{rec.label}；{rec.sample} 期样本，"
+            f"可信度 {rec.confidence}；平均超额 {bt.avg_excess_pct:+.2f}%，"
+            f"最大回撤 {bt.max_drawdown_pct:.1f}%）")}
+
+    def _action_pick_run(self, own: Dict[str, Any]) -> Dict[str, Any]:
+        """设置页「立即跑一轮选股」按钮。
+
+        为什么放在设置页而不是面板：面板只读（点不了），设置页的
+        `type:"action"` 是本插件唯一能提供的可点击控件（与盯盘开关同一机制）。
+
+        同步执行约 6 秒（30 只 K 线 + 限速）。按钮由用户显式点击，因此
+        同步可接受；但**必须把结果说清楚**——尤其是"钱不够买一手"这种
+        看起来像出错、其实是资金约束的情况，否则用户会以为插件坏了。
+        """
+        key = str(own.get("pick_strategy") or self._default_strategy()).strip().lower()
+        if key not in quant.STRATEGIES:
+            key = quant.DEFAULT_STRATEGY
+        try:
+            result = self._quant_scan(key, {"fresh": True})
+        except Exception as exc:
+            logger.warning("[astock] 设置页选股失败: %s", exc)
+            return {"ok": False,
+                    "message": f"选股失败：{type(exc).__name__}: {exc}。"
+                               f"若为接口限流，等 10-30 秒再点一次"}
+        strat = quant.STRATEGIES[key]
+        allocs = result.get("allocations") or []
+        summary = result.get("summary") or {}
+        if not allocs:
+            skipped = result.get("skipped") or []
+            if skipped:
+                msg = (f"{strat.label}：{len(skipped)} 只通过筛选但资金不足一手"
+                       f"（可用 {summary.get('cash', 0):,.0f} 元，"
+                       f"预算 {summary.get('budget', 0):,.0f} 元）。"
+                       f"可提高现金使用比例或减少买入只数")
+            else:
+                msg = (f"{strat.label}：本轮无标的通过门槛"
+                       f"（扫描 {result.get('scanned', 0)} 只 / "
+                       f"候选 {result.get('candidates', 0)} 只）。"
+                       f"可换策略或放宽最低成交额")
+            return {"ok": True, "message": msg}
+        names = "、".join(f"{a.name} {a.shares}股" for a in allocs[:3])
+        more = f" 等 {len(allocs)} 只" if len(allocs) > 3 else ""
+        return {"ok": True, "message": (
+            f"{strat.label}：选出 {len(allocs)} 只（{names}{more}），"
+            f"计划投入 {summary.get('allocated_amount', 0):,.0f} 元 / "
+            f"预算 {summary.get('budget', 0):,.0f} 元。"
+            f"详见右栏「{strat.label[:2]}」面板")}
 
     def _action_test_mail(self, own: Dict[str, Any],
                           _config: Dict[str, Any]) -> Dict[str, Any]:
@@ -2401,6 +2917,223 @@ class AstockPlugin(ToolPlugin):
             logger.warning("[astock] 写配置失败: %s", exc)
             return f"{type(exc).__name__}: {exc}"
 
+    async def _tool_pick(self, args: Dict[str, Any]) -> str:
+        """量化选股：全市场扫描 → 打分 → 换算股数（可带推荐率）。"""
+        try:
+            result = await asyncio.to_thread(self._quant_scan, None, args)
+        except data.DataError as exc:
+            return f"[Error] 选股扫描失败：{exc}"
+        if args.get("rank_only"):
+            n = int(args.get("top_n") or 10)
+            return quant_tool.render_ranking(result, max(1, min(n, 20)))
+        text = quant_tool.render_scan(result)
+        # 推荐率：默认附上该策略的回测结论（只读缓存，不额外拉网络）。
+        # 为什么默认附：用户要的是"该不该买"的判断，只给得分仍要他自己解读。
+        if not args.get("no_grade", False) \
+                and _bool(self._app, "backtest_auto_grade", True):
+            grade = await self._attach_grade(result.get("strategy") or "")
+            if grade:
+                text = grade + "\n\n---\n\n" + text
+        return text
+
+    async def _attach_grade(self, strategy: str,
+                            fresh: bool = False) -> str:
+        """取该策略的回测推荐率摘要（优先缓存；无缓存时跑一轮）。"""
+        if not strategy:
+            return ""
+        try:
+            cached = backtest_tool.get_cached(strategy)
+            if cached is None or fresh:
+                cached = await asyncio.to_thread(
+                    backtest_tool.run, strategy, use_cache=not fresh)
+        except Exception as exc:
+            logger.info("[astock] 推荐率获取失败（不影响选股结果）: %s", exc)
+            return ("> ⚪ **推荐率暂不可用**：回测取数失败（可能接口限流）。"
+                    "可稍后单独问「回测一下这个策略」。")
+        rec = cached.get("recommendation")
+        if rec is None:
+            return ""
+        mark = {"A": "🟢", "B": "🔵", "C": "🟠", "D": "🔴"}.get(rec.grade, "⚪")
+        if rec.win_rate is None:
+            return f"> {mark} **推荐率无法判定**：{rec.reason}"
+        return (f"> {mark} **策略推荐率 {rec.win_rate:.0f}%**"
+                f"（{rec.grade} 档 · {rec.label}；历史 {rec.sample} 期中 "
+                f"{int(round(rec.win_rate / 100 * rec.sample))} 期跑赢沪深300，"
+                f"样本可信度 {rec.confidence}）\n"
+                f"> 这是**策略**的历史表现，不是这几只票各自上涨的概率。")
+
+    async def _tool_backtest(self, args: Dict[str, Any]) -> str:
+        """策略回测：出推荐率与风险指标。"""
+        strategy = str(args.get("strategy") or "").strip().lower() \
+            or self._default_strategy()
+        if strategy not in quant.STRATEGIES:
+            return (f"[Error] 未知策略 {strategy}；可选："
+                    f"{'、'.join(quant.STRATEGIES)}")
+        cfg = backtest.BacktestConfig()
+        for key in ("rebalance_days", "top_k", "hold_days"):
+            v = args.get(key)
+            if v not in (None, ""):
+                try:
+                    setattr(cfg, key, int(float(v)))
+                except (TypeError, ValueError):
+                    pass
+        cfg.rebalance_days = max(2, min(cfg.rebalance_days, 60))
+        cfg.top_k = max(1, min(cfg.top_k, 10))
+        cfg.hold_days = max(1, min(cfg.hold_days, 60))
+        pool = int(args.get("pool_size") or backtest_tool.DEFAULT_POOL)
+        try:
+            out = await asyncio.to_thread(
+                backtest_tool.run, strategy,
+                pool_size=max(6, min(pool, 60)), cfg=cfg,
+                use_cache=not bool(args.get("fresh")))
+        except data.DataError as exc:
+            return f"[Error] 回测取数失败：{exc}"
+        except ValueError as exc:
+            return f"[Error] {exc}"
+        detail = int(args.get("detail_periods") or 0)
+        return backtest_tool.render(
+            out["result"], out["recommendation"],
+            detail_periods=max(0, min(detail, 30)),
+            fetch_failed=out.get("fetch_failed") or 0)
+
+    # -------------------------------------------------- 操作指示
+
+    async def _tool_act(self, args: Dict[str, Any]) -> str:
+        """生成操作指示：先卖后买 + 资金闭环。"""
+        try:
+            scan = await asyncio.to_thread(self._quant_scan, None, args)
+        except data.DataError as exc:
+            return f"[Error] 选股失败，无法生成操作指示：{exc}"
+
+        snap = self._snapshot()
+        d = snap["data"]
+        positions = d.get("positions") or []
+        quotes = d.get("quotes") or {}
+        strategy_key = scan.get("strategy") or self._default_strategy()
+        strat = quant.STRATEGIES.get(strategy_key)
+
+        plan = actions.build_action_plan(
+            positions=positions,
+            quotes=quotes,
+            allocations=scan.get("allocations") or [],
+            cash=float(d.get("cash") or 0),
+            cfg=self._hints_cfg(),
+            strategy=strat,
+            total_market_value=float(d.get("total_market_value") or 0),
+            fee_cfg=self._get_ledger().fee)
+
+        text = actions.render_action_plan(
+            plan, strat.label if strat else "")
+        # 推荐率一并给出：让用户知道"这套指示背后的策略靠不靠谱"
+        grade = await self._attach_grade(strategy_key)
+        if grade:
+            text = grade + "\n\n" + text
+        return text
+
+    # -------------------------------------------------- 存档
+
+    async def _tool_archive(self, args: Dict[str, Any]) -> str:
+        """本地历史行情存档：更新 / 概览 / 清理。"""
+        action = str(args.get("action") or "status").strip().lower()
+        archive = self._get_archive()
+
+        if action == "status":
+            st = await asyncio.to_thread(archive.stats)
+            lines = ["**本地历史行情存档**", ""]
+            lines.append("| 项目 | 数值 |")
+            lines.append("|---|---|")
+            lines.append(f"| 文件 | `{st['path']}` |")
+            lines.append(f"| 已存标的 | {st['codes']} 只 |")
+            lines.append(f"| 总 K 线根数 | {st['bars']:,} 根 |")
+            lines.append(f"| 时间跨度 | {st['first_date'] or '-'} ~ "
+                         f"{st['last_date'] or '-'} |")
+            lines.append(f"| 占用空间 | {st['size_human']} |")
+            lines.append("")
+            if st["detail"]:
+                lines.append("### 覆盖最多的标的（前 10）")
+                lines.append("")
+                lines.append("| 代码 | 口径 | 根数 | 起 | 止 |")
+                lines.append("|---|---|---|---|---|")
+                for d in st["detail"][:10]:
+                    lines.append(f"| {d['code']} | {d['adjust']} | "
+                                 f"{d['bar_count']} | {d['first_date']} | "
+                                 f"{d['last_date']} |")
+                lines.append("")
+            if st["bars"] == 0:
+                lines.append("**存档为空**。说一句「更新 K 线存档」开始累积。")
+            else:
+                years = _span_years(st["first_date"], st["last_date"])
+                lines.append(f"> 当前覆盖约 {years:.1f} 年。回测会自动优先用存档数据"
+                             f"——**存得越久，回测窗口越长**。建议每天跑一次更新。")
+            lines.append("")
+            lines.append("_存档只存不复权原始价：前复权会随分红重算整段历史，"
+                         "存下来会自相矛盾。_")
+            return "\n".join(lines)
+
+        if action == "prune":
+            before = str(args.get("before") or "").strip()
+            codes = [str(c).strip() for c in (args.get("codes") or []) if str(c).strip()]
+            if not before and not codes:
+                return ("[Error] prune 必须指定 before 日期或 codes，"
+                        "否则会清空全部存档。这是刻意的保护——"
+                        "几年数据一次误点就没了。")
+            res = await asyncio.to_thread(archive.prune, before, codes or None)
+            return (f"✅ 已清理 {res['deleted']} 根 K 线"
+                    + (f"（{', '.join(codes)}）" if codes else "")
+                    + (f"（{before} 之前）" if before else ""))
+
+        if action != "update":
+            return f"[Error] 未知 action {action}；可选 update/status/prune"
+
+        # update：默认标的 = 持仓 + 自选
+        codes = [str(c).strip() for c in (args.get("codes") or []) if str(c).strip()]
+        if not codes:
+            ledger = self._get_ledger()
+            try:
+                codes = [p["code"] for p in await asyncio.to_thread(
+                    ledger.list_positions)]
+                codes += [w["code"] for w in await asyncio.to_thread(
+                    ledger.list_watch)]
+            except LedgerError as exc:
+                return f"[Error] 读取台账失败：{exc}"
+        codes = list(dict.fromkeys(c for c in codes if c))
+        if not codes:
+            return ("台账里没有持仓或自选股，没东西可存。"
+                    "先用 astock_record 录入持仓，或 astock_watch 添加自选，"
+                    "或用 codes 参数指定要存档的代码。")
+
+        limit = int(args.get("limit") or 640)
+        limit = max(60, min(limit, 2000))
+
+        def fetch_fn(code: str, _adjust: str, _limit: int) -> List[Dict[str, Any]]:
+            # 存档一律取**不复权**（见 astock_archive 模块注释①）
+            bars = data.fetch_klines(code, period="day", limit=limit, adjust="none")
+            return [b.as_dict() for b in bars]
+
+        result = await asyncio.to_thread(
+            archive_mod.update_from_provider, archive, codes, fetch_fn,
+            "raw", limit)
+        ok = len(result["updated"])
+        fail = len(result["failed"])
+        lines = [f"✅ 存档已更新：成功 {ok} 只、失败 {fail} 只、"
+                 f"新增/刷新 {result['total_saved']:,} 根", ""]
+        if result["updated"]:
+            lines.append("| 代码 | 写入 | 起 | 止 |")
+            lines.append("|---|---|---|---|")
+            for u in result["updated"][:15]:
+                lines.append(f"| {u['code']} | {u['saved']} | "
+                             f"{u['first_date']} | {u['last_date']} |")
+            lines.append("")
+        if result["failed"]:
+            lines.append("**失败明细**（通常是接口限流，稍后重试即可）：")
+            lines.append("")
+            for f in result["failed"][:10]:
+                lines.append(f"- {f['code']}：{f['error']}")
+            lines.append("")
+        lines.append("_提示：存档是随时间累积的，今天存的覆盖约 2.6 年，"
+                     "**一年后才会多出一年**。建议每天跑一次。_")
+        return "\n".join(lines)
+
     async def _tool_watch(self, args: Dict[str, Any]) -> str:
         action = str(args.get("action") or "list")
         ledger = self._get_ledger()
@@ -2456,6 +3189,8 @@ class AstockPlugin(ToolPlugin):
           着色，适合盘中扫一眼。
         形态是偏好问题而非对错问题，所以做成开关而不是替你决定。
         """
+        if panel_id.startswith("pick-"):
+            return self._panel_pick(panel_id)
         if panel_id != "portfolio":
             return ""
         try:
@@ -2471,6 +3206,57 @@ class AstockPlugin(ToolPlugin):
         if style == "tree":
             return self._panel_tree(d, flag)
         return self._panel_markdown(d, flag)
+
+    # -------------------------------------------------- 面板渲染（两种形态）
+
+    def _panel_pick(self, panel_id: str) -> str:
+        """量化选股面板（三个策略 tab）。
+
+        **为什么要做成三个 tab**：宿主面板是**只读**的——Markdown 与 lite-tree
+        都点不了，插件在右栏唯一能提供的交互就是"切换 tab"。所以"在面板里
+        切换策略"的正确实现是「一个策略一个面板」，点 tab 即切换，而不是
+        想办法塞一个下拉框或按钮（协议不支持，做了也是死控件）。
+
+        **绝不在这里跑扫描**：面板 5 秒刷新，而一次扫描要拉 30 只 K 线 ≈ 6 秒
+        + 会把公共接口打到限流。这里只读 `quant_tool` 的进程内缓存；
+        没缓存就提示"去设置页点一下/说一句让我跑"，把耗时的决定权交给用户。
+        """
+        strategy = panel_id.split("-", 1)[1] if "-" in panel_id else ""
+        if strategy not in quant.STRATEGIES:
+            return ""
+        try:
+            cached = quant_tool.pick_cached(strategy)
+        except Exception:
+            logger.warning("[astock] 选股面板缓存读取失败", exc_info=True)
+            cached = None
+        # 回测推荐率（只读缓存，绝不在这里跑回测——那是 25 只 K 线的开销）
+        rec = None
+        try:
+            bt_cached = backtest_tool.get_cached(strategy)
+            if bt_cached:
+                rec = bt_cached.get("recommendation")
+        except Exception:
+            logger.debug("[astock] 面板读回测缓存失败", exc_info=True)
+
+        # 卡片形态：有选股结果 + 用户没要求 Markdown 时，走 lite-tree 卡片看板
+        # （「像炒股软件那样」的诉求）。卡片能以进度条表达推荐率/仓位，
+        # 表格在 331px 窄栏里做不到这一点。
+        style = str(_cfg(self._app, "pick_panel_style", "card") or "card").lower()
+        if cached and (cached.get("allocations") or cached.get("skipped")) \
+                and style != "markdown":
+            try:
+                return backtest_tool.build_recommendation_cards(
+                    cached.get("allocations") or [], rec,
+                    quant.STRATEGIES[strategy].label)
+            except Exception as exc:
+                logger.warning("[astock] 选股卡片渲染失败，退回 markdown: %s", exc)
+        try:
+            return quant_tool.render_panel(cached, strategy, rec=rec)
+        except Exception as exc:
+            logger.warning("[astock] 选股面板渲染失败: %s", exc)
+            return (f"**量化选股 · {strategy}**\n\n"
+                    f"面板渲染出错：{type(exc).__name__}: {exc}\n\n"
+                    f"可在对话里说「帮我选股」直接拿结果。")
 
     # -------------------------------------------------- 面板渲染（两种形态）
 

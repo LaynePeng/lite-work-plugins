@@ -70,6 +70,12 @@ orders_mod = astock.orders
 notify_mod = astock.notify
 ledger_mod = astock.Ledger
 hints = astock.hints
+quant = astock.quant                  # 量化选股引擎（v1.8.0）
+quant_tool = astock.quant_tool        # 扫描/缓存/渲染接入层
+backtest_mod = astock.backtest        # 回测引擎（v1.9.0）
+backtest_tool = astock.backtest_tool  # 回测取数/缓存/卡片接入层
+archive_mod = astock.archive_mod      # 本地历史行情存档（v2.0.0）
+astock_actions = astock.actions       # 操作指示（先卖后买）（v2.0.0）
 
 
 # ---------------------------------------------------------------- 市场规则
@@ -542,6 +548,7 @@ class TestPluginSurface(unittest.TestCase):
             "astock_quote", "astock_kline", "astock_search", "astock_screen",
             "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
             "astock_sentiment", "astock_events", "astock_sync", "astock_watch",
+            "astock_pick", "astock_backtest", "astock_archive", "astock_act",
         })
 
     def test_command_names_are_prefixed(self):
@@ -2374,6 +2381,1337 @@ class TestSnapshotIncludesWatch(unittest.TestCase):
             d.fetch_quotes = orig
         self.assertEqual(called["n"], 0, "默认不该为自选打行情请求")
         self.assertEqual(snap["data"]["watch_quotes"], {})
+
+
+# ---------------------------------------------------------------- 量化选股（v1.8.0）
+
+
+def _mk_bars(base: float, trend: float, n: int = 120,
+             vol_base: float = 2000.0) -> list:
+    """构造合成日 K（升序）。trend>1 上升、<1 下降、=1 横盘。"""
+    bars = []
+    p = base
+    for i in range(n):
+        p *= trend
+        bars.append({"close": p, "high": p * 1.01, "low": p * 0.99,
+                     "volume_lot": vol_base + i})
+    return bars
+
+
+def _mk_scored(code: str, name: str, bars: list, *, pe=20.0, pb=2.0,
+               mcap=5e10, amount=3e8, turnover=3.0, chg=1.0,
+               main_net=1e7) -> "quant.Scored":
+    tech = quant.compute_technical(bars)
+    price = bars[-1]["close"] if bars else 0.0
+    row = {"code": code, "name": name, "price": price, "change_pct": chg,
+           "pe": pe, "pb": pb, "total_mcap_yuan": mcap, "amount_yuan": amount,
+           "turnover_pct": turnover, "main_net_inflow_yuan": main_net}
+    return quant.Scored(code=code, name=name, price=price, change_pct=chg,
+                        tech=tech, row=row)
+
+
+class TestQuantTechnical(unittest.TestCase):
+    """技术因子计算：口径必须能被手算核对。"""
+
+    def test_uptrend_alignment_and_momentum(self):
+        t = quant.compute_technical(_mk_bars(10.0, 1.004))
+        self.assertEqual(t["bars"], 120)
+        self.assertEqual(t["ma_alignment"], 3, "持续上涨应满足 close>MA5>MA10>MA20")
+        self.assertGreater(t["mom20"], 0)
+        self.assertGreater(t["mom60"], 0)
+        self.assertGreater(t["pos_in_range"], 90, "接近区间高点")
+
+    def test_downtrend(self):
+        t = quant.compute_technical(_mk_bars(30.0, 0.996))
+        self.assertLess(t["mom20"], 0)
+        self.assertLess(t["pos_in_range"], 10, "接近区间低位")
+        self.assertLess(t["rsi14"], 50)
+
+    def test_short_history_is_none_not_zero(self):
+        """数据不足时必须给 None，不能给 0。
+
+        0 在「低波动」因子里是最优点 → 数据不足的标的会被推到第一名。
+        这是最难发现的静默错误之一，必须锁住。
+        """
+        t = quant.compute_technical(_mk_bars(10.0, 1.01, n=2))
+        self.assertIsNone(t.get("volatility_20d"))
+        self.assertIsNone(t.get("ma20"))
+        self.assertIsNone(t.get("mom20"))
+
+    def test_empty_and_bad_bars(self):
+        self.assertEqual(quant.compute_technical([])["bars"], 0)
+        self.assertEqual(quant.compute_technical([{"close": 0}])["bars"], 0)
+
+    def test_rsi_bounds(self):
+        up = quant.compute_technical(_mk_bars(10.0, 1.01, n=40))
+        self.assertGreater(up["rsi14"], 90, "单边上涨 RSI 应接近 100")
+        self.assertLessEqual(up["rsi14"], 100.0)
+        down = quant.compute_technical(_mk_bars(10.0, 0.99, n=40))
+        self.assertLess(down["rsi14"], 10)
+        self.assertGreaterEqual(down["rsi14"], 0.0)
+
+    def test_rsi_flat_is_neutral(self):
+        bars = [{"close": 10.0, "high": 10.0, "low": 10.0, "volume_lot": 100}
+                for _ in range(40)]
+        self.assertEqual(quant.compute_technical(bars)["rsi14"], 50.0)
+
+
+class TestQuantPercentiles(unittest.TestCase):
+    """百分位是打分的地基，必须精确。"""
+
+    def test_basic_ascending(self):
+        p = quant.percentiles({"a": 1, "b": 2, "c": 3}, direction=1)
+        self.assertEqual(p, {"a": 0.0, "b": 0.5, "c": 1.0})
+
+    def test_direction_flip(self):
+        p = quant.percentiles({"a": 1, "b": 2, "c": 3}, direction=-1)
+        self.assertEqual(p["a"], 1.0)
+        self.assertEqual(p["c"], 0.0)
+
+    def test_ties_get_average_rank(self):
+        """并列必须同分——否则同值股票会因排序不稳定而分数抖动。"""
+        p = quant.percentiles({"a": 1, "b": 2, "c": 2, "d": 3}, direction=1)
+        self.assertEqual(p["b"], p["c"])
+        self.assertAlmostEqual(p["b"], (1 + 2) / 2 / 3)
+
+    def test_single_element_is_full_score(self):
+        """单元素池给 1.0 而非 0：只选一只时得 0 分看着像出错。"""
+        self.assertEqual(quant.percentiles({"a": 5}, direction=1), {"a": 1.0})
+
+    def test_empty(self):
+        self.assertEqual(quant.percentiles({}, direction=1), {})
+
+
+class TestQuantRanking(unittest.TestCase):
+    """多因子打分：策略方向相反，同一批股票排序应相反。"""
+
+    def setUp(self):
+        self.rising = _mk_scored("600001", "强趋势", _mk_bars(10.0, 1.008))
+        self.flat = _mk_scored("600002", "横盘", _mk_bars(15.0, 1.0))
+        self.falling = _mk_scored("600003", "下跌", _mk_bars(20.0, 0.997))
+
+    def test_momentum_ranks_rising_first(self):
+        ranked = quant.rank_candidates(
+            [self.rising, self.flat, self.falling], quant.STRATEGIES["momentum"])
+        self.assertEqual(ranked[0].code, "600001")
+
+    def test_reversal_ranks_falling_first(self):
+        ranked = quant.rank_candidates(
+            [self.rising, self.flat, self.falling], quant.STRATEGIES["reversal"])
+        self.assertEqual(ranked[0].code, "600003")
+
+    def test_scores_within_0_100(self):
+        ranked = quant.rank_candidates(
+            [self.rising, self.flat, self.falling], quant.STRATEGIES["momentum"])
+        for c in ranked:
+            self.assertGreaterEqual(c.score, 0.0)
+            self.assertLessEqual(c.score, 100.0 + 1e-6)
+
+    def test_contributions_sum_to_score(self):
+        """贡献之和必须等于总分——这是"可核对"的硬前提。"""
+        ranked = quant.rank_candidates(
+            [self.rising, self.flat, self.falling], quant.STRATEGIES["momentum"])
+        for c in ranked:
+            if c.contributions:
+                self.assertAlmostEqual(sum(c.contributions.values()), c.score,
+                                       places=1)
+
+    def test_missing_factor_not_treated_as_best(self):
+        """缺数据（如亏损股 PE<=0）不得被当成"极度便宜"。
+
+        做法：该因子从这只票的分母里剔除。若实现成"缺失→给 0 分"，
+        它会被压到末位；若实现成"缺失→给满分"，它会窜到首位。
+        正确行为是：只按它有数据的因子打分（得分介于两者之间）。
+        """
+        rich = _mk_scored("600010", "有PE", _mk_bars(10.0, 1.004), pe=10.0)
+        poor = _mk_scored("600011", "亏损", _mk_bars(10.0, 1.004), pe=-5.0)
+        strat = quant.STRATEGIES["quality"]
+        ranked = quant.rank_candidates([rich, poor], strat)
+        by_code = {c.code: c for c in ranked}
+        self.assertIn("pe_inv", by_code["600011"].missing_factors)
+        self.assertNotIn("pe_inv", by_code["600011"].factor_pcts)
+        self.assertGreater(by_code["600011"].score, 0.0,
+                           "有其它有效因子时不应是 0 分")
+
+    def test_empty_input(self):
+        self.assertEqual(quant.rank_candidates([], quant.STRATEGIES["momentum"]), [])
+
+    def test_weight_override(self):
+        only_mom = quant.rank_candidates(
+            [self.rising, self.flat, self.falling],
+            quant.STRATEGIES["momentum"], weights={"mom20": 1.0})
+        self.assertEqual(only_mom[0].code, "600001")
+        self.assertEqual(set(only_mom[0].contributions), {"mom20"})
+
+    def test_bad_factor_value_does_not_crash(self):
+        """单只票的脏数据不应炸掉整轮选股。"""
+        bad = _mk_scored("600099", "脏数据", _mk_bars(10.0, 1.004))
+        bad.row["pe"] = "abc"           # 非数值
+        ranked = quant.rank_candidates(
+            [self.rising, bad], quant.STRATEGIES["quality"])
+        self.assertEqual(len(ranked), 2)
+
+
+class TestQuantFilters(unittest.TestCase):
+    """硬门槛：不通过的要给出人能读懂的原因。"""
+
+    def setUp(self):
+        self.strat = quant.STRATEGIES["momentum"]
+        self.scored = _mk_scored("600001", "测试", _mk_bars(10.0, 1.004))
+
+    def test_normal_passes(self):
+        ok, why = quant.passes_filters(self.scored.row, self.scored.tech, self.strat)
+        self.assertTrue(ok, why)
+
+    def test_st_rejected(self):
+        row = dict(self.scored.row, name="ST测试")
+        ok, why = quant.passes_filters(row, self.scored.tech, self.strat)
+        self.assertFalse(ok)
+        self.assertIn("ST", why)
+
+    def test_low_liquidity_rejected(self):
+        row = dict(self.scored.row, amount_yuan=1e6)
+        ok, why = quant.passes_filters(row, self.scored.tech, self.strat)
+        self.assertFalse(ok)
+        self.assertIn("成交额", why)
+
+    def test_limit_up_rejected(self):
+        """涨停不追：成交不确定。"""
+        row = dict(self.scored.row, change_pct=10.0)
+        ok, why = quant.passes_filters(row, self.scored.tech, self.strat)
+        self.assertFalse(ok)
+        self.assertIn("涨停", why)
+
+    def test_no_price_rejected(self):
+        row = dict(self.scored.row, price=0)
+        ok, why = quant.passes_filters(row, self.scored.tech, self.strat)
+        self.assertFalse(ok)
+        self.assertIn("停牌", why)
+
+    def test_insufficient_bars_rejected(self):
+        tech = quant.compute_technical(_mk_bars(10.0, 1.0, n=10))
+        ok, why = quant.passes_filters(self.scored.row, tech, self.strat)
+        self.assertFalse(ok)
+        self.assertIn("历史数据不足", why)
+
+
+class TestQuantSizing(unittest.TestCase):
+    """仓位分配：股数必须整手、不超预算、不超单票上限。"""
+
+    def setUp(self):
+        self.ranked = quant.rank_candidates(
+            [_mk_scored(f"60000{i}", f"股{i}", _mk_bars(10.0 + i, 1.004))
+             for i in range(1, 6)],
+            quant.STRATEGIES["momentum"])
+
+    def test_shares_are_whole_lots(self):
+        taken, _s, _sum = quant.size_positions(
+            self.ranked, cash=1e5, equity=3e5, cfg=quant.SizingConfig())
+        self.assertTrue(taken)
+        for a in taken:
+            self.assertEqual(a.shares % 100, 0, f"{a.code} 不是整手")
+
+    def test_never_exceeds_budget(self):
+        taken, _s, summary = quant.size_positions(
+            self.ranked, cash=1e5, equity=3e5, cfg=quant.SizingConfig())
+        spent = sum(a.amount + a.fee for a in taken)
+        self.assertLessEqual(spent, summary["budget"] + 1e-6)
+
+    def test_never_exceeds_position_cap(self):
+        cfg = quant.SizingConfig(position_cap_pct=10.0)
+        taken, _s, _sum = quant.size_positions(
+            self.ranked, cash=1e6, equity=1e6, cfg=cfg)
+        for a in taken:
+            self.assertLessEqual(a.amount, 1e6 * 0.10 + 1.0,
+                                 f"{a.code} 超出单票上限")
+
+    def test_max_positions_respected(self):
+        cfg = quant.SizingConfig(max_positions=2)
+        taken, _s, _sum = quant.size_positions(
+            self.ranked, cash=1e6, equity=1e6, cfg=cfg)
+        self.assertLessEqual(len(taken), 2)
+
+    def test_insufficient_cash_reports_reason(self):
+        """钱不够买一手 → 跳过并说明原因，不能静默消失。"""
+        expensive = quant.rank_candidates(
+            [_mk_scored("600999", "高价股", _mk_bars(5000.0, 1.004))],
+            quant.STRATEGIES["momentum"])
+        taken, skipped, _sum = quant.size_positions(
+            expensive, cash=1000, equity=1000, cfg=quant.SizingConfig())
+        self.assertEqual(taken, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("一手", skipped[0].skip_reason)
+
+    def test_cash_usage_pct(self):
+        cfg = quant.SizingConfig(cash_usage_pct=50.0)
+        _t, _s, summary = quant.size_positions(
+            self.ranked, cash=1e5, equity=1e5, cfg=cfg)
+        self.assertAlmostEqual(summary["budget"], 5e4, places=2)
+
+    def test_cash_reserve_floor(self):
+        cfg = quant.SizingConfig(cash_usage_pct=100.0, cash_reserve_yuan=20000)
+        _t, _s, summary = quant.size_positions(
+            self.ranked, cash=1e5, equity=1e5, cfg=cfg)
+        self.assertAlmostEqual(summary["budget"], 8e4, places=2)
+
+    def test_zero_cash_all_skipped(self):
+        taken, skipped, _s = quant.size_positions(
+            self.ranked, cash=0, equity=0, cfg=quant.SizingConfig())
+        self.assertEqual(taken, [])
+        self.assertEqual(len(skipped), len(self.ranked[:5]))
+
+    def test_idle_budget_is_reallocated(self):
+        """买不起一手的标的留下的预算必须回收，不能躺在账上。
+
+        回归背景：实测 8 万预算只投出 5 万、剩 3 万闲置——原因是有一只
+        高价股买不起一手，它那份预算没人接手。用户看到的是"算出该买 8 万
+        却只买了 5 万"，而原因藏在细节里，几乎没人会去算。
+        """
+        cheap = quant.Scored(code="600001", name="便宜", price=8.0,
+                             change_pct=1.0, score=90.0)
+        pricey = quant.Scored(code="600002", name="高价", price=5000.0,
+                              change_pct=1.0, score=80.0)
+        taken, skipped, summary = quant.size_positions(
+            [cheap, pricey], cash=100000, equity=1000000,
+            cfg=quant.SizingConfig(max_positions=2))
+        self.assertEqual(len(skipped), 1, "高价股应买不起一手")
+        self.assertEqual(len(taken), 1)
+        # 便宜的这只应吃到远超"一半"的预算（回收了高价股那份）
+        self.assertGreater(summary["allocated_amount"], 60000,
+                           f"预算未回收，只投出 {summary['allocated_amount']}")
+
+    def test_idle_cash_stays_within_budget(self):
+        """回收之后仍然不能超预算——上限是被反复校验的。"""
+        cheap = quant.Scored(code="600001", name="便宜", price=8.0,
+                             change_pct=1.0, score=90.0)
+        pricey = quant.Scored(code="600002", name="高价", price=5000.0,
+                              change_pct=1.0, score=80.0)
+        taken, _sk, summary = quant.size_positions(
+            [cheap, pricey], cash=100000, equity=1e9,
+            cfg=quant.SizingConfig(max_positions=2))
+        spent = sum(a.amount + a.fee for a in taken)
+        self.assertLessEqual(spent, summary["budget"] + 1e-6)
+
+    def test_stop_loss_below_price(self):
+        taken, _s, _sum = quant.size_positions(
+            self.ranked, cash=1e5, equity=3e5, cfg=quant.SizingConfig())
+        for a in taken:
+            self.assertLess(a.stop_loss, a.price)
+            self.assertGreater(a.take_profit, a.price)
+
+    def test_star_board_lot_is_200(self):
+        bars = _mk_bars(10.0, 1.004)
+        star = quant.Scored(code="688001", name="科创", price=bars[-1]["close"],
+                            change_pct=1.0,
+                            tech=quant.compute_technical(bars),
+                            row={"code": "688001", "name": "科创",
+                                 "price": bars[-1]["close"], "amount_yuan": 3e8})
+        taken, _s, _sum = quant.size_positions(
+            [star], cash=1e6, equity=1e6, cfg=quant.SizingConfig())
+        if taken:
+            self.assertEqual(taken[0].shares % 200, 0, "科创板应 200 股一手")
+
+
+class TestQuantRendering(unittest.TestCase):
+    """渲染：必须带上免责口径与"分数不是概率"。"""
+
+    def test_report_contains_shares_and_disclaimer(self):
+        ranked = quant.rank_candidates(
+            [_mk_scored("600001", "甲", _mk_bars(10.0, 1.004))],
+            quant.STRATEGIES["momentum"])
+        taken, skipped, summary = quant.size_positions(
+            ranked, cash=1e5, equity=2e5, cfg=quant.SizingConfig())
+        text = quant.format_pick_report(quant.STRATEGIES["momentum"],
+                                        taken, skipped, summary,
+                                        scanned=5000, candidates=20)
+        self.assertIn("买入清单", text)
+        self.assertIn("股", text)
+        self.assertIn("不构成投资建议", text)
+        self.assertIn("止损", text)
+
+    def test_empty_result_explains_why(self):
+        text = quant.format_pick_report(
+            quant.STRATEGIES["momentum"], [], [],
+            {"cash": 0, "budget": 0, "equity": 0,
+             "allocated_amount": 0, "allocated_fee": 0,
+             "remaining_cash": 0, "position_cap_amount": 0,
+             "position_cap_pct": 25.0, "position_count": 0,
+             "skipped_count": 0, "budget_source": "x"},
+            scanned=5000, candidates=0)
+        self.assertIn("没有产生可执行的买入计划", text)
+        self.assertIn("不构成投资建议", text)
+
+    def test_panel_without_cache_prompts_action(self):
+        import astock_quant_tool as qt
+        text = qt.render_panel(None, "momentum")
+        self.assertIn("尚未生成", text)
+        self.assertIn("面板只读缓存", text)
+
+    def test_explain_is_human_readable(self):
+        """成交额/PE 等在内部做了 log/倒数变换，展示时必须还原。"""
+        c = _mk_scored("600001", "甲", _mk_bars(10.0, 1.004), pe=10.0)
+        ranked = quant.rank_candidates([c], quant.STRATEGIES["quality"])
+        text = ranked[0].explain(5)
+        self.assertNotIn("e-", text)
+        self.assertIn("贡献", text)
+
+
+class TestQuantStrategyRegistry(unittest.TestCase):
+    """策略表自身的完整性——新增因子时最容易漏掉引用。"""
+
+    def test_three_strategies(self):
+        self.assertEqual(set(quant.STRATEGIES),
+                         {"momentum", "reversal", "quality"})
+
+    def test_all_weights_reference_known_factors(self):
+        for key, s in quant.STRATEGIES.items():
+            for f in s.weights:
+                self.assertIn(f, quant.FACTORS, f"{key} 引用了未知因子 {f}")
+            self.assertGreater(sum(s.weights.values()), 0)
+
+    def test_opposite_directions_documented(self):
+        """趋势策略看高的因子，回归策略应看低——否则两套策略是同一件事。"""
+        mom = quant.STRATEGIES["momentum"].weights
+        rev = quant.STRATEGIES["reversal"].weights
+        self.assertIn("mom20", mom)
+        self.assertNotIn("mom20", rev, "回归策略不该追动量")
+        self.assertIn("low_pos", rev)
+        self.assertNotIn("low_pos", mom)
+
+    def test_default_strategy_exists(self):
+        self.assertIn(quant.DEFAULT_STRATEGY, quant.STRATEGIES)
+
+
+class TestQuantPanelTabs(unittest.TestCase):
+    """右栏策略切换：一个策略一个 tab（宿主面板只读，这是唯一的切换方式）。"""
+
+    def setUp(self):
+        self.plugin = astock.AstockPlugin()
+
+    def test_each_strategy_has_panel(self):
+        ids = [p["id"] for p in self.plugin.contributes["panels"]]
+        for key in quant.STRATEGIES:
+            self.assertIn(f"pick-{key}", ids, f"策略 {key} 缺少面板 tab")
+
+    def test_panel_ids_unique_and_titled(self):
+        panels = self.plugin.contributes["panels"]
+        ids = [p["id"] for p in panels]
+        self.assertEqual(len(ids), len(set(ids)))
+        for p in panels:
+            self.assertTrue(p.get("title"), p["id"])
+
+    def test_panel_content_renders_for_each_strategy(self):
+        for key in quant.STRATEGIES:
+            text = self.plugin.panel_content(f"pick-{key}", {})
+            self.assertTrue(text.strip(), key)
+            self.assertIn("量化选股", text)
+
+    def test_unknown_panel_is_empty(self):
+        self.assertEqual(self.plugin.panel_content("pick-nope", {}), "")
+        self.assertEqual(self.plugin.panel_content("nope", {}), "")
+
+    def test_panel_never_scans_network(self):
+        """面板 5 秒刷新 × 30 只 K 线 = 打死接口。渲染路径必须零网络。"""
+        import astock_data as d
+        import astock_quant_tool as qt
+        called = {"n": 0}
+
+        def boom(*a, **k):
+            called["n"] += 1
+            raise AssertionError("面板渲染不应触发行情请求")
+
+        orig_screen, orig_kline = d.screen, d.fetch_klines
+        d.screen, d.fetch_klines = boom, boom
+        qt.clear_cache()
+        try:
+            for key in quant.STRATEGIES:
+                self.plugin.panel_content(f"pick-{key}", {})
+        finally:
+            d.screen, d.fetch_klines = orig_screen, orig_kline
+        self.assertEqual(called["n"], 0)
+
+
+class TestQuantSettingsAndAction(unittest.TestCase):
+    """设置页动作：按钮要可用，且"钱不够"不能报成错误。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="astock-pick-")
+        self.plugin = astock.AstockPlugin()
+
+        class _App:
+            workspace = self.tmp
+            config = {"astock-plugin": {
+                "ledger_path": os.path.join(self.tmp, "l.sqlite"),
+                "pick_strategy": "momentum",
+            }}
+
+            def save_config(self, _u):
+                pass
+
+        self.plugin._app = _App()
+
+    def test_default_strategy_read_from_config(self):
+        self.assertEqual(self.plugin._default_strategy(), "momentum")
+
+    def test_bad_strategy_falls_back(self):
+        self.plugin._app.config["astock-plugin"]["pick_strategy"] = "nonsense"
+        self.assertEqual(self.plugin._default_strategy(),
+                         quant.DEFAULT_STRATEGY)
+
+    def test_sizing_cfg_clamps_absurd_values(self):
+        cfg = self.plugin._sizing_cfg({"max_positions": 999,
+                                       "cash_usage_pct": 500})
+        self.assertLessEqual(cfg.max_positions, 20)
+        self.assertLessEqual(cfg.cash_usage_pct, 100.0)
+
+    def test_action_reports_error_gracefully(self):
+        """接口失败要给人话，不能抛栈。"""
+        import astock_quant_tool as qt
+        orig = qt.scan
+
+        def boom(*a, **k):
+            raise RuntimeError("接口炸了")
+
+        qt.scan = boom
+        try:
+            res = self.plugin.settings_action("pick_run", self.plugin._app.config)
+        finally:
+            qt.scan = orig
+        self.assertFalse(res["ok"])
+        self.assertIn("接口炸了", res["message"])
+        self.assertIn("限流", res["message"])
+
+    def test_action_reports_insufficient_cash_as_ok(self):
+        """钱不够买一手是**资金约束**，不是错误——ok 必须为 True。"""
+        import astock_quant_tool as qt
+        orig = qt.scan
+
+        def fake(strategy, **k):
+            return {"strategy": strategy, "strategy_label": "趋势动量",
+                    "allocations": [], "skipped": [
+                        quant.Allocation(code="600001", name="甲", price=5000.0,
+                                         score=50.0, skipped=True,
+                                         skip_reason="预算 100 元不足一手")],
+                    "summary": {"cash": 100.0, "budget": 80.0},
+                    "scanned": 5000, "candidates": 3}
+
+        qt.scan = fake
+        try:
+            res = self.plugin.settings_action("pick_run", self.plugin._app.config)
+        finally:
+            qt.scan = orig
+        self.assertTrue(res["ok"], res)
+        self.assertIn("资金不足", res["message"])
+
+
+# ---------------------------------------------------------------- 回测与推荐率（v1.9.0）
+
+
+def _bt_bars(trend_fn, n=300, start="2024-01-01"):
+    """构造回测用日 K（含 open/close）。trend_fn(i) 返回当日涨幅因子。"""
+    import datetime as _dt
+    bars = []
+    p = 10.0
+    d = _dt.date.fromisoformat(start)
+    for i in range(n):
+        p *= trend_fn(i)
+        d += _dt.timedelta(days=1)
+        bars.append({"date": d.isoformat(), "open": p, "close": p,
+                     "high": p * 1.01, "low": p * 0.99, "volume_lot": 10000.0})
+    return bars
+
+
+def _bt_flat_bench(n=300):
+    return [{"date": b["date"], "open": 10.0, "close": 10.0}
+            for b in _bt_bars(lambda i: 1.0, n)]
+
+
+class TestBacktestNoLookahead(unittest.TestCase):
+    """防未来函数 —— 回测可信与否的分水岭。"""
+
+    def test_early_periods_do_not_see_late_boom(self):
+        """构造「前 250 天横盘、最后 50 天暴涨」的股票。
+
+        若回测正确：早期调仓期它不该被选中（当时它还不涨），
+        早期收益应接近 0（仅扣费）。
+        若用了未来数据：早期就会选中它并赚大钱 —— 这是最常见的自欺方式。
+        """
+        boom = {"code": "A", "name": "晚涨",
+                "bars": _bt_bars(lambda i: 1.03 if i >= 250 else 1.0)}
+        flat1 = {"code": "B", "name": "横1", "bars": _bt_bars(lambda i: 1.0)}
+        flat2 = {"code": "C", "name": "横2", "bars": _bt_bars(lambda i: 1.0)}
+        cfg = backtest_mod.BacktestConfig(rebalance_days=10, top_k=1,
+                                         hold_days=10)
+        r = backtest_mod.run_backtest("momentum", [boom, flat1, flat2],
+                                      _bt_flat_bench(), cfg=cfg)
+        early = r.periods[:5]
+        self.assertTrue(early)
+        for p in early:
+            self.assertLess(p.net_return_pct, 1.0,
+                            f"第 {p.date} 期收益 {p.net_return_pct}% 异常高——"
+                            f"疑似提前用到了未来数据")
+
+    def test_late_periods_capture_the_boom(self):
+        """暴涨段应被捕捉到（否则说明因子/回测根本没生效）。"""
+        boom = {"code": "A", "name": "晚涨",
+                "bars": _bt_bars(lambda i: 1.03 if i >= 250 else 1.0)}
+        flat1 = {"code": "B", "name": "横1", "bars": _bt_bars(lambda i: 1.0)}
+        cfg = backtest_mod.BacktestConfig(rebalance_days=10, top_k=1,
+                                         hold_days=10)
+        r = backtest_mod.run_backtest("momentum", [boom, flat1],
+                                      _bt_flat_bench(), cfg=cfg)
+        self.assertGreater(max(p.net_return_pct for p in r.periods), 5.0,
+                           "暴涨段未被捕捉，因子可能失效")
+
+    def test_entry_is_next_day_open_not_signal_close(self):
+        """买入价必须是信号日**次日开盘**——当日收盘时你还没下单。"""
+        bars = _bt_bars(lambda i: 1.005)
+        r = backtest_mod.run_backtest(
+            "momentum",
+            [{"code": "A", "name": "a", "bars": bars},
+             {"code": "B", "name": "b", "bars": list(bars)}],
+            _bt_flat_bench(), cfg=backtest_mod.BacktestConfig(top_k=1))
+        for p in r.periods:
+            self.assertNotEqual(p.date, p.entry_date,
+                                "信号日与买入日相同 → 用了当日价买入")
+
+
+class TestBacktestMetrics(unittest.TestCase):
+    """指标口径：每个数字都要能被手算核对。"""
+
+    def setUp(self):
+        up = {"code": "A", "name": "涨", "bars": _bt_bars(lambda i: 1.006)}
+        down = {"code": "B", "name": "跌", "bars": _bt_bars(lambda i: 0.997)}
+        self.r = backtest_mod.run_backtest(
+            "momentum", [up, down], _bt_flat_bench(),
+            cfg=backtest_mod.BacktestConfig(rebalance_days=10, top_k=1,
+                                            hold_days=10))
+
+    def test_periods_exist(self):
+        self.assertGreater(self.r.period_count, 10)
+
+    def test_win_rate_matches_periods(self):
+        """胜率必须等于「跑赢期数 / 总期数」，不能另算一套。"""
+        beats = sum(1 for p in self.r.periods if p.beat)
+        self.assertAlmostEqual(self.r.win_rate,
+                               round(beats / self.r.period_count * 100, 1),
+                               places=1)
+
+    def test_excess_equals_net_minus_bench(self):
+        for p in self.r.periods:
+            self.assertAlmostEqual(p.excess_pct,
+                                   round(p.net_return_pct - p.benchmark_pct, 2),
+                                   places=1)
+
+    def test_beat_flag_consistent(self):
+        for p in self.r.periods:
+            self.assertEqual(p.beat, p.excess_pct > 0)
+
+    def test_costs_reduce_returns(self):
+        """扣费后收益必须低于毛收益——否则费用没扣。"""
+        for p in self.r.periods:
+            self.assertLess(p.net_return_pct, p.gross_return_pct)
+
+    def test_max_drawdown_is_non_positive(self):
+        self.assertLessEqual(self.r.max_drawdown_pct, 0.0)
+
+    def test_as_dict_serializable(self):
+        import json
+        json.dumps(self.r.as_dict(), ensure_ascii=False)
+
+    def test_insufficient_universe_raises(self):
+        with self.assertRaises(ValueError):
+            backtest_mod.run_backtest(
+                "momentum", [{"code": "A", "name": "a",
+                              "bars": _bt_bars(lambda i: 1.0, n=30)}],
+                _bt_flat_bench(), cfg=backtest_mod.BacktestConfig(top_k=3))
+
+    def test_unknown_strategy_raises(self):
+        with self.assertRaises(ValueError):
+            backtest_mod.run_backtest("nope", [], [],
+                                      cfg=backtest_mod.BacktestConfig())
+
+
+class TestRecommendationGrading(unittest.TestCase):
+    """推荐率分档：宁可说"测不准"，也不给好看的假结论。"""
+
+    def _mk(self, win_rate, samples):
+        r = backtest_mod.BacktestResult(strategy="momentum",
+                                        strategy_label="趋势动量")
+        beats = int(round((win_rate or 0) / 100.0 * samples))
+        for i in range(samples):
+            r.periods.append(backtest_mod.PeriodResult(
+                date=f"2024-01-{i + 1:02d}", entry_date=f"2024-02-{i + 1:02d}",
+                picks=["A"], names=["甲"], gross_return_pct=1.0,
+                net_return_pct=1.0, benchmark_pct=0.0,
+                excess_pct=(0.5 if i < beats else -0.5),
+                beat=i < beats))
+        return r
+
+    def test_high_win_rate_with_enough_samples_is_a(self):
+        rec = backtest_mod.grade_recommendation(self._mk(70.0, 20))
+        self.assertEqual(rec.grade, "A")
+        self.assertEqual(rec.label, "推荐")
+
+    def test_mid_win_rate_is_b(self):
+        rec = backtest_mod.grade_recommendation(self._mk(55.0, 20))
+        self.assertEqual(rec.grade, "B")
+
+    def test_low_win_rate_is_c_not_a(self):
+        rec = backtest_mod.grade_recommendation(self._mk(40.0, 20))
+        self.assertEqual(rec.grade, "C")
+
+    def test_bad_win_rate_is_d(self):
+        rec = backtest_mod.grade_recommendation(self._mk(20.0, 20))
+        self.assertEqual(rec.grade, "D")
+
+    def test_few_samples_never_gets_a_grade(self):
+        """样本极少时哪怕胜率 100% 也不能给 A —— 2 期样本毫无统计意义。
+
+        这是本功能最重要的防误导规则：不做这个降级，
+        用户会看到「胜率 100% · 推荐」然后重仓。
+        """
+        rec = backtest_mod.grade_recommendation(self._mk(100.0, 3))
+        self.assertEqual(rec.grade, "D")
+        self.assertEqual(rec.label, "样本不足")
+        self.assertIn("不足以支撑", rec.reason)
+
+    def test_confidence_scales_with_samples(self):
+        self.assertEqual(
+            backtest_mod.grade_recommendation(self._mk(60.0, 30)).confidence,
+            "较充分")
+        # 阈值定义：>=24 较充分 / >=12 一般 / >=5 偏少 / 其余过少
+        self.assertEqual(
+            backtest_mod.grade_recommendation(self._mk(60.0, 12)).confidence,
+            "一般")
+        self.assertEqual(
+            backtest_mod.grade_recommendation(self._mk(60.0, 5)).confidence,
+            "偏少")
+        self.assertEqual(
+            backtest_mod.grade_recommendation(self._mk(60.0, 2)).confidence,
+            "过少")
+
+    def test_no_samples_returns_d(self):
+        r = backtest_mod.BacktestResult(strategy="momentum", strategy_label="x")
+        rec = backtest_mod.grade_recommendation(r)
+        self.assertEqual(rec.grade, "D")
+        self.assertIsNone(rec.win_rate)
+
+    def test_caveats_always_mention_survivorship(self):
+        """幸存者偏差必须每次都提——它是最大的系统性高估来源。"""
+        rec = backtest_mod.grade_recommendation(self._mk(70.0, 20))
+        self.assertTrue(any("幸存者偏差" in c for c in rec.caveats))
+
+    def test_incomplete_strategy_flagged(self):
+        r = self._mk(70.0, 20)
+        r.unavailable_factors = ["pe_inv", "pb_inv"]
+        rec = backtest_mod.grade_recommendation(r)
+        self.assertFalse(r.complete)
+        self.assertTrue(any("不完整" in c for c in rec.caveats))
+
+
+class TestBacktestRendering(unittest.TestCase):
+    """渲染：结论先说、限制必写、措辞不能把策略胜率说成个股概率。"""
+
+    def setUp(self):
+        up = {"code": "A", "name": "涨", "bars": _bt_bars(lambda i: 1.006)}
+        mid = {"code": "B", "name": "平", "bars": _bt_bars(lambda i: 1.0005)}
+        self.r = backtest_mod.run_backtest(
+            "momentum", [up, mid], _bt_flat_bench(),
+            cfg=backtest_mod.BacktestConfig(rebalance_days=10, top_k=1))
+        self.rec = backtest_mod.grade_recommendation(self.r)
+
+    def test_report_has_win_rate_and_drawdown(self):
+        text = backtest_mod.render_backtest(self.r, self.rec)
+        self.assertIn("推荐率", text)
+        self.assertIn("最大回撤", text)
+        self.assertIn("样本", text)
+
+    def test_report_mentions_survivorship(self):
+        text = backtest_mod.render_backtest(self.r, self.rec)
+        self.assertIn("幸存者偏差", text)
+
+    def test_report_explains_it_is_strategy_not_stock(self):
+        text = backtest_mod.render_backtest(self.r, self.rec)
+        self.assertIn("不是", text)
+        self.assertIn("策略", text)
+
+    def test_detail_periods_rendered(self):
+        text = backtest_mod.render_backtest(self.r, self.rec, detail_periods=3)
+        self.assertIn("逐期明细", text)
+
+
+class TestBacktestPanelCards(unittest.TestCase):
+    """右栏卡片看板（需求：像炒股软件那样）。"""
+
+    def _picks(self):
+        return [quant.Allocation(code="600001", name="甲", price=10.0,
+                                 score=80.0, shares=1000, amount=10000.0,
+                                 fee=5.0, stop_loss=9.2, take_profit=11.5,
+                                 weight_pct=10.0)]
+
+    def test_cards_are_valid_json_lite_tree(self):
+        import json
+        rec = backtest_mod.grade_recommendation(
+            backtest_mod.BacktestResult(strategy="momentum",
+                                        strategy_label="趋势动量"))
+        raw = backtest_tool.build_recommendation_cards(
+            self._picks(), None, "趋势动量")
+        payload = json.loads(raw)
+        self.assertEqual(payload["type"], "lite-tree")
+        self.assertEqual(payload["total"], 1)
+        card = payload["trees"][0]
+        self.assertIn("甲", card["title"])
+        self.assertIn("1000 股", card["context"])
+        self.assertTrue(card["options"])
+
+    def test_win_rate_rendered_as_progress(self):
+        """推荐率必须进 prob 通道（宿主唯一会渲染成进度条的字段）。"""
+        import json
+        r = backtest_mod.BacktestResult(strategy="momentum",
+                                        strategy_label="趋势动量")
+        for i in range(20):
+            r.periods.append(backtest_mod.PeriodResult(
+                date=f"2024-01-{i + 1:02d}", entry_date="2024-02-01",
+                picks=["A"], names=["甲"], gross_return_pct=1.0,
+                net_return_pct=1.0, benchmark_pct=0.0,
+                excess_pct=(0.5 if i < 13 else -0.5), beat=i < 13))
+        rec = backtest_mod.grade_recommendation(r)
+        payload = json.loads(backtest_tool.build_recommendation_cards(
+            self._picks(), rec, "趋势动量"))
+        probs = [o["prob"] for o in payload["trees"][0]["options"]]
+        self.assertTrue(any(abs(p - 0.65) < 0.02 for p in probs),
+                        f"推荐率未体现在进度条上: {probs}")
+
+    def test_status_carries_grade(self):
+        import json
+        r = backtest_mod.BacktestResult(strategy="momentum",
+                                        strategy_label="趋势动量")
+        for i in range(20):
+            r.periods.append(backtest_mod.PeriodResult(
+                date=f"2024-01-{i + 1:02d}", entry_date="2024-02-01",
+                picks=["A"], names=["甲"], gross_return_pct=1.0,
+                net_return_pct=1.0, benchmark_pct=0.0,
+                excess_pct=(0.5 if i < 15 else -0.5), beat=i < 15))
+        rec = backtest_mod.grade_recommendation(r)
+        payload = json.loads(backtest_tool.build_recommendation_cards(
+            self._picks(), rec, "趋势动量"))
+        self.assertTrue(payload["status"]["chips"])
+
+
+class TestBacktestSurface(unittest.TestCase):
+    """工具与设置面：声明与实际一致。"""
+
+    def setUp(self):
+        self.plugin = astock.AstockPlugin()
+
+    def test_backtest_tool_registered(self):
+        names = {t.name for t in self.plugin.get_tools()}
+        self.assertIn("astock_backtest", names)
+
+    def test_settings_keys_exist(self):
+        keys = {s["key"] for s in self.plugin.contributes["settings"]}
+        for k in ("pick_panel_style", "backtest_run", "backtest_auto_grade"):
+            self.assertIn(k, keys)
+
+    def test_backtest_command_exists(self):
+        cmds = {c["name"] for c in self.plugin.contributes["commands"]}
+        self.assertIn("astock-backtest", cmds)
+
+    def test_unknown_strategy_reports_error(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            out = loop.run_until_complete(
+                self.plugin.execute("astock_backtest", {"strategy": "nope"}))
+        finally:
+            loop.close()
+        self.assertIn("未知策略", out)
+
+
+# ---------------------------------------------------------------- 本地存档（v2.0.0）
+
+
+class ArchiveTestBase(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="astock-arc-")
+        self.arc = archive_mod.Archive(os.path.join(self.tmp, "arc.sqlite"))
+
+    @staticmethod
+    def _bars(prefix="2024-01-", n=5, base=10.0):
+        return [{"date": f"{prefix}{i:02d}", "open": base + i,
+                 "close": base + i + 0.5, "high": base + i + 1,
+                 "low": base + i - 1, "volume_lot": 1000,
+                 "amount_yuan": 1e7} for i in range(1, n + 1)]
+
+
+class TestArchiveRawPriority(ArchiveTestBase):
+    """不复权优先 —— 存档可信度的地基。"""
+
+    def test_save_and_load(self):
+        info = self.arc.save_bars("600000", self._bars(), adjust="raw")
+        self.assertEqual(info["saved"], 5)
+        bars = self.arc.load_bars("600000", adjust="raw")
+        self.assertEqual(len(bars), 5)
+        self.assertEqual(bars[0]["date"], "2024-01-01")
+
+
+
+    def test_qfq_does_not_affect_raw(self):
+        """两个口径**各自独立**：写 qfq 不得改变 raw 的值。
+
+        回归背景：前复权价会随每次分红重算整段历史。若 qfq 能覆盖 raw，
+        存档里同一天的价格会随分红变动，跨期拼接后自相矛盾——
+        而且数据看着还是「有」，属于最难发现的静默错误。
+        """
+        self.arc.save_bars("600000", self._bars(base=10.0), adjust="raw")
+        self.arc.save_bars("600000", self._bars(base=99.0), adjust="qfq")
+        raw = self.arc.load_bars("600000", adjust="raw")
+        qfq = self.arc.load_bars("600000", adjust="qfq")
+        self.assertEqual(raw[0]["close"], 11.5, "raw 被 qfq 污染了")
+        self.assertEqual(qfq[0]["close"], 100.5, "qfq 应独立保存")
+        self.assertEqual(len(raw), 5)
+        self.assertEqual(len(qfq), 5)
+
+    def test_raw_and_qfq_coexist_per_date(self):
+        """同一日期两个口径并存：这是主键设计的意图，不是 bug。"""
+        self.arc.save_bars("600000", self._bars(n=3, base=10.0), adjust="raw")
+        self.arc.save_bars("600000", self._bars(n=3, base=99.0), adjust="qfq")
+        self.assertEqual(len(self.arc.load_bars("600000", adjust="raw")), 3)
+        self.assertEqual(len(self.arc.load_bars("600000", adjust="qfq")), 3)
+
+
+
+    def test_raw_write_after_qfq_is_independent(self):
+        """先存 qfq、后存 raw → raw 是独立一份，不受 qfq 影响。"""
+        self.arc.save_bars("600000", self._bars(base=99.0), adjust="qfq")
+        self.arc.save_bars("600000", self._bars(base=10.0), adjust="raw")
+        raw = self.arc.load_bars("600000", adjust="raw")
+        self.assertEqual(raw[0]["close"], 11.5)
+        qfq = self.arc.load_bars("600000", adjust="qfq")
+        self.assertEqual(qfq[0]["close"], 100.5)
+
+    def test_same_adjust_is_idempotent(self):
+        """同口径重复写入应幂等（不产生重复行）。"""
+        self.arc.save_bars("600000", self._bars(), adjust="raw")
+        self.arc.save_bars("600000", self._bars(), adjust="raw")
+        self.assertEqual(len(self.arc.load_bars("600000", adjust="raw")), 5)
+
+    def test_bad_rows_skipped(self):
+        bad = [{"date": "", "close": 10}, {"date": "2024-01-02", "close": 0},
+               {"date": "2024-01-03"}] + self._bars(n=2)
+        info = self.arc.save_bars("600000", bad, adjust="raw")
+        self.assertEqual(info["saved"], 2)
+
+    def test_adjust_isolation(self):
+        """两个口径各自独立，条数互不影响。"""
+        self.arc.save_bars("600000", self._bars(n=3), adjust="raw")
+        self.arc.save_bars("600000", self._bars(n=5, base=50), adjust="qfq")
+        self.assertEqual(len(self.arc.load_bars("600000", adjust="raw")), 3)
+        self.assertEqual(len(self.arc.load_bars("600000", adjust="qfq")), 5)
+
+
+class TestArchiveQuery(ArchiveTestBase):
+    def test_date_range_filter(self):
+        self.arc.save_bars("600000", self._bars(n=10), adjust="raw")
+        got = self.arc.load_bars("600000", start="2024-01-03",
+                                 end="2024-01-05", adjust="raw")
+        self.assertEqual([b["date"] for b in got],
+                         ["2024-01-03", "2024-01-04", "2024-01-05"])
+
+    def test_limit_returns_latest_in_ascending_order(self):
+        """limit 取**最近** N 根，但返回仍应升序（调用方按时间正序用）。"""
+        self.arc.save_bars("600000", self._bars(n=10), adjust="raw")
+        got = self.arc.load_bars("600000", limit=3, adjust="raw")
+        self.assertEqual([b["date"] for b in got],
+                         ["2024-01-08", "2024-01-09", "2024-01-10"])
+
+    def test_stats(self):
+        self.arc.save_bars("600000", self._bars(n=5), adjust="raw")
+        self.arc.save_bars("000001", self._bars(n=3), adjust="raw")
+        st = self.arc.stats()
+        self.assertEqual(st["codes"], 2)
+        self.assertEqual(st["bars"], 8)
+        self.assertTrue(st["first_date"])
+        self.assertIn("B", st["size_human"])
+
+    def test_empty_stats(self):
+        st = self.arc.stats()
+        self.assertEqual(st["codes"], 0)
+        self.assertEqual(st["bars"], 0)
+
+    def test_coverage(self):
+        self.arc.save_bars("600000", self._bars(n=5), adjust="raw")
+        cov = self.arc.coverage(["600000", "999999"])
+        self.assertEqual(cov["600000"]["bar_count"], 5)
+        self.assertEqual(cov["999999"]["bar_count"], 0)
+
+
+class TestArchivePrune(ArchiveTestBase):
+    def test_refuses_to_wipe_everything(self):
+        """无条件的 prune 必须拒绝——几年存档不能被误点清空。"""
+        self.arc.save_bars("600000", self._bars(), adjust="raw")
+        with self.assertRaises(ValueError):
+            self.arc.prune()
+        self.assertEqual(len(self.arc.load_bars("600000")), 5)
+
+    def test_prune_by_date(self):
+        self.arc.save_bars("600000", self._bars(n=10), adjust="raw")
+        res = self.arc.prune(before="2024-01-06")
+        self.assertEqual(res["deleted"], 5)
+        self.assertEqual(len(self.arc.load_bars("600000")), 5)
+
+    def test_prune_by_code(self):
+        self.arc.save_bars("600000", self._bars(), adjust="raw")
+        self.arc.save_bars("000001", self._bars(), adjust="raw")
+        self.arc.prune(codes=["600000"])
+        self.assertEqual(len(self.arc.load_bars("600000")), 0)
+        self.assertEqual(len(self.arc.load_bars("000001")), 5)
+
+
+class TestArchiveMerge(unittest.TestCase):
+    """存档与在线数据的合并：按日期去重、存档优先。"""
+
+    def test_merged_prefers_archive(self):
+        archived = [{"date": "2024-01-01", "close": 10.0}]
+        online = [{"date": "2024-01-01", "close": 99.0},
+                  {"date": "2024-01-02", "close": 11.0}]
+        merged = archive_mod.merged_bars_dicts(archived, online)
+        self.assertEqual(len(merged), 2, "同一天不应出现两行")
+        self.assertEqual(merged[0]["close"], 10.0, "存档应优先")
+
+    def test_merged_sorted(self):
+        archived = [{"date": "2024-01-03", "close": 1.0}]
+        online = [{"date": "2024-01-01", "close": 2.0},
+                  {"date": "2024-01-02", "close": 3.0}]
+        dates = [b["date"] for b in
+                 archive_mod.merged_bars_dicts(archived, online)]
+        self.assertEqual(dates, ["2024-01-01", "2024-01-02", "2024-01-03"])
+
+    def test_merged_handles_empty(self):
+        self.assertEqual(archive_mod.merged_bars_dicts([], []), [])
+        one = [{"date": "2024-01-01", "close": 1.0}]
+        self.assertEqual(len(archive_mod.merged_bars_dicts(one, [])), 1)
+        self.assertEqual(len(archive_mod.merged_bars_dicts([], one)), 1)
+
+
+class TestArchiveUpdate(ArchiveTestBase):
+    def test_update_collects_failures_without_aborting(self):
+        """单只失败不应中断整批（接口限流是常态）。"""
+        def fetch(code, _adj, _lim):
+            if code == "BAD":
+                raise RuntimeError("模拟接口失败")
+            return self._bars()
+
+        res = archive_mod.update_from_provider(
+            self.arc, ["600000", "BAD", "000001"], fetch)
+        self.assertEqual(len(res["updated"]), 2)
+        self.assertEqual(len(res["failed"]), 1)
+        self.assertEqual(res["failed"][0]["code"], "BAD")
+
+    def test_update_empty_result_is_failure(self):
+        res = archive_mod.update_from_provider(
+            self.arc, ["600000"], lambda c, a, l: [])
+        self.assertEqual(len(res["failed"]), 1)
+
+    def test_update_writes_raw_only(self):
+        archive_mod.update_from_provider(
+            self.arc, ["600000"], lambda c, a, l: self._bars(), adjust="raw")
+        self.assertEqual(len(self.arc.load_bars("600000", adjust="raw")), 5)
+        self.assertEqual(len(self.arc.load_bars("600000", adjust="qfq")), 0)
+
+
+class TestArchiveSurface(unittest.TestCase):
+    def setUp(self):
+        self.plugin = astock.AstockPlugin()
+
+    def test_tool_registered(self):
+        names = {t.name for t in self.plugin.get_tools()}
+        self.assertIn("astock_archive", names)
+
+    def test_settings_keys(self):
+        keys = {s["key"] for s in self.plugin.contributes["settings"]}
+        for k in ("archive_path", "archive_auto_update", "archive_run"):
+            self.assertIn(k, keys)
+
+    def test_archive_path_follows_ledger_dir(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="astock-arcpath-")
+
+        class _App:
+            workspace = tmp
+            config = {"astock-plugin": {
+                "ledger_path": os.path.join(tmp, "l.sqlite")}}
+
+            def save_config(self, _u):
+                pass
+
+        self.plugin._app = _App()
+        path = self.plugin._archive_path()
+        self.assertEqual(os.path.dirname(path), tmp)
+        self.assertTrue(path.endswith("archive.sqlite"))
+
+    def test_custom_archive_path_respected(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="astock-arcpath2-")
+        target = os.path.join(tmp, "custom", "a.sqlite")
+
+        class _App:
+            workspace = tmp
+            config = {"astock-plugin": {"archive_path": target}}
+
+            def save_config(self, _u):
+                pass
+
+        self.plugin._app = _App()
+        self.assertEqual(self.plugin._archive_path(), os.path.abspath(target))
+
+
+class TestArchiveBrandNew(unittest.TestCase):
+    """全新存档的冷启动：不该崩，且状态要说清"还没有数据"。"""
+
+    def test_status_on_empty_archive(self):
+        import asyncio
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="astock-arcnew-")
+        plugin = astock.AstockPlugin()
+
+        class _App:
+            workspace = tmp
+            config = {"astock-plugin": {
+                "ledger_path": os.path.join(tmp, "l.sqlite"),
+                "archive_path": os.path.join(tmp, "a.sqlite")}}
+
+            def save_config(self, _u):
+                pass
+
+        plugin._app = _App()
+        loop = asyncio.new_event_loop()
+        try:
+            out = loop.run_until_complete(
+                plugin.execute("astock_archive", {"action": "status"}))
+        finally:
+            loop.close()
+        self.assertIn("存档", out)
+        self.assertIn("存档为空", out)
+
+    def test_prune_without_args_is_rejected(self):
+        import asyncio
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="astock-arcnew2-")
+        plugin = astock.AstockPlugin()
+
+        class _App:
+            workspace = tmp
+            config = {"astock-plugin": {
+                "ledger_path": os.path.join(tmp, "l.sqlite"),
+                "archive_path": os.path.join(tmp, "a.sqlite")}}
+
+            def save_config(self, _u):
+                pass
+
+        plugin._app = _App()
+        loop = asyncio.new_event_loop()
+        try:
+            out = loop.run_until_complete(
+                plugin.execute("astock_archive", {"action": "prune"}))
+        finally:
+            loop.close()
+        self.assertIn("必须指定", out)
+
+
+# ---------------------------------------------------------------- 操作指示（v2.0.0）
+
+
+class _Cfg:
+    stop_loss_pct = 8.0
+    take_profit_pct = 15.0
+    position_cap_pct = 25.0
+
+
+class _Alloc:
+    """测试用 Allocation 替身（避免依赖 quant 内部字段）。"""
+
+    def __init__(self, code, name, price, shares, score=60.0,
+                 amount=10000.0, fee=5.0, stop_loss=8.0, take_profit=11.0,
+                 skipped=False, weight_pct=10.0):
+        self.code, self.name, self.price, self.shares = code, name, price, shares
+        self.score, self.amount, self.fee = score, amount, fee
+        self.stop_loss, self.take_profit = stop_loss, take_profit
+        self.skipped, self.weight_pct = skipped, weight_pct
+
+
+class TestActionSells(unittest.TestCase):
+    """卖出判定：只依据明确规则，且必须尊重 T+1。"""
+
+    def _pos(self, code="600000", shares=2000, avail=2000, cost=10.0):
+        return {"code": code, "name": code, "shares": shares,
+                "available_today": avail, "cost_price": cost}
+
+    def test_stop_loss_triggers_full_sell(self):
+        pos = [self._pos(cost=10.0)]
+        quotes = {"600000": {"price": 9.0}}      # -10% 破 -8% 止损线
+        sells = astock_actions.decide_sells(pos, quotes, [], _Cfg())
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0].shares, 2000)
+        self.assertEqual(sells[0].urgency, "urgent")
+
+    def test_take_profit_sells_half(self):
+        pos = [self._pos(cost=10.0)]
+        quotes = {"600000": {"price": 12.0}}     # +20% 过 +15% 止盈线
+        sells = astock_actions.decide_sells(pos, quotes, [], _Cfg())
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0].shares, 1000, "应减半锁利")
+
+    def test_t1_locked_never_sells_more_than_available(self):
+        """T+1 锁定的股份不能出现在卖出指示里——那是废单。"""
+        pos = [self._pos(shares=2000, avail=0, cost=10.0)]
+        quotes = {"600000": {"price": 8.0}}      # 触发止损
+        sells = astock_actions.decide_sells(pos, quotes, [], _Cfg())
+        self.assertEqual(sells, [], "今日可卖为 0 时不该给卖出指示")
+
+    def test_partial_t1_limited(self):
+        pos = [self._pos(shares=2000, avail=600, cost=10.0)]
+        quotes = {"600000": {"price": 8.0}}
+        sells = astock_actions.decide_sells(pos, quotes, [], _Cfg())
+        self.assertEqual(len(sells), 1)
+        self.assertLessEqual(sells[0].shares, 600)
+
+    def test_no_trigger_no_sell(self):
+        pos = [self._pos(cost=10.0)]
+        quotes = {"600000": {"price": 10.2}}     # 小幅浮盈，不触发任何规则
+        sells = astock_actions.decide_sells(pos, quotes, ["600000"], _Cfg())
+        self.assertEqual(sells, [])
+
+    def test_switch_out_when_not_picked_and_losing(self):
+        """不在选股名单 + 浮亏 → 建议换仓（腾资金给更好的标的）。"""
+        pos = [self._pos(cost=10.0)]
+        quotes = {"600000": {"price": 9.7}}      # -3%，未到止损线
+        sells = astock_actions.decide_sells(pos, quotes, ["600519"], _Cfg())
+        self.assertEqual(len(sells), 1)
+        self.assertIn("换仓", sells[0].reason)
+
+    def test_picked_and_losing_is_held(self):
+        """在选股名单里即使浮亏也不换仓（策略仍然看好它）。"""
+        pos = [self._pos(cost=10.0)]
+        quotes = {"600000": {"price": 9.7}}
+        sells = astock_actions.decide_sells(pos, quotes, ["600000"], _Cfg())
+        self.assertEqual(sells, [])
+
+    def test_position_cap_reduces(self):
+        pos = [self._pos(shares=10000, cost=10.0)]
+        quotes = {"600000": {"price": 10.0}}
+        sells = astock_actions.decide_sells(
+            pos, quotes, ["600000"], _Cfg(), total_market_value=200000.0)
+        self.assertTrue(sells)
+        self.assertIn("超上限", sells[0].reason)
+
+    def test_zero_price_skipped(self):
+        pos = [self._pos()]
+        sells = astock_actions.decide_sells(pos, {"600000": {"price": 0}}, [], _Cfg())
+        self.assertEqual(sells, [])
+
+    def test_missing_quote_skipped(self):
+        sells = astock_actions.decide_sells([self._pos()], {}, [], _Cfg())
+        self.assertEqual(sells, [])
+
+
+class TestActionPlan(unittest.TestCase):
+    """资金闭环：cash_after 必须等于 现金 + 卖出净额 - 买入成本。"""
+
+    def _pos(self, code="600000", shares=2000, avail=2000, cost=10.0):
+        return {"code": code, "name": code, "shares": shares,
+                "available_today": avail, "cost_price": cost}
+
+    def test_cash_identity_holds(self):
+        pos = [self._pos(cost=10.0)]
+        quotes = {"600000": {"price": 8.0}}     # 止损
+        plan = astock_actions.build_action_plan(
+            pos, quotes, [_Alloc("600519", "甲", 100.0, 100, amount=10000.0)],
+            cash=5000.0, cfg=_Cfg())
+        expect = plan.cash_before + plan.sell_proceeds - plan.buy_cost
+        self.assertAlmostEqual(plan.cash_after, expect, places=2)
+
+    def test_sell_before_buy_note_added(self):
+        pos = [self._pos(cost=10.0)]
+        quotes = {"600000": {"price": 8.0}}
+        plan = astock_actions.build_action_plan(
+            pos, quotes, [_Alloc("600519", "甲", 100.0, 100)], cash=1000.0,
+            cfg=_Cfg())
+        self.assertTrue(any("先卖出、再买入" in n for n in plan.notes))
+
+    def test_insufficient_funds_flagged(self):
+        """买入额超过「现金+卖出」时必须明确告警，不能默默放过。"""
+        plan = astock_actions.build_action_plan(
+            [], {}, [_Alloc("600519", "甲", 100.0, 1000, amount=100000.0)],
+            cash=1000.0, cfg=_Cfg())
+        self.assertTrue(plan.blocked)
+        self.assertIn("超过可用资金", " ".join(plan.notes))
+
+    def test_nothing_to_do(self):
+        plan = astock_actions.build_action_plan([], {}, [], cash=1000.0,
+                                               cfg=_Cfg())
+        self.assertTrue(plan.blocked)
+        self.assertEqual(plan.sells, [])
+        self.assertEqual(plan.buys, [])
+
+    def test_t1_lock_noted(self):
+        pos = [{"code": "600000", "name": "甲", "shares": 1000,
+                "available_today": 0, "cost_price": 10.0}]
+        plan = astock_actions.build_action_plan(
+            pos, {"600000": {"price": 11.0}}, [], cash=1000.0, cfg=_Cfg())
+        self.assertTrue(any("T+1" in n for n in plan.notes))
+
+    def test_never_claims_to_trade(self):
+        """红线：输出必须明确"不连接券商、不下单"。"""
+        plan = astock_actions.build_action_plan(
+            [], {"600000": {"price": 10.0}},
+            [_Alloc("600519", "甲", 100.0, 100)], cash=50000.0, cfg=_Cfg())
+        text = astock_actions.render_action_plan(plan)
+        self.assertIn("不连接", text)
+        self.assertIn("不下单", text)
+
+    def test_skipped_allocation_excluded(self):
+        plan = astock_actions.build_action_plan(
+            [], {}, [_Alloc("600519", "甲", 100.0, 0, skipped=True)],
+            cash=50000.0, cfg=_Cfg())
+        self.assertEqual(plan.buys, [])
+
+    def test_render_has_two_steps(self):
+        pos = [{"code": "600000", "name": "甲", "shares": 2000,
+                "available_today": 2000, "cost_price": 10.0}]
+        plan = astock_actions.build_action_plan(
+            pos, {"600000": {"price": 8.0}},
+            [_Alloc("600519", "乙", 100.0, 100)], cash=50000.0, cfg=_Cfg())
+        text = astock_actions.render_action_plan(plan)
+        self.assertIn("第一步：卖出", text)
+        self.assertIn("第二步：买入", text)
+
+
+class TestActionSurface(unittest.TestCase):
+    def setUp(self):
+        self.plugin = astock.AstockPlugin()
+
+    def test_tool_registered(self):
+        names = {t.name for t in self.plugin.get_tools()}
+        self.assertIn("astock_act", names)
+
+    def test_command_registered(self):
+        cmds = {c["name"] for c in self.plugin.contributes["commands"]}
+        self.assertIn("astock-act", cmds)
+
+    def test_all_tools_declared_in_manifest(self):
+        import json
+        with open(os.path.join(_HERE, "..", "..", "manifest.json"),
+                  encoding="utf-8") as f:
+            man = json.load(f)
+        entry = [p for p in man["plugins"] if p["name"] == "astock-plugin"][0]
+        declared = set(entry["tools"])
+        actual = {t.name for t in self.plugin.get_tools()}
+        self.assertEqual(declared, actual,
+                         "manifest 与实际工具面不一致（CI 会因此报错）")
 
 
 if __name__ == "__main__":

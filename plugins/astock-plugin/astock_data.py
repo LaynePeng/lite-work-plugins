@@ -475,11 +475,69 @@ class Bar:
         return out
 
 
+#: 东财 K 线（备用源）。腾讯 web.ifzq 被限流时会 501（实测高发，尤其批量
+#: 回测时连发几十次），没有备用源就等于 K 线与回测全部不可用。
+EM_KLINE = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+#: 东财 klt 周期映射（分钟线 1/5/15/30/60，日/周/月 101/102/103）
+_EM_KLT = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "60m": "60",
+           "day": "101", "week": "102", "month": "103"}
+#: 东财 fqt：0 不复权 / 1 前复权 / 2 后复权
+_EM_FQT = {"none": "0", "qfq": "1", "hfq": "2"}
+
+
+def _em_secid(code: str, venue: str) -> str:
+    """东财 secid：沪市 1.xxxxxx / 深市与北交所 0.xxxxxx。"""
+    return f"{'1' if venue == 'sh' else '0'}.{code}"
+
+
+def _fetch_klines_em(code: str, venue: str, period: str, limit: int,
+                     adjust: str) -> List[Bar]:
+    """东财 K 线备用源。
+
+    与腾讯的**字段口径差异**（写在这里防止以后改错）：
+      · 东财 klines 每条是逗号分隔字符串：日期,开,收,高,低,成交量(手),成交额(元)
+        —— 注意是「开,收」不是「开,收,高」的顺序习惯，第 3 位是收盘价；
+      · 成交额直接给出，比腾讯（只有量）更完整，因此顺序也是 开收高低。
+    """
+    klt = _EM_KLT.get(period)
+    if not klt:
+        return []
+    fqt = _EM_FQT.get((adjust or "qfq").lower(), "1")
+    params = urllib.parse.urlencode({
+        "secid": _em_secid(code, venue),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        "klt": klt, "fqt": fqt, "end": "20500101", "lmt": str(limit),
+    })
+    data = _http_get_json(f"{EM_KLINE}?{params}", headers=_EM_HEADERS)
+    rows = ((data or {}).get("data") or {}).get("klines") or []
+    out: List[Bar] = []
+    for raw in rows:
+        parts = str(raw).split(",")
+        if len(parts) < 6:
+            continue
+        # 顺序：date, open, close, high, low, volume(手), amount(元)
+        out.append(Bar(
+            date=str(parts[0]),
+            open=to_float(parts[1], 0.0) or 0.0,
+            close=to_float(parts[2], 0.0) or 0.0,
+            high=to_float(parts[3], 0.0) or 0.0,
+            low=to_float(parts[4], 0.0) or 0.0,
+            volume_lot=to_float(parts[5], 0.0) or 0.0,
+            amount=to_float(parts[6], None) if len(parts) > 6 else None,
+        ))
+    return out
+
+
 def fetch_klines(raw_code: str, period: str = "day", limit: int = 120,
                  adjust: str = "qfq", kind: str = "stock") -> List[Bar]:
     """取 K 线（前复权默认）。period: day/week/month/5m/15m/30m/60m。
 
     分钟线只支持近期（腾讯接口约 320 根上限），且不复权。
+
+    **双源**：腾讯为主、东财为备。腾讯 web.ifzq 在批量请求下会返回 501
+    （实测：跑一轮回测连发 25 次就被掐），没有备用源等于 K 线与回测全废。
+    备用源同时补齐成交额（腾讯日 K 不含 amount）。
     """
     code, venue = normalize_code(raw_code, kind)
     limit = max(1, min(int(limit or 120), 640))
@@ -489,6 +547,35 @@ def fetch_klines(raw_code: str, period: str = "day", limit: int = 120,
     if cached is not None:
         return cached
 
+    bars: List[Bar] = []
+    primary_error: Optional[Exception] = None
+    try:
+        bars = _fetch_klines_tencent(code, venue, period, limit, adjust)
+    except Exception as exc:        # 501/超时/解析失败 → 走备用源
+        primary_error = exc
+        logger.warning("[astock] 腾讯 K 线失败，改用东财备用源 %s: %s",
+                       code, exc)
+    if not bars:
+        try:
+            bars = _fetch_klines_em(code, venue, period, limit, adjust)
+        except Exception as exc:
+            logger.warning("[astock] 东财 K 线也失败 %s: %s", code, exc)
+            if primary_error is not None:
+                raise DataError(
+                    f"{code} K 线获取失败（腾讯与东财都不通：{primary_error}）"
+                    f"，通常是接口限流，等 30 秒再试") from exc
+            raise
+    if not bars:
+        raise DataError(f"{code} 未返回 {period} K 线数据（代码可能不存在，"
+                        f"或该周期无历史数据）")
+    bars.sort(key=lambda b: b.date)
+    _CACHE.set(cache_key, bars)
+    return bars
+
+
+def _fetch_klines_tencent(code: str, venue: str, period: str, limit: int,
+                          adjust: str) -> List[Bar]:
+    """腾讯 K 线（主源）。"""
     sym = tencent_symbol(code, venue)
     bars: List[Bar] = []
     if period in _MINUTE_PERIODS:
@@ -506,30 +593,24 @@ def fetch_klines(raw_code: str, period: str = "day", limit: int = 120,
                             high=to_float(r[3], 0.0) or 0.0,
                             low=to_float(r[4], 0.0) or 0.0,
                             volume_lot=to_float(r[5], 0.0) or 0.0))
-    else:
-        api_period, adj_key, plain_key = _PERIODS.get(
-            period, _PERIODS["day"])
-        adj = _ADJUST.get((adjust or "qfq").lower(), "qfq")
-        param = f"{sym},{api_period},,,{limit},{adj}" if adj else \
-            f"{sym},{api_period},,,{limit}"
-        url = f"{TENCENT_KLINE}?param={param}"
-        data = _http_get_json(url)
-        node = ((data or {}).get("data") or {}).get(sym) or {}
-        rows = node.get(adj_key) or node.get(plain_key) or node.get(api_period) or []
-        for r in rows:
-            if len(r) < 6:
-                continue
-            bars.append(Bar(date=str(r[0]),
-                            open=to_float(r[1], 0.0) or 0.0,
-                            close=to_float(r[2], 0.0) or 0.0,
-                            high=to_float(r[3], 0.0) or 0.0,
-                            low=to_float(r[4], 0.0) or 0.0,
-                            volume_lot=to_float(r[5], 0.0) or 0.0))
-    if not bars:
-        raise DataError(f"{sym} 未返回 {period} K 线数据（代码可能不存在，"
-                        f"或该周期无历史数据）")
-    bars.sort(key=lambda b: b.date)
-    _CACHE.set(cache_key, bars)
+        return bars
+    api_period, adj_key, plain_key = _PERIODS.get(period, _PERIODS["day"])
+    adj = _ADJUST.get((adjust or "qfq").lower(), "qfq")
+    param = f"{sym},{api_period},,,{limit},{adj}" if adj else \
+        f"{sym},{api_period},,,{limit}"
+    url = f"{TENCENT_KLINE}?param={param}"
+    data = _http_get_json(url)
+    node = ((data or {}).get("data") or {}).get(sym) or {}
+    rows = node.get(adj_key) or node.get(plain_key) or node.get(api_period) or []
+    for r in rows:
+        if len(r) < 6:
+            continue
+        bars.append(Bar(date=str(r[0]),
+                        open=to_float(r[1], 0.0) or 0.0,
+                        close=to_float(r[2], 0.0) or 0.0,
+                        high=to_float(r[3], 0.0) or 0.0,
+                        low=to_float(r[4], 0.0) or 0.0,
+                        volume_lot=to_float(r[5], 0.0) or 0.0))
     return bars
 
 
