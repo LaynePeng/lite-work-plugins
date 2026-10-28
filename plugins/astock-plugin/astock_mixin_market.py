@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import astock_data as data
+import astock_hints as hints
 import astock_market as mkt
 from astock_common import (MAX_QUOTE_BATCH, _f, _money, _pct, _ratio, _table)
 

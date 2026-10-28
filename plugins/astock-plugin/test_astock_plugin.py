@@ -15,9 +15,17 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------- 桩
 def _install_litework_stubs() -> None:
-    """插件模块级 import litework.*；测试环境没有主程序包，按最小契约打桩。"""
-    if "litework" in sys.modules:
-        return
+    """插件模块级 import litework.*；测试环境没有主程序包，按最小契约打桩。
+
+    **幂等补齐，不能整体跳过**：`unittest discover` 会先按文件名顺序导入
+    其它测试模块——`test_astock_plan` 排在本文件之前，它已经注册了
+    `litework` 包（以及自己的 `litework.watch.schedule_store` 桩），但**没有**
+    注册 `litework.core.types`。早先这里写的是 `if "litework" in sys.modules:
+    return`，于是整个打桩被跳过，本文件加载 plugin.py 时直接
+    `ModuleNotFoundError: No module named 'litework.core.types'`。
+    改成逐个 `setdefault` 补齐：别人已建的模块原样留着（不覆盖它的桩语义），
+    缺的才补上。这样 discover 与按文件跑都能通过。
+    """
 
     class _Plugin:
         name = "plugin"
@@ -50,10 +58,16 @@ def _install_litework_stubs() -> None:
         "litework.tools": types.ModuleType("litework.tools"),
         "litework.tools.plugin": types.ModuleType("litework.tools.plugin"),
     }
-    mods["litework.core.types"].ToolDefinition = _ToolDefinition
-    mods["litework.tools.plugin"].ToolPlugin = _ToolPlugin
     for k, m in mods.items():
         sys.modules.setdefault(k, m)
+    # 用 setdefault 挂属性：别的测试模块可能已给同名模块设了自己的桩
+    # （例如 plan 的 schedule_store），这里只补缺、不覆盖
+    core_types = sys.modules["litework.core.types"]
+    if not hasattr(core_types, "ToolDefinition"):
+        core_types.ToolDefinition = _ToolDefinition
+    tools_plugin = sys.modules["litework.tools.plugin"]
+    if not hasattr(tools_plugin, "ToolPlugin"):
+        tools_plugin.ToolPlugin = _ToolPlugin
 
 
 _install_litework_stubs()
@@ -4624,6 +4638,37 @@ class ConfigHotReloadTest(unittest.TestCase):
             self.plugin.on_config_changed(self.plugin._app.config)
         self.assertEqual(astock.data._TIMEOUT, 11.0)
 
+
+
+class TestMixinModuleImports(unittest.TestCase):
+    """mixin 模块的顶层依赖必须真的导入。
+
+    回归背景（v2.2.0 拆分 mixin 时踩到）：`astock_mixin_market._tool_quote`
+    第 56 行调用了 `hints.market_context()`，但该文件只导入了 data / mkt，
+    **漏了 `import astock_hints as hints`**。模块能正常 import（顶层不报错），
+    直到真正调用 astock_quote 才抛 `NameError: name 'hints' is not defined`
+    —— 用户看到的是「行情工具全挂」，而单测因为没走到那条分支全绿。
+
+    这类 bug 用「导入整个模块 + 检查属性存在」就能抓住，成本极低。
+    """
+
+    #: (模块名, 期望存在的模块级名字)
+    CASES = [
+        ("astock_mixin_market", "hints"),
+        ("astock_mixin_hint", "hints"),
+        ("astock_mixin_ledger", "hints"),
+    ]
+
+    def test_mixin_modules_expose_their_dependencies(self):
+        _install_litework_stubs()
+        import importlib
+        for mod_name, attr in self.CASES:
+            with self.subTest(module=mod_name, attr=attr):
+                mod = importlib.import_module(mod_name)
+                self.assertTrue(
+                    hasattr(mod, attr),
+                    f"{mod_name} 缺少模块级 {attr}（源码里用了却未 import）",
+                )
 
 
 if __name__ == "__main__":
