@@ -1640,8 +1640,93 @@ class NewToolsRegisteredTest(EmailPluginBase):
         for n in ("email_manage", "email_folders", "email_reply", "email_forward"):
             self.assertIn(n, names)
 
-    def test_version_is_140(self):
-        self.assertEqual(emailplugin.EmailPlugin.version, "1.4.0")
+    def test_version_is_150(self):
+        self.assertEqual(emailplugin.EmailPlugin.version, "1.5.0")
+
+class ConfigHotReloadTest(EmailPluginBase):
+    """on_config_changed 热生效：改账号/认证方式后不能还吃旧缓存。
+
+    本插件的关键状态是**模块级**的（不挂实例）：`_token_cache` 按
+    「服务商|client_id|token|refresh_token 尾段」缓存 access_token，
+    `_DISK_CFG` 是 config.json 快照。不清掉就会出现「设置页改了账号，
+    发信还是旧账号」，只能重启 Core。
+    """
+
+    def test_hook_clears_token_cache(self):
+        emailplugin._token_cache.update(
+            {"key": "old|key", "access": "OLD_TOKEN", "exp": time.time() + 3600})
+        app = _App(config={"email-plugin": {"email_user": "new@x.com"}})
+        self.plugin._app = app
+
+        self.plugin.on_config_changed(app.config)
+
+        self.assertEqual(emailplugin._token_cache["access"], "")
+        self.assertEqual(emailplugin._token_cache["key"], "")
+        self.assertEqual(emailplugin._token_cache["exp"], 0.0)
+
+    def test_hook_invalidates_disk_config_snapshot(self):
+        """_DISK_CFG 置空 → 下次读取按磁盘重新加载（同 mtime 精度内也不吃旧值）。"""
+        emailplugin._DISK_CFG.update(
+            {"path": "/x/config.json", "mtime": 123.0, "data": {"email_user": "old"}})
+        app = _App(config={"email-plugin": {}})
+        self.plugin._app = app
+
+        self.plugin.on_config_changed(app.config)
+
+        self.assertEqual(emailplugin._DISK_CFG["data"], {})
+        self.assertEqual(emailplugin._DISK_CFG["mtime"], 0.0)
+
+    def test_hook_clears_device_cache(self):
+        """设备码与 client_id 绑定：配置一变必须重取。"""
+        emailplugin._device_cache["pending"] = {"device_code": "dc"}
+        app = _App(config={"email-plugin": {}})
+        self.plugin._app = app
+
+        self.plugin.on_config_changed(app.config)
+
+        self.assertEqual(emailplugin._device_cache, {})
+
+    def test_hook_next_token_fetch_uses_new_config(self):
+        """端到端：钩子之后_取 token 会按新配置重新换票，而不是命中旧缓存。"""
+        calls = []
+        orig = emailplugin._oauth_refresh
+
+        def fake_refresh(conf):
+            calls.append(conf["client_id"])
+            return "AT-%s" % conf["client_id"], 3600, ""
+
+        emailplugin._oauth_refresh = fake_refresh
+        try:
+            old_app = _App(config={"email-plugin": {
+                "email_user": "u@x.com", "email_auth": "oauth2",
+                "email_oauth_client_id": "cid-old",
+                "email_oauth_refresh_token": "rt-old"}})
+            self.plugin._app = old_app
+            self.plugin.on_config_changed(old_app.config)
+            emailplugin._access_token(old_app)
+
+            new_app = _App(config={"email-plugin": {
+                "email_user": "u@x.com", "email_auth": "oauth2",
+                "email_oauth_client_id": "cid-new",
+                "email_oauth_refresh_token": "rt-new"}})
+            self.plugin._app = new_app
+            self.plugin.on_config_changed(new_app.config)
+            token, err = emailplugin._access_token(new_app)
+        finally:
+            emailplugin._oauth_refresh = orig
+
+        self.assertEqual(err, "")
+        self.assertEqual(token, "AT-cid-new", "应换用新 client_id 取票")
+        self.assertEqual(calls, ["cid-old", "cid-new"])
+
+    def test_hook_works_without_app(self):
+        """实例未绑定 app 时用传入 config 兜底（宿主只实例化不 install）。"""
+        self.plugin._app = None
+        self.plugin.on_config_changed({"email-plugin": {"email_user": "a@x.com"}})
+        self.assertIsNotNone(self.plugin._app)
+        self.assertEqual(emailplugin._own_cfg(self.plugin._app),
+                         {"email_user": "a@x.com"})
+
 
 
 if __name__ == "__main__":

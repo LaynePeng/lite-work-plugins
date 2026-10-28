@@ -1554,7 +1554,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.4.0"
+    version = "1.5.0"
     description = (
         "邮件：SMTP 发信 / 回复 / 转发（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱"
         "列表 / 关键词搜索 / 读取单封（含附件清单）/ 文件夹管理 / 删除·移动·标记。"
@@ -1703,6 +1703,31 @@ class EmailPlugin(ToolPlugin):
         except Exception:
             self._app = None
         super().install(kernel)
+
+    def on_config_changed(self, config: Dict[str, Any]) -> None:
+        """设置页保存了本插件配置 → 丢弃所有按旧配置建立的缓存（宿主可选钩子）。
+
+        为什么必须清：本插件的关键状态是**模块级**的，不挂在实例上——
+        `_token_cache` 按「服务商|client_id|token|refresh_token 尾段」缓存
+        access_token，`_DISK_CFG` 是 config.json 的快照。用户改账号/认证方式/
+        服务商后旧缓存仍会命中，表现为「改了配置还是用旧账号」，只能重启 Core。
+
+        - `_token_cache`：整条作废（新配置下 key 一定不同，但清掉更稳——
+          refresh_token 只在尾 12 位参与 key，改前缀不会被识别）；
+        - `_DISK_CFG`：置空让下次读取按 mtime 重新加载（宿主保存后 mtime 已变，
+          但同一 mtime 精度内连续保存两次会命中旧快照）；
+        - `_device_cache`：设备码与当前 client_id 绑定，配置变了必须重取。
+
+        不动 `_AUTH_PENDING`（进行中的授权流程与配置无关）。
+        """
+        global _DISK_CFG
+        if self._app is None and isinstance(config, dict):
+            # 实例未绑定 app（宿主只实例化不 install）时，用传入的配置兜底
+            self._app = _SimpleApp(config)
+        with _oauth_lock:
+            _token_cache.update({"key": "", "access": "", "exp": 0.0})
+        _DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
+        _device_cache.clear()
 
     def get_tools(self) -> List[ToolDefinition]:
         return [
