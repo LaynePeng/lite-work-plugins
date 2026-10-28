@@ -163,6 +163,61 @@ class TestEnsurePlan(unittest.TestCase):
         self.assertTrue(app.schedule_store.get(sid).enabled)
         self.assertEqual(len(app.schedule_store.all()), 1)
 
+    def test_self_heal_respects_user_pause(self):
+        """回归（v2.3.0）：自愈路径绝不能把用户主动暂停的计划改回启用。
+
+        真实用户报障：「点了停用都没用，一直开着」。根因是 install() 每次
+        插件重载都调 ensure_plan，而早先它把"禁用"一律视为故障并无条件
+        enabled=True。实测一天重载 459 次 → 停用几分钟内就被推翻。
+        这在语义上是系统推翻用户明确意图，不只是体验问题。
+        """
+        app = FakeApp()
+        sid = plan.ensure_plan(app, "/ws/a", interval=300)["schedule_id"]
+        plan.set_enabled(app, False)
+        self.assertFalse(app.schedule_store.get(sid).enabled)
+
+        # 自愈调用（respect_paused=True）：必须保持停用
+        res = plan.ensure_plan(app, "/ws/a", interval=300, respect_paused=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["action"], "paused", res)
+        self.assertFalse(app.schedule_store.get(sid).enabled,
+                         "自愈不得恢复用户主动暂停的计划")
+
+        # 反复自愈仍然停用（模拟一天 459 次重载）
+        for _ in range(5):
+            plan.ensure_plan(app, "/ws/a", interval=300, respect_paused=True)
+        self.assertFalse(app.schedule_store.get(sid).enabled,
+                         "多次自愈也不得恢复")
+
+    def test_self_heal_still_fixes_other_fields_while_paused(self):
+        """暂停期间自愈仍需修正间隔/工作区等字段，只是不碰 enabled。
+
+        否则用户暂停后再启动，会拿到一份过期配置（间隔 3600 秒之类）。
+        """
+        app = FakeApp()
+        sid = plan.ensure_plan(app, "/ws/a", interval=300)["schedule_id"]
+        plan.set_enabled(app, False)
+        s = app.schedule_store.get(sid)
+        s.interval_seconds = 3600
+        s.workspace = "/ws/wrong"
+
+        res = plan.ensure_plan(app, "/ws/a", interval=300, respect_paused=True)
+        self.assertEqual(res["action"], "paused", res)
+        s = app.schedule_store.get(sid)
+        self.assertEqual(s.interval_seconds, 300, "间隔应被修正")
+        self.assertEqual(s.workspace, "/ws/a", "工作区应被修正")
+        self.assertFalse(s.enabled, "但启用状态必须保持停用")
+
+    def test_explicit_start_still_enables(self):
+        """用户显式启动（respect_paused=False，默认）仍要能恢复启用。"""
+        app = FakeApp()
+        sid = plan.ensure_plan(app, "/ws/a", interval=300)["schedule_id"]
+        plan.set_enabled(app, False)
+        res = plan.ensure_plan(app, "/ws/a", interval=300)
+        self.assertEqual(res["action"], "repaired", res)
+        self.assertTrue(app.schedule_store.get(sid).enabled,
+                        "用户点启动必须能恢复")
+
     def test_repairs_wrong_interval_and_workspace(self):
         app = FakeApp()
         sid = plan.ensure_plan(app, "/ws/a", interval=300)["schedule_id"]

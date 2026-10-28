@@ -295,7 +295,7 @@ class AStockWatch(WatchSource):
                   "gap（开盘跳空）/tail（尾盘异动）。默认全部"),
         "min_level": ("最低报告级别：urgent 只报紧急（跌停/止损）｜action 默认"
                       "（含止盈/超仓位/异动）｜info 全部。想少被打扰就设 urgent"),
-        "rules": ("**精确价位规则**（v2.1.4，数组 JSON）。要盯\"跌破前低 36.01\""
+        "rules": ("**精确价位规则**（数组 JSON；界面若显示 [object Object] 属正常，直接粘 JSON 即可）。需盯\"跌破前低 36.01\""
                   "\"放量站回 37.11\"这类技术位时用它——百分比表达不出来。"
                   "每条：{code, name?, kind, price, op, label?, severity?, "
                   "vol_ratio_lt?, vol_ratio_gt?}；op: lt 跌破 / gt 站上 / le / ge。"
@@ -316,6 +316,9 @@ class AStockWatch(WatchSource):
         self._notifier = notify.Notifier()
         # 精确价位规则的"当天只报一次"状态（跨 5 分钟探测累积，故挂实例上）
         self._price_state = price_rule.PriceRuleState()
+        # 最近一次"邮件阈值把信号全拦掉了"的记录（v2.3.0）。
+        # 只用于 astock_watch 体检展示，不参与任何决策；None = 无拦截。
+        self._mail_blocked: Optional[Dict[str, Any]] = None
 
     async def probe(self, cfg: Dict[str, Any], ctx: Any) -> Any:
         own = (ctx.config or {}).get(PLUGIN_NAME) if isinstance(ctx.config, dict) else {}
@@ -332,7 +335,10 @@ class AStockWatch(WatchSource):
         #    例外：交易日 15:05–16:00 的首次探测触发【盘后舆情报告】
         #    （收盘了、舆情数据齐了，跑一轮全量分析；当天只跑一次）。
         if _as_bool(own.get("watch_only_trading_hours"), True):
-            ok_now, why = mkt.should_watch_now()
+            # watch_start_time（v2.3.0）：用户可配"几点开始盯"，默认留空=09:10。
+            # 早先写死 9:10 起，想早于集合竞价盯的人没法调。
+            ok_now, why = mkt.should_watch_now(
+                start_hhmm=str(own.get("watch_start_time") or ""))
             if not ok_now:
                 report = await self._maybe_eod_report(own, why,
                                                       str(getattr(ctx, "workspace", "") or ""))
@@ -340,7 +346,8 @@ class AStockWatch(WatchSource):
                     return report
                 return ProbeResult(
                     snapshot="",
-                    summary=f"当前不盯盘：{why}（下次 {mkt.next_watch_window()}）")
+                    summary=(f"当前不盯盘：{why}"
+                             f"（下次 {mkt.next_watch_window(start_hhmm=str(own.get('watch_start_time') or ''))}）"))
 
         workspace = str(getattr(ctx, "workspace", "") or "")
         path = str(own.get("ledger_path") or "").strip() or default_ledger_path(workspace)
@@ -594,7 +601,34 @@ class AStockWatch(WatchSource):
             picked = [e for e in entries
                       if level_rank.get(e.get("severity"), 1) >= floor]
             if not picked:
+                # 静默失败的头号来源（v2.3.0 修）：探针侧已经报出信号，
+                # 但邮件阈值把它全拦掉了 —— 用户看到面板有提醒、邮箱却一封没有，
+                # 而日志里什么也没有，根本无从排查。
+                # 探针级 min_level 默认 action、邮件级 email_min_level 默认 urgent，
+                # 两个独立开关默认不一致，写一条 action 级价位规则就会撞上这个坑。
+                # 记录被拦条数与两侧阈值，供 astock_watch status 复现。
+                blocked = [e for e in entries
+                           if level_rank.get(e.get("severity"), 1) < floor]
+                self._mail_blocked = {
+                    "at": str(entries[0].get("code") or ""),
+                    "total": len(entries), "blocked": len(blocked),
+                    "email_min_level": mcfg.min_level,
+                    "severities": sorted({str(e.get("severity") or "?")
+                                          for e in blocked}),
+                    "codes": sorted({str(e.get("code") or "") for e in blocked}),
+                }
+                logger.warning(
+                    "[astock] 邮件阈值拦截：%d 条信号全部低于阈值 %s"
+                    "（信号级别 %s，标的 %s）→ 不会发邮件。"
+                    "若要收到这些提醒，把设置页「通知阈值」调到 %s 或更低。",
+                    len(blocked), mcfg.min_level,
+                    "/".join(sorted({str(e.get("severity") or "?") for e in blocked})),
+                    "、".join(sorted({str(e.get("code") or "") for e in blocked})),
+                    "/".join(sorted({str(e.get("severity") or "?") for e in blocked})),
+                )
                 return
+            # 有邮件真正发出（或进入去重/限流前）→ 清掉上次的拦截记录
+            self._mail_blocked = None
             # 去重 / 限流：同一标的同一信号 6 小时内只发一次
             fresh: List[Dict[str, Any]] = []
             for e in picked:
@@ -818,7 +852,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.2.0"
+    version = "2.3.0"
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -887,6 +921,11 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                      "也可用 astock_watch action=start/stop 切换"},
             {"key": "watch_toggle", "type": "action", "label": "启动 / 暂停盯盘",
              "hint": "点一下切换盯盘开关；结果与当前状态会显示在按钮旁"},
+            {"key": "watch_start_time", "type": "str",
+             "label": "盯盘开始时间（HH:MM）", "default": "",
+             "hint": "留空＝默认 09:10（集合竞价前 5 分钟）。填 09:00 就从 9 点开始盯，"
+                     "填 09:30 就等开盘后再盯。只影响开始时刻，收盘与午休时段不变。"
+                     "格式须两位数 24 小时制（如 09:00），填错会退回默认值"},
             {"key": "watch_only_trading_hours", "type": "boolean",
              "label": "仅交易时段盯盘（推荐）", "default": True,
              "hint": "开启后只在工作日 9:10–15:00 盯，午休与收盘后自动静默——"
@@ -1054,13 +1093,15 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
 
     # -------------------------------------------------- 安装
 
-    def install(self, kernel) -> None:
-        """捕获 app（workspace / config 都从这里取，支持项目热切换）。"""
-        try:
-            if kernel.has_service("app"):
-                self._app = kernel.get_service("app")
-        except Exception:
-            self._app = None
+    def _apply_runtime_config(self) -> None:
+        """按当前 app.config 重新应用**运行期参数**（install 与热更新共用）。
+
+        为什么单独一个方法：这些值不是「用的时候读」，而是安装时**拷进模块级
+        全局 / 成员**——行情限流速率写进 astock_data 的模块全局、回测的自动
+        存档开关写进 backtest_tool 的模块状态。不重新应用就只能重启才生效。
+
+        幂等、不抛：任何一段失败都不影响其余（配置坏了不该让插件停摆）。
+        """
         try:
             data.configure(
                 rate_per_sec=_num(self._app, "rate_limit_per_sec", 5.0),
@@ -1080,15 +1121,46 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                 _bool(self._app, "archive_auto_update", True))
         except Exception:
             logger.warning("[astock] 回测台账/存档注入失败", exc_info=True)
+
+    def on_config_changed(self, config: Dict[str, Any]) -> None:
+        """设置页保存了本插件配置 → 立即应用（宿主 Plugin 可选钩子）。
+
+        覆盖两类「改完必须重启」的配置：
+        ① 行情参数（限流速率 / 超时 / 报价与 K 线缓存 TTL）——改完下一次调用
+           就用新值；
+        ② 台账/存档路径与回测自动存档开关——置空句柄，下次取用时按新配置重建。
+
+        盯盘**开关**（watch_enabled）刻意不在这里动计划：那是 plan 的职责，
+        由 settings_action 的 watch_toggle 与 astock_watch start/stop 维护；
+        探针每次探测都现读 config，无需重建。
+        """
+        # 宿主传全量 config：以它为准则能覆盖「实例尚未绑定 app」的场景
+        if self._app is None and isinstance(config, dict):
+            self._app = _SimpleApp(config)
+        self._apply_runtime_config()
+
+    def install(self, kernel) -> None:
+        """捕获 app（workspace / config 都从这里取，支持项目热切换）。"""
+        try:
+            if kernel.has_service("app"):
+                self._app = kernel.get_service("app")
+        except Exception:
+            self._app = None
+        self._apply_runtime_config()
         # 盯盘计划自愈：插件重新加载（重启/升级/切工作区）时检查计划还在不在。
         # 为什么要做：计划被禁用或工作区变了之后，盯盘会**静默停摆**——没有报错，
         # 用户只会觉得"邮件怎么不来了"。只在开关打开时修复：关着说明用户主动
         # 暂停了，不该擅自建。
         try:
             if _as_bool(_cfg(self._app, "watch_enabled", True), True):
+                # respect_paused=True（v2.3.0）：自愈**绝不能**恢复用户主动暂停
+                # 的计划。这条路径每次插件重载都会跑（实测一天 459 次），早先
+                # 无条件 enabled=True，导致用户点「停用」后几分钟内被反复推翻，
+                # 界面上表现为"停用按钮完全没用"——这是系统在推翻用户意图。
                 res = plan_ctl.ensure_plan(
                     self._app, self._workspace(),
-                    interval=int(_num(self._app, "watch_interval_seconds", 300)))
+                    interval=int(_num(self._app, "watch_interval_seconds", 300)),
+                    respect_paused=True)
                 if res.get("action") in ("created", "repaired"):
                     logger.info("[astock] 盯盘计划自愈：%s", res.get("message"))
                 elif not res.get("ok"):
@@ -1549,7 +1621,8 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         if err:
             return {"ok": False, "message": f"写入失败：{err}"}
         st = mkt.trading_status()
-        ok_now, why = mkt.should_watch_now()
+        ok_now, why = mkt.should_watch_now(
+            start_hhmm=str(own.get("watch_start_time") or ""))
         # 按钮与 `astock_watch action=start/stop` 走同一套计划逻辑：
         # 启动＝自动建/修计划，暂停＝禁用计划（不删，保留指纹基线）
         interval = int(float(own.get("watch_interval_seconds") or 300))
@@ -1558,7 +1631,8 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                                        interval=interval,
                                        probe_cfg=self._probe_cfg())
             tail = (f"现在在盯着（{st['phase']}）" if ok_now
-                    else f"现在不盯：{why}；下次 {mkt.next_watch_window()}")
+                    else (f"现在不盯：{why}；下次 "
+                          f"{mkt.next_watch_window(start_hhmm=str(own.get('watch_start_time') or ''))}"))
             msg = f"已启动盯盘，{res.get('message')}。{tail}"
             if not res.get("ok"):
                 msg += ("　⚠️ 自动建计划不可用，请到右栏「盯梢」页手动新建"

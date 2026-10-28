@@ -224,7 +224,8 @@ def watch_line(app: Any) -> str:
     """
     try:
         enabled = _as_bool(_cfg(app, "watch_enabled", True), True)
-        ok_now, why = mkt.should_watch_now()
+        start_hhmm = str(_cfg(app, "watch_start_time", "") or "")
+        ok_now, why = mkt.should_watch_now(start_hhmm=start_hhmm)
         st = mkt.trading_status()
     except Exception:
         return ""
@@ -234,8 +235,9 @@ def watch_line(app: Any) -> str:
     if ok_now:
         return f"🟢 **正在盯盘**（{st['phase']}）"
     # 块内空行分段：单换行会被 markdown 渲染器合并成一行（v1.7.1）
-    return (f"⚪ **当前不盯盘**：{why}　下次 {mkt.next_watch_window()}"
-            f"\n\n　时段自律：工作日 9:10–15:00，午休跳过，收盘自动停")
+    return (f"⚪ **当前不盯盘**：{why}　"
+            f"下次 {mkt.next_watch_window(start_hhmm=start_hhmm)}"
+            f"\n\n　时段自律：工作日 {mkt._resolve_start(start_hhmm)}–15:00，午休跳过，收盘自动停")
 
 
 def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
@@ -455,7 +457,7 @@ def render_tree(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
                      f"可用 {_money(d['cash'])}"],
             "chips": ([flag.split("：")[0].replace("*", "").strip()]
                       if flag else []) + [
-                "盯盘中" if mkt.should_watch_now()[0] else mkt.next_watch_window(),
+                "盯盘中" if mkt.should_watch_now(start_hhmm=str(_cfg(ctx.app, "watch_start_time", "") or ""))[0] else mkt.next_watch_window(start_hhmm=str(_cfg(ctx.app, "watch_start_time", "") or "")),
                 "每 5 秒刷新"],
         },
         "trees": cards,

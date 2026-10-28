@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sys
 import unittest
@@ -68,6 +69,38 @@ class TestParseRules(unittest.TestCase):
         self.assertEqual(rules, [])
         self.assertTrue(errs)
 
+
+    # ---------------- v2.3.1：字符串形式也要能解析 ----------------
+
+    def test_json_string_accepted(self):
+        """计划编辑器的 probe_config 是文本框，前端会把数组以 JSON 串提交。
+
+        不还原就等于「用户一编辑规则就全部静默失效」，而界面上完全看不出来
+        ——这正是用户报「rule 显示 [object Object]」时暴露出的另一半问题。
+        """
+        raw = json.dumps([{"code": "000651", "kind": "stop_loss",
+                          "price": 36.0, "op": "lt"}])
+        rules, errs = pr.parse_rules(raw)
+        self.assertEqual(len(rules), 1, errs)
+        self.assertEqual(rules[0]["code"], "000651")
+        self.assertEqual(rules[0]["price"], 36.0)
+
+    def test_object_object_string_gives_actionable_error(self):
+        """前端 render 成 "[object Object]" 时必须给出可读错误，不是静默空。"""
+        rules, errs = pr.parse_rules("[object Object],[object Object]")
+        self.assertEqual(rules, [])
+        self.assertTrue(errs)
+        self.assertIn("JSON", errs[0])
+
+    def test_json_string_single_object(self):
+        raw = json.dumps({"code": "000651", "kind": "stop_loss", "price": 36.0})
+        rules, errs = pr.parse_rules(raw)
+        self.assertEqual(len(rules), 1, errs)
+
+    def test_empty_string_is_not_error(self):
+        rules, errs = pr.parse_rules("   ")
+        self.assertEqual(rules, [])
+        self.assertEqual(errs, [])
 
 class TestMatchRule(unittest.TestCase):
     def _r(self, **kw):

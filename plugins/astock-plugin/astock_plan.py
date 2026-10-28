@@ -124,8 +124,22 @@ def _persist(app: Any, sched: Any, store: Any) -> Tuple[bool, str]:
 
 def ensure_plan(app: Any, workspace: str, *, interval: int = DEFAULT_INTERVAL,
                 probe_cfg: Optional[Dict[str, Any]] = None,
+                respect_paused: bool = False,
                 ) -> Dict[str, Any]:
     """**幂等**地确保计划存在、启用且间隔正确。
+
+    `respect_paused`（v2.3.0）：**自愈路径必须传 True**。
+    传 True 时，已存在的计划若处于禁用状态，视为「用户主动暂停」，
+    **只修其它字段、绝不重新启用**，并返回 action="paused"。
+
+    为什么需要这个开关（真实的用户报障）：
+    早先 `ensure_plan` 只有一种语义——「计划禁用=故障」，于是无条件
+    `sched.enabled = True`。而 `install()` 每次插件重载都会调它，实测
+    一天重载 459 次（Agent 每轮结束都会重载全部插件）。结果：用户点
+    「停用」后，几分钟内被自愈逻辑反复推翻，界面上看起来就是
+    **"停用按钮完全没用"**。这不只是体验问题，是系统在推翻用户的
+    明确意图——必须让"用户说停"优先于"系统想修"。
+
 
     返回 `{"ok", "action", "message", "schedule_id"}`：
       · `ok=True, action="created"`   新建了一条
@@ -167,8 +181,14 @@ def ensure_plan(app: Any, workspace: str, *, interval: int = DEFAULT_INTERVAL,
     # 已存在：检查是否需要修正（取第一条，多余的只报告不擅删）
     sched = mine[0]
     need: List[str] = []
+    paused = not bool(getattr(sched, "enabled", True))
     try:
-        if not bool(getattr(sched, "enabled", True)):
+        # 禁用状态**不再算作需要修复的缺陷**：
+        #   · respect_paused=True（自愈路径）→ 完全跳过，保持停用；
+        #   · respect_paused=False（用户点「启动」）→ 在下面显式启用。
+        # 早先无条件把 plan_disabled 塞进 need 并 sched.enabled=True，
+        # 导致用户点停用后每次插件重载都被改回启用（v2.3.0 修）。
+        if paused and not respect_paused:
             need.append("plan_disabled")
         if str(getattr(sched, "schedule_mode", "")) != "interval":
             need.append("mode")
@@ -190,6 +210,13 @@ def ensure_plan(app: Any, workspace: str, *, interval: int = DEFAULT_INTERVAL,
         need.append("unknown")
     extra = len(mine) - 1
     if not need:
+        if paused:
+            # 用户主动暂停中：如实报告，不要谎称"已启用"
+            msg = f"盯梢计划已暂停（用户主动停用，自愈不会恢复；每 {interval} 秒的配置已就绪）"
+            if extra:
+                msg += f"；另有 {extra} 条同名计划未动"
+            return {"ok": True, "action": "paused", "schedule_id": sched.id,
+                    "message": msg}
         msg = f"盯梢计划已就绪（每 {interval} 秒探测，已启用）"
         if extra:
             msg += f"；另有 {extra} 条同名计划未动（可在盯梢页手动清理）"
@@ -197,7 +224,10 @@ def ensure_plan(app: Any, workspace: str, *, interval: int = DEFAULT_INTERVAL,
                 "message": msg}
 
     try:
-        sched.enabled = True
+        # 只在"用户这次明确要启动"时才启用；自愈路径绝不碰 enabled。
+        # 这一行是"停用无效"的直接肇事点（早先无条件 = True）。
+        if not (paused and respect_paused):
+            sched.enabled = True
         sched.schedule_mode = "interval"
         sched.interval_seconds = interval
         sched.source = SOURCE_KIND
@@ -213,6 +243,10 @@ def ensure_plan(app: Any, workspace: str, *, interval: int = DEFAULT_INTERVAL,
         logger.warning("[astock] 修正盯梢计划失败: %s", exc, exc_info=True)
         return {"ok": False, "action": "error", "schedule_id": "",
                 "message": f"修正失败：{type(exc).__name__}: {exc}"}
+    if paused and respect_paused:
+        return {"ok": True, "action": "paused", "schedule_id": sched.id,
+                "message": (f"盯梢计划保持暂停（已同步每 {interval} 秒等配置，"
+                            f"未改动启用状态）")}
     return {"ok": True, "action": "repaired", "schedule_id": sched.id,
             "message": f"盯梢计划已修正并启用（每 {interval} 秒探测）"}
 

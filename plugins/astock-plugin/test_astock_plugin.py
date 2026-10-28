@@ -943,6 +943,70 @@ class TestWatchWindow(unittest.TestCase):
         self.assertIn("2026-10-26",
                       mkt.next_watch_window(self._at(2026, 10, 23, 16, 0)))
 
+    # ---------------- v2.3.0：可配置开始时间 ----------------
+
+    def test_start_time_default_is_0910(self):
+        """留空＝旧口径 09:10（集合竞价前 5 分钟）。"""
+        self.assertFalse(mkt.should_watch_now(self._at(2026, 10, 23, 9, 9))[0])
+        self.assertTrue(mkt.should_watch_now(self._at(2026, 10, 23, 9, 10))[0])
+
+    def test_start_time_custom_0900(self):
+        """用户要的「9 点开始」：09:00 起就盯，早于它不盯。"""
+        self.assertFalse(mkt.should_watch_now(
+            self._at(2026, 10, 23, 8, 59), start_hhmm="09:00")[0])
+        self.assertTrue(mkt.should_watch_now(
+            self._at(2026, 10, 23, 9, 0), start_hhmm="09:00")[0])
+        self.assertTrue(mkt.should_watch_now(
+            self._at(2026, 10, 23, 9, 30), start_hhmm="09:00")[0])
+
+    def test_start_time_custom_0930(self):
+        """想等开盘后再盯的人：09:30 之前不盯。"""
+        self.assertFalse(mkt.should_watch_now(
+            self._at(2026, 10, 23, 9, 15), start_hhmm="09:30")[0])
+        self.assertTrue(mkt.should_watch_now(
+            self._at(2026, 10, 23, 9, 30), start_hhmm="09:30")[0])
+
+    def test_start_time_evening_env_still_closes_1500(self):
+        """自定义开始时间**不能**突破收盘/午休边界。"""
+        for bad_start in ("09:00", "08:00", "23:00"):
+            self.assertFalse(mkt.should_watch_now(
+                self._at(2026, 10, 23, 15, 0), start_hhmm=bad_start)[0],
+                f"{bad_start} 时 15:00 后仍应停")
+            self.assertFalse(mkt.should_watch_now(
+                self._at(2026, 10, 23, 12, 0), start_hhmm=bad_start)[0],
+                f"{bad_start} 时午休仍应跳过")
+
+    def test_start_time_invalid_falls_back_silently(self):
+        """格式错误退回默认，且绝不抛错（盯盘开关不该因一个字符串失效）。"""
+        for bad in ("25:00", "abc", "9:00", "09:00:00", "", "  "):
+            ok, why = mkt.should_watch_now(
+                self._at(2026, 10, 23, 9, 5), start_hhmm=bad)
+            self.assertFalse(ok, f"{bad!r} 应退回默认 09:10（9:05 不盯）")
+            self.assertIn("09:10", why, f"{bad!r} 的提示应显示默认值")
+
+    def test_next_window_respects_start_time(self):
+        """状态栏「下次开始」必须与配置一致，不能一个说 09:15 一个 09:00。"""
+        t = self._at(2026, 10, 23, 8, 0)
+        self.assertIn("09:00", mkt.next_watch_window(t, start_hhmm="09:00"))
+        self.assertIn("09:30", mkt.next_watch_window(t, start_hhmm="09:30"))
+        self.assertIn("09:10", mkt.next_watch_window(t))        # 默认
+
+    def test_resolve_start_matches_should_watch_now(self):
+        """两处口径必须同一个函数，否则展示与实际会自相矛盾。"""
+        for cfg in ("", "09:00", "09:30", "13:05", "bad", "25:00"):
+            resolved = mkt._resolve_start(cfg)
+            # 恰好在 resolved 时刻应开始盯；前一分钟不该盯
+            h, mi = int(resolved.split(":")[0]), int(resolved.split(":")[1])
+            if "11:30" <= resolved < "13:00" or resolved >= "15:00":
+                continue        # 落在休市区间，不适用于此断言
+            self.assertTrue(mkt.should_watch_now(
+                self._at(2026, 10, 23, h, mi), start_hhmm=cfg)[0],
+                f"{cfg!r}→{resolved} 应开始盯")
+            if mi > 0:
+                self.assertFalse(mkt.should_watch_now(
+                    self._at(2026, 10, 23, h, mi - 1), start_hhmm=cfg)[0],
+                    f"{cfg!r}→{resolved} 前一分钟不该盯")
+
 
 class TestReceiptParse(unittest.TestCase):
     """成交回单解析：这是“买完怎么同步回系统”的入口，宁可少记也不能记错。"""
@@ -2201,6 +2265,48 @@ class TestNotifyIntegration(unittest.TestCase):
         self._probe([self._quote(price=9.4, prev=9.9)],
                     cfg=self._cfg(email_min_level="action"))
         self.assertGreaterEqual(len(self.sent), 1)
+
+    def test_blocked_signal_recorded_for_diagnosis(self):
+        """回归（v2.3.0）：邮件阈值把信号全拦掉时必须留下可查记录。
+
+        真实的坑：探针级 `min_level` 默认 `action`、邮件级 `email_min_level`
+        默认 `urgent`，两个独立开关默认不一致。写一条 `action` 级价位规则后，
+        面板会报警、邮件一封不发、日志空白——用户无从判断是"没信号"还是
+        "被阈值拦了"。所以这里断言拦截事实被记到 watch 实例上，
+        供 `astock_watch action=status` 回显。
+        """
+        w = astock.AStockWatch()
+        self.assertIsNone(getattr(w, "_mail_blocked", None),
+                          "初始不应有拦截记录")
+        self._probe([self._quote(price=9.4, prev=9.9)],
+                    cfg=self._cfg(email_min_level="urgent",
+                                  kinds="stop_loss,take_profit,trailing,"
+                                        "limit_up,limit_down,event"),
+                    watch=w)
+        self.assertEqual(self.sent, [])
+        blocked = getattr(w, "_mail_blocked", None)
+        self.assertIsNotNone(blocked, "被阈值拦掉的信号必须留下记录")
+        self.assertGreaterEqual(blocked["blocked"], 1)
+        self.assertEqual(blocked["email_min_level"], "urgent")
+        self.assertIn("action", blocked["severities"])
+        self.assertIn("600000", blocked["codes"])
+
+    def test_blocked_flag_cleared_after_sent(self):
+        """一旦有邮件真的发出去，拦截记录要清掉，否则体检会一直报旧状态。"""
+        w = astock.AStockWatch()
+        self._probe([self._quote(price=9.4, prev=9.9)],
+                    cfg=self._cfg(email_min_level="urgent",
+                                  kinds="stop_loss,take_profit,trailing,"
+                                        "limit_up,limit_down,event"),
+                    watch=w)
+        self.assertIsNotNone(getattr(w, "_mail_blocked", None))
+        # 换成能发信的配置再探一次（用新实例避开 6 小时去重）
+        w2 = astock.AStockWatch()
+        self._probe([self._quote(price=9.4, prev=9.9)],
+                    cfg=self._cfg(email_min_level="action"), watch=w2)
+        self.assertGreaterEqual(len(self.sent), 1)
+        self.assertIsNone(getattr(w2, "_mail_blocked", None),
+                          "发信成功后不应残留拦截记录")
 
     def test_same_signal_deduped_across_probes(self):
         w = astock.AStockWatch()
@@ -4434,6 +4540,90 @@ class TestActionSurface(unittest.TestCase):
         actual = {t.name for t in self.plugin.get_tools()}
         self.assertEqual(declared, actual,
                          "manifest 与实际工具面不一致（CI 会因此报错）")
+
+class ConfigHotReloadTest(unittest.TestCase):
+    """on_config_changed 热生效：设置页保存后立即应用，不需要重启 Core。
+
+    守住的不变量是「install() 与 on_config_changed 走同一份实现」——
+    早先这些参数只在 install() 里应用一次（行情限流/超时/缓存 TTL 写进
+    astock_data 的模块全局，回测自动存档开关写进 backtest_tool 的模块状态），
+    设置页改完必须重启 Core 才生效。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="astock-hotcfg-")
+        self.plugin = astock.AstockPlugin()
+
+    def _app(self, config):
+        class App:
+            workspace = self.tmp
+            config_ = None
+
+            def __init__(self):
+                self.config = config
+
+            def save_config(self, upd):
+                for k, v in upd.items():
+                    self.config.setdefault(k, {}).update(v)
+
+        return App()
+
+    def test_hook_reapplies_market_params(self):
+        """行情参数（限流/超时/TTL）改完立即生效。"""
+        self.plugin._app = self._app({"astock-plugin": {
+            "rate_limit_per_sec": 99, "http_timeout": 42,
+            "quote_cache_ttl": 7, "kline_cache_ttl": 123}})
+
+        self.plugin.on_config_changed(self.plugin._app.config)
+
+        self.assertEqual(astock.data._TIMEOUT, 42.0)
+        self.assertEqual(astock.data._QUOTE_TTL, 7.0)
+        self.assertEqual(astock.data._KLINE_TTL, 123.0)
+
+    def test_hook_resets_ledger_and_archive_handles(self):
+        """台账/存档句柄置空：路径改了下次取用时按新配置重建。"""
+        self.plugin._app = self._app({"astock-plugin": {}})
+        self.plugin._ledger = object()
+        self.plugin._archive = object()
+
+        self.plugin.on_config_changed(self.plugin._app.config)
+
+        self.assertIsNone(self.plugin._ledger)
+        self.assertIsNone(self.plugin._archive)
+
+    def test_hook_works_without_app(self):
+        """实例未绑定 app（宿主只实例化不 install）时用传入的 config 兜底。"""
+        self.assertIsNone(self.plugin._app)
+
+        self.plugin.on_config_changed({"astock-plugin": {
+            "rate_limit_per_sec": 3, "http_timeout": 15}})
+
+        self.assertIsNotNone(self.plugin._app)
+        self.assertEqual(astock.data._TIMEOUT, 15.0)
+
+    def test_hook_does_not_create_watch_plan(self):
+        """钩子不碰盯盘计划：开关归 plan 管，这里只重应用参数。
+
+        为什么重要：探针每次探测都现读 config，重建计划纯属多余；
+        更糟的是会被当成一次「自愈」，把用户主动暂停的计划翻回来。
+        """
+        calls = []
+        orig = astock.plan_ctl.ensure_plan
+        astock.plan_ctl.ensure_plan = lambda *a, **kw: calls.append(1) or {"ok": True}
+        self.plugin._app = self._app({"astock-plugin": {"watch_enabled": True}})
+        try:
+            self.plugin.on_config_changed(self.plugin._app.config)
+        finally:
+            astock.plan_ctl.ensure_plan = orig
+        self.assertEqual(calls, [], "on_config_changed 不该创建/修复盯盘计划")
+
+    def test_hook_is_idempotent(self):
+        """重复调用不报错（宿主保存任意配置都可能触发）。"""
+        self.plugin._app = self._app({"astock-plugin": {"http_timeout": 11}})
+        for _ in range(3):
+            self.plugin.on_config_changed(self.plugin._app.config)
+        self.assertEqual(astock.data._TIMEOUT, 11.0)
+
 
 
 if __name__ == "__main__":

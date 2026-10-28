@@ -39,7 +39,8 @@ class WatchToolsMixin:
         一次就把两件事都办完；拿不到 app 时才退回手动指引（并明确说明原因）。
         """
         st = mkt.trading_status()
-        ok_now, why = mkt.should_watch_now()
+        start_hhmm = str(_cfg(self._app, "watch_start_time", "") or "")
+        ok_now, why = mkt.should_watch_now(start_hhmm=start_hhmm)
         enabled = _as_bool(_cfg(self._app, "watch_enabled", True), True)
         only_hours = _as_bool(_cfg(self._app, "watch_only_trading_hours", True), True)
         workspace = str(getattr(self._app, "workspace", "") or "")
@@ -88,9 +89,10 @@ class WatchToolsMixin:
             ["最近一次探测", diag.get("last_run_text") or "还没探测过"],
             ["当前时刻", f"{st['now']}（{st['phase']}）"],
             ["现在是否在盯", ("✅ 是" if ok_now else f"❌ 否 —— {why}")],
-            ["下次开始", mkt.next_watch_window()],
-            ["时段自律", ("✅ 仅工作日 9:10–15:00，午休跳过"
-                          if only_hours else "⚠️ 已关闭（全天盯，会消耗 token）")],
+            ["下次开始", mkt.next_watch_window(start_hhmm=start_hhmm)],
+            ["时段自律", (f"✅ 仅工作日 {mkt._resolve_start(start_hhmm)}–15:00，"
+                          f"午休跳过" if only_hours
+                          else "⚠️ 已关闭（全天盯，会消耗 token）")],
         ]))
         lines.append("")
         lines.append(f"**体检结论**：{diag['verdict']}")
@@ -117,6 +119,37 @@ class WatchToolsMixin:
         lines.append("**盯盘按 A 股交易时段自动作息**：开盘前 5 分钟开始，"
                      "午休自动跳过，15:00 收盘自动停。非交易时段探针直接返回"
                      "「无变化」，**不消耗 token**。")
+        lines.append("")
+        write_ok = _as_bool(_cfg(self._app, "email_notify_enabled", False), False)
+        mail_level = str(_cfg(self._app, "email_min_level", "urgent") or "urgent")
+        probe_level = str(_cfg(self._app, "min_level", "action") or "action")
+        _rank = {"info": 0, "action": 1, "urgent": 2}
+        _probe_floor = _rank.get(probe_level, 1)
+        _mail_floor = _rank.get(mail_level, 2)
+        # 阈值阶梯：探针报得出、邮件发不出，是**两个独立开关**造成的
+        # （探针默认 action、邮件默认 urgent）。这类失败完全静默——
+        # 面板有提醒、邮箱没邮件、日志无异常，所以体检必须主动点出来。
+        if write_ok and _mail_floor > _probe_floor:
+            lines.append("")
+            lines.append("### ⚠️ 邮件阈值会把部分信号拦掉")
+            lines.append("")
+            lines.append(f"探测级别 `{probe_level}`（会报出），"
+                         f"邮件级别 `{mail_level}`（只发这一级及以上）——"
+                         f"**级别低于 `{mail_level}` 的信号不会发邮件**。"
+                         f"价格突破类价位规则通常是 `action` 级，"
+                         f"若你的规则是 `action` 而阈值为 `urgent`，会一条邮件都收不到。")
+            lines.append("")
+            lines.append(f"要收到这类提醒：设置页把「通知阈值」调到 `{probe_level}` 或更低。")
+        # 探针最近一次是否真的被阈值拦住了（进程内记录，重启后清空）
+        blocked = getattr(self, "_mail_blocked", None)
+        if isinstance(blocked, dict) and blocked.get("blocked"):
+            lines.append("")
+            lines.append("### 🔴 上次探测有信号被邮件阈值拦掉")
+            lines.append("")
+            lines.append(f"{blocked.get('blocked')} 条信号（级别 "
+                         f"{'/'.join(blocked.get('severities') or ['?'])}，"
+                         f"标的 {'、'.join(blocked.get('codes') or ['?'])}）"
+                         f"低于邮件阈值 `{blocked.get('email_min_level')}`，未发邮件。")
         lines.append("")
         lines.append("### 邮件通知依赖这条链路")
         lines.append("")

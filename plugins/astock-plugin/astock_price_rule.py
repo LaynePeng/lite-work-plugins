@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -69,6 +70,24 @@ def parse_rules(raw: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
         return out, errors
     if isinstance(raw, dict):        # 容忍单条写成对象
         raw = [raw]
+    # 容忍 JSON 字符串（v2.3.0）：计划编辑器把 probe_config 当文本框，
+    # 前端可能提交 JSON 串或 "[object Object]"。不还原就等于用户一编辑
+    # 规则就全部静默失效，而且界面上完全看不出来。
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return out, errors
+        try:
+            decoded = json.loads(text)
+        except (ValueError, TypeError):
+            errors.append("rules 不是合法 JSON，无法解析（请填数组 JSON）")
+            return out, errors
+        if isinstance(decoded, dict):
+            decoded = [decoded]
+        if not isinstance(decoded, list):
+            errors.append("rules 解析后不是数组")
+            return out, errors
+        raw = decoded
     if not isinstance(raw, (list, tuple)):
         errors.append(f"rules 应为数组，实际是 {type(raw).__name__}")
         return out, errors

@@ -226,6 +226,9 @@ def check_order_size(shares: int, code: str, side: str,
 
 # ---------------------------------------------------------------- 交易时段
 
+#: `HH:MM` 形式校验（盯盘开始时间配置用）。宽松：只认 24 小时制两位数。
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
 #: 连续竞价 + 集合竞价时段（本地时区，A 股为 UTC+8）
 SESSIONS: List[Tuple[str, str, str]] = [
     ("09:15", "09:25", "开盘集合竞价"),
@@ -256,7 +259,8 @@ def is_trading_day(day: Optional[_dt.date] = None) -> bool:
 
 def should_watch_now(now: Optional[_dt.datetime] = None,
                      lead_minutes: int = 5,
-                     lag_minutes: int = 5) -> Tuple[bool, str]:
+                     lag_minutes: int = 5,
+                     start_hhmm: str = "") -> Tuple[bool, str]:
     """盯盘时刻判断：现在该不该让盯梢源真的去查行情。
 
     **这个函数是"何时开始盯"的答案**，也是省 token 的关键：非交易时段直接
@@ -270,6 +274,12 @@ def should_watch_now(now: Optional[_dt.datetime] = None,
     - 时段覆盖 09:15–15:00 并各留 `lead/lag` 分钟缓冲：集合竞价（9:15）与
       尾盘（14:57–15:00）正是条件单容易触发的时刻，掐掉会漏报；
     - 午休 11:30–13:00 不盯（价格不动，盯了纯浪费）。
+
+    `start_hhmm`（v2.3.0）：用户可配置的"几点开始盯"，形如 `"09:00"`。
+    留空＝沿用旧口径（09:15 减 lead 分钟）。**只影响下界，不影响收盘/午休**。
+    之所以要可配：有人想在集合竞价前就盯着（09:00），有人想等开盘后（09:30），
+    写死一个值总有一边不合适。校验宽松：格式不对就退回默认，绝不抛错
+    ——盯盘开关不该因为一个时间字符串打错而整体失效。
     """
     now = now or _now_cn()
     day = now.date()
@@ -279,7 +289,7 @@ def should_watch_now(now: Optional[_dt.datetime] = None,
     # 边界：集合竞价 09:15 开始（提前量只在"刚好卡点"时生效，不能把 9:10
     # 也算成盘中——那是错误信号，会让用户在开盘前收到"盘中异动"）；
     # 收盘 15:00 之后一律不盯（尾盘集合竞价到 15:00 结束，15:00 后价格冻结）。
-    start = f"{9:02d}:{max(0, 15 - max(0, lead_minutes)):02d}"
+    start = _resolve_start(start_hhmm, lead_minutes)
     if hhmm < start:
         return False, f"开盘前（早于 {start}）"
     if hhmm >= "15:00":
@@ -290,14 +300,30 @@ def should_watch_now(now: Optional[_dt.datetime] = None,
     return True, f"{st['phase']}"
 
 
-def next_watch_window(now: Optional[_dt.datetime] = None) -> str:
-    """下一次该盯盘的时间（给人看的说明，用于面板/状态展示）。"""
+def _resolve_start(start_hhmm: str = "", lead_minutes: int = 5) -> str:
+    """解析"开始盯盘"时刻。与 should_watch_now 同一口径，避免两处不一致。
+
+    非法/空值时退回默认（09:15 减提前量），绝不抛错。
+    """
+    if isinstance(start_hhmm, str) and _HHMM_RE.match(start_hhmm.strip()):
+        return start_hhmm.strip()
+    return f"{9:02d}:{max(0, 15 - max(0, lead_minutes)):02d}"
+
+
+def next_watch_window(now: Optional[_dt.datetime] = None,
+                      start_hhmm: str = "") -> str:
+    """下一次该盯盘的时间（给人看的说明，用于面板/状态展示）。
+
+    `start_hhmm` 必须跟 should_watch_now 用同一个值，否则会出现
+    「状态栏说 09:15、实际 09:00 就开始」这种自相矛盾的展示。
+    """
     now = now or _now_cn()
     today = now.date()
     hhmm = now.strftime("%H:%M")
+    start = _resolve_start(start_hhmm)
     if is_trading_day(today):
-        if hhmm < "09:15":
-            return f"今天 09:15"
+        if hhmm < start:
+            return f"今天 {start}"
         if "11:30" <= hhmm < "13:00":
             return "今天 13:00"
         if hhmm < "15:00":
@@ -306,9 +332,9 @@ def next_watch_window(now: Optional[_dt.datetime] = None) -> str:
     d = today + _dt.timedelta(days=1)
     for _ in range(10):
         if d.weekday() < 5:
-            return f"{d.isoformat()} 09:15"
+            return f"{d.isoformat()} {start}"
         d += _dt.timedelta(days=1)
-    return "下一个交易日 09:15"
+    return f"下一个交易日 {start}"
 
 
 def trading_status(now: Optional[_dt.datetime] = None) -> Dict[str, object]:
