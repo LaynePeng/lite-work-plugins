@@ -1081,6 +1081,110 @@ class DynamicSchemaTest(EmailPluginBase):
         self.assertIn("email_password", keys)
         self.assertNotIn("email_oauth_client_id", keys)
 
+class AuthModeSwitchTest(EmailPluginBase):
+    """切换「认证方式」后表单必须跟着变（真实故障回归）。
+
+    故障现象：用户把认证方式从 oauth2 改成 basic 并保存，页面**仍不出现**
+    「密码 / 应用密码」与「SMTP/IMAP 服务器」字段，怎么重试都填不了。
+
+    成因链（两个独立缺陷叠加，都在「实例未 install」的渲染路径上）：
+    1. `on_config_changed` 只在 `_app is None` 时造 `_SimpleApp(config)` 快照，
+       第二次保存起就不换新 → 快照永久停在第一次保存时的配置；
+    2. `contributes` 用 `_own_cfg(self._app) or _read_disk_cfg()` 取值，快照
+       非空就短路了磁盘读取，于是按**旧**的 email_auth 渲染字段。
+    """
+
+    def _cfg_dir(self, cfg):
+        """造一个临时 config_dir，让插件按磁盘配置渲染表单。"""
+        import json as _json
+        ws = tempfile.mkdtemp(prefix="lw-authswitch-")
+        cfg_dir = os.path.join(ws, "cfg")
+        os.makedirs(os.path.join(cfg_dir, "plugins", "email-plugin"), exist_ok=True)
+        path = os.path.join(cfg_dir, "config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"email-plugin": cfg}, f, ensure_ascii=False)
+        return ws, cfg_dir, path
+
+    def _save(self, path, cfg):
+        """模拟宿主保存：整块替换命名空间并落盘（与 save_config 语义一致）。"""
+        import json as _json
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"email-plugin": cfg}, f, ensure_ascii=False)
+
+    def test_switch_to_basic_after_save_shows_password_fields(self):
+        """第 2 次保存（切 basic）后必须出现密码与服务器字段——本用例钉死该 bug。"""
+        ws, cfg_dir, path = self._cfg_dir(
+            {"email_auth": "oauth2", "email_user": "u@x.com",
+             "email_oauth_provider": "outlook"})
+        orig = emailplugin._config_dir
+        emailplugin._config_dir = lambda: cfg_dir
+        emailplugin._DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
+        try:
+            plug = emailplugin.EmailPlugin()          # 未 install：_app is None
+            keys = [s["key"] for s in plug.contributes["settings"]]
+            self.assertNotIn("email_password", keys, "oauth2 下本不该有密码字段")
+
+            # 第一次保存：填了账号，仍是 oauth2
+            first = {"email_auth": "oauth2", "email_user": "u@x.com",
+                     "email_oauth_provider": "outlook"}
+            self._save(path, first)
+            plug.on_config_changed({"email-plugin": first})
+            self.assertNotIn("email_password",
+                             [s["key"] for s in plug.contributes["settings"]])
+
+            # 第二次保存：用户切到 basic（关键：快照必须跟着换新）
+            second = dict(first, email_auth="basic")
+            self._save(path, second)
+            plug.on_config_changed({"email-plugin": second})
+            keys2 = [s["key"] for s in plug.contributes["settings"]]
+        finally:
+            emailplugin._config_dir = orig
+            emailplugin._DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
+            shutil.rmtree(ws, ignore_errors=True)
+
+        self.assertIn("email_password", keys2)
+        self.assertIn("email_smtp_host", keys2)
+        self.assertIn("email_imap_host", keys2)
+        self.assertNotIn("email_oauth_authorize", keys2)
+
+    def test_stale_snapshot_does_not_override_disk(self):
+        """即使钩子没被调用（快照过期），表单也要按磁盘的最新配置渲染。"""
+        ws, cfg_dir, path = self._cfg_dir(
+            {"email_auth": "basic", "email_user": "u@x.com"})
+        orig = emailplugin._config_dir
+        emailplugin._config_dir = lambda: cfg_dir
+        emailplugin._DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
+        try:
+            plug = emailplugin.EmailPlugin()
+            # 塞一个「旧的」_SimpleApp 快照（oauth2），磁盘上已改成 basic
+            plug._app = emailplugin._SimpleApp({"email-plugin": {
+                "email_auth": "oauth2", "email_user": "u@x.com"}})
+            keys = [s["key"] for s in plug.contributes["settings"]]
+        finally:
+            emailplugin._config_dir = orig
+            emailplugin._DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
+            shutil.rmtree(ws, ignore_errors=True)
+        self.assertIn("email_password", keys, "过期的 _SimpleApp 快照不该盖住磁盘配置")
+
+    def test_hook_refreshes_simple_app_snapshot(self):
+        """每次保存都要换新兜底快照，否则第二次保存后读到的仍是旧配置。"""
+        self.plugin._app = None
+        self.plugin.on_config_changed({"email-plugin": {"email_auth": "oauth2",
+                                                        "email_user": "a@x.com"}})
+        first = self.plugin._app
+        self.assertEqual(type(first).__name__, "_SimpleApp")
+        self.plugin.on_config_changed({"email-plugin": {"email_auth": "basic"}})
+        self.assertEqual(
+            emailplugin._own_cfg(self.plugin._app).get("email_auth"), "basic",
+            "第二次保存后快照仍是旧配置 → 表单按 oauth2 渲染，密码字段永不出现")
+
+    def test_hook_keeps_real_app_object(self):
+        """已 install 的真实宿主 app 不该被 _SimpleApp 顶替（否则读不到审批门等）。"""
+        real = _App(config={"email-plugin": {"email_auth": "basic"}})
+        self.plugin._app = real
+        self.plugin.on_config_changed({"email-plugin": {"email_auth": "oauth2"}})
+        self.assertIs(self.plugin._app, real)
+
 
 class OauthBrowserTest(EmailPluginBase):
     """授权时自动打开浏览器（用户期望『弹出网页 approve』）。"""
@@ -1641,7 +1745,7 @@ class NewToolsRegisteredTest(EmailPluginBase):
             self.assertIn(n, names)
 
     def test_version_is_150(self):
-        self.assertEqual(emailplugin.EmailPlugin.version, "1.5.0")
+        self.assertEqual(emailplugin.EmailPlugin.version, "1.5.1")
 
 class ConfigHotReloadTest(EmailPluginBase):
     """on_config_changed 热生效：改账号/认证方式后不能还吃旧缓存。

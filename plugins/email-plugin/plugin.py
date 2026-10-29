@@ -1554,7 +1554,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.5.0"
+    version = "1.5.1"
     description = (
         "邮件：SMTP 发信 / 回复 / 转发（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱"
         "列表 / 关键词搜索 / 读取单封（含附件清单）/ 文件夹管理 / 删除·移动·标记。"
@@ -1569,7 +1569,16 @@ class EmailPlugin(ToolPlugin):
     #: 实例未绑定 app 时（宿主只实例化不 install）读磁盘 config.json 取当前值。
     @property
     def contributes(self) -> Dict[str, Any]:
-        own = _own_cfg(self._app) or _read_disk_cfg()
+        # 真实宿主 app 的内存配置是最新事实源；但渲染设置表单时实例往往**没有
+        # install**（_app 为 None），或被我们塞了 `_SimpleApp` 兜底快照。后者在
+        # 第二次保存后就指向上一版配置——`save_config` 是整块替换命名空间，
+        # 快照持有的还是旧的嵌套 dict，不会自己更新。于是「认证方式改成 basic
+        # 并保存」后表单仍按 oauth2 渲染，密码/SMTP 字段永远不出现（真实故障：
+        # 用户怎么重试都填不了服务器和密码）。这两种情况一律以磁盘 config.json
+        # 为准（宿主保存时已原子落盘）。
+        own = _own_cfg(self._app)
+        if not own or isinstance(self._app, _SimpleApp):
+            own = _read_disk_cfg() or own
         mode = _resolve_auth_mode(own)
         provider = str(own.get("email_oauth_provider") or DEFAULT_PROVIDER).strip().lower()
         custom = provider == "custom"
@@ -1719,11 +1728,18 @@ class EmailPlugin(ToolPlugin):
         - `_device_cache`：设备码与当前 client_id 绑定，配置变了必须重取。
 
         不动 `_AUTH_PENDING`（进行中的授权流程与配置无关）。
+
+        另外必须**每次保存都刷新 `_SimpleApp` 快照**：宿主渲染设置表单时插件
+        实例没有 install 过（`_app` 为 None），首次保存时我们用传入的 config
+        造了一个 `_SimpleApp` 兜底；若不换新，第二次保存后 `_own_cfg(self._app)`
+        读到的仍是**第一次保存时的快照**，表现为「改成 basic 并保存，设置页
+        还是不出现密码/SMTP 字段」，且怎么重试都不出现（真实故障）。
         """
         global _DISK_CFG
-        if self._app is None and isinstance(config, dict):
-            # 实例未绑定 app（宿主只实例化不 install）时，用传入的配置兜底
-            self._app = _SimpleApp(config)
+        if self._app is None or isinstance(self._app, _SimpleApp):
+            # 未绑定真宿主 app，或绑的还是我们自己的兜底快照 → 换成最新配置
+            if isinstance(config, dict):
+                self._app = _SimpleApp(config)
         with _oauth_lock:
             _token_cache.update({"key": "", "access": "", "exp": 0.0})
         _DISK_CFG.update({"path": "", "mtime": 0.0, "data": {}})
