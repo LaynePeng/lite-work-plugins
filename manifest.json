@@ -285,7 +285,7 @@
     },
     {
       "name": "astock-plugin",
-      "version": "2.3.0",
+      "version": "2.3.1",
       "description": "A 股助手（按「没时间盯盘」设计）：**量化选股 + 回测推荐率（v1.9.0：全市场扫描→多因子池内打分→按现金/单票上限换算成具体股数，输出买哪几只·各买多少股·止损止盈价；内置三套策略 momentum 趋势动量/reversal 均值回归/quality 质量价值，右栏「选股」tab 一次展示三套策略对比（v2.2.0 起为卡片看板：一票一卡带得分/仓位进度条、共识标的标绿；聊天侧输出改为 kpi+board+table 富围栏，不再是全角缩进纯文本）（一次数据采集同时算三套，价格同源可比）并**直接给出「该用哪套」的人话结论**（含风险提示，绝不把历史胜率讲成上涨概率）；**策略回测**把策略放回近 2.6 年历史逐期重放（防未来函数：次日开盘买入），统计「多少期跑赢沪深300」= 推荐率，并报最大回撤与逐期明细；推荐率按 A/B/C/D 分档且强制标注样本数，样本不足一律降档——结论衡量策略不是个股上涨概率）** + 行情/K线/选股/资金流 + 投资舆情分析（公告·研报·新闻·热度·龙虎榜·两融·股东户数七类证据，标可靠度与方向，优先给信号背离，不合成情绪分） + 手工交易台账 + **条件单参数**（算出可直接挂的委托价/止损价/止盈价，挂一次白天不用看盘） + **成交回单同步**（粘贴券商成交明细或 CSV，自动解析多笔、匹配建议计划、校价、落账） + 下单提示 + **盯盘自动落地**（说一句「启动盯盘」即自动创建/维护宿主盯梢计划并自愈，无需手动去盯梢页建计划；附「最近一次探测」体检，工作日 9:10–15:00 自动作息，午休跳过，收盘自动停，非交易时段零 token）。**你自己在券商下单，插件只记账与提示，不含任何委托/撤单/券商对接通道**。行情腾讯主源、新浪与东财备源（含限流重试与自动换源）；零第三方依赖（纯标准库）；含盯梢源、右栏持仓面板（markdown/tree 可切）；数据落盘 <workspace>/.astock/ledger.sqlite + **高风险邮件通知**（复用 email-plugin 的邮箱与凭据，含 OAuth2；只发【计划外】的紧急信号，同一信号 6 小时去重、每小时上限 12 封）",
       "path": "plugins/astock-plugin",
       "tools": [
@@ -327,6 +327,21 @@
           "**/.astock/**"
         ]
       }
+    },
+    {
+      "name": "watch-plugin",
+      "version": "1.0.0",
+      "description": "盯梢 / 定时计划的**工具面**：让模型能看见「现在到底在盯什么」并直接改配置。lite-work 的盯梢（watch & schedule）是宿主内置子系统（调度循环·指纹比对·跨进程触发租约·通知总线·无人值守权限档），但长期只有 REST 面 `/api/schedules`，**没有任何 Agent 工具**——于是界面能建计划、模型却只能回「请到右栏盯梢页手动新建」。本插件补上这一层：schedule_sources（可用数据源 + 各源的 probe_config 字段说明）/ schedule_list（计划清单，含探针参数与最近运行）/ schedule_get / schedule_upsert（创建或修改；probe_config 支持整体替换、按键合并 merge_probe_config、删键 drop_probe_keys）/ schedule_run（立即触发一次，走与定时触发完全相同的探针→指纹→按需唤 Agent 路径）/ schedule_delete（默认 dry_run 只预览）。与宿主 REST 走同一条数据通路（app.schedule_store + watch_scheduler.reschedule），不与界面互相覆盖。安全边界：workspace 钉死为当前工作区（探针盯哪个目录不接受调用方指定）、权限档只允许 read/read+web（与宿主 ALLOWED_PERMISSIONS 一致）、source 写入前对照 watch_registry 校验（写错只会让计划永远记 error）、改删其他工作区的计划需显式 force、删除默认预览。零第三方依赖（纯标准库 + 宿主稳定接口）。",
+      "path": "plugins/watch-plugin",
+      "tools": [
+        "schedule_sources",
+        "schedule_list",
+        "schedule_get",
+        "schedule_upsert",
+        "schedule_run",
+        "schedule_delete"
+      ],
+      "permissions": {}
     }
   ],
   "skills": [

@@ -57,9 +57,17 @@ def _install_litework_stubs() -> None:
         "litework.core.types": types.ModuleType("litework.core.types"),
         "litework.tools": types.ModuleType("litework.tools"),
         "litework.tools.plugin": types.ModuleType("litework.tools.plugin"),
+        "litework.watch": types.ModuleType("litework.watch"),
     }
     for k, m in mods.items():
         sys.modules.setdefault(k, m)
+    # 桩模块必须带 `__path__`，否则 `litework.watch` 这类子模块 import 会报
+    # `'litework' is not a package`——盯盘计划读写的测试正需要那条路径
+    # （`plan.ensure_plan` 延迟 import `litework.watch.schedule_store`）。
+    for name in ("litework", "litework.core", "litework.tools", "litework.watch"):
+        mod = sys.modules.get(name)
+        if mod is not None and not hasattr(mod, "__path__"):
+            mod.__path__ = []
     # 用 setdefault 挂属性：别的测试模块可能已给同名模块设了自己的桩
     # （例如 plan 的 schedule_store），这里只补缺、不覆盖
     core_types = sys.modules["litework.core.types"]
@@ -68,6 +76,49 @@ def _install_litework_stubs() -> None:
     tools_plugin = sys.modules["litework.tools.plugin"]
     if not hasattr(tools_plugin, "ToolPlugin"):
         tools_plugin.ToolPlugin = _ToolPlugin
+
+    # `litework.watch.schedule_store.Schedule`：盯盘计划读写的测试要它。
+    # 仍然用 setdefault 语义——`test_astock_plan` 若已注册自己的桩就沿用，
+    # 两边不抢（否则 discover 下顺序不同会互相覆盖，症状是随机的
+    # AttributeError）。
+    if "litework.watch.schedule_store" not in sys.modules:
+        store_mod = types.ModuleType("litework.watch.schedule_store")
+
+        class _Schedule:
+            _seq = 0
+
+            def __init__(self, **kw):
+                _Schedule._seq += 1
+                self.id = kw.get("id") or f"sch_{_Schedule._seq}"
+                self.name = kw.get("name", "")
+                self.enabled = kw.get("enabled", True)
+                self.schedule_mode = kw.get("schedule_mode", "interval")
+                self.interval_seconds = kw.get("interval_seconds", 3600)
+                self.time_of_day = kw.get("time_of_day", "09:00")
+                self.cron = kw.get("cron", "")
+                self.session_id = kw.get("session_id")
+                self.workspace = kw.get("workspace", "")
+                self.prompt = kw.get("prompt", "")
+                self.source = kw.get("source", "")
+                self.probe_config = dict(kw.get("probe_config") or {})
+                self.permissions = kw.get("permissions", "read")
+                self.notify = list(kw.get("notify") or ["in_app"])
+                self.catch_up = kw.get("catch_up", "once")
+                self.last_run = kw.get("last_run")
+                self.last_hash = kw.get("last_hash", "")
+                self.last_status = kw.get("last_status", "")
+                self.runs = list(kw.get("runs") or [])
+
+            def to_dict(self):
+                return dict(self.__dict__)
+
+        store_mod.Schedule = _Schedule
+        store_mod.ScheduleStore = object
+        store_mod.RunRecord = object
+        sys.modules["litework.watch.schedule_store"] = store_mod
+    watch_mod = sys.modules["litework.watch"]
+    if not hasattr(watch_mod, "schedule_store"):
+        watch_mod.schedule_store = sys.modules["litework.watch.schedule_store"]
 
 
 _install_litework_stubs()
@@ -830,6 +881,245 @@ class TestWatchControl(unittest.TestCase):
                 loop.close()
         self.assertEqual(res.snapshot, "")
         self.assertIn("不盯盘", res.summary)
+
+
+class _WatchPlanApp:
+    """带**内存计划存储**的 app 替身（`astock_watch` 计划读写的测法）。
+
+    真实宿主用 `ScheduleStore`（落盘 `~/.lite-work/schedules.json`）——测试
+    绝不能碰用户真实计划文件，所以这里用内存版替身，但保持与宿主同名的
+    方法与属性（`schedule_store.all/get/upsert/delete`、
+    `watch_scheduler.reschedule`），否则测的就不是真实调用路径。
+    """
+
+    def __init__(self, workspace: str, ledger_path: str, watch: bool = True):
+        self.workspace = workspace
+        self.config = {"astock-plugin": {
+            "ledger_path": ledger_path,
+            "watch_enabled": watch,
+            "watch_only_trading_hours": False,
+        }}
+        self.schedule_store = _MemStore()
+        self.watch_scheduler = _MemScheduler()
+
+    def save_config(self, upd):
+        for k, v in upd.items():
+            self.config.setdefault("astock-plugin", {})[k] = v
+
+
+class _MemStore:
+    def __init__(self):
+        self.items = {}
+
+    def all(self):
+        return list(self.items.values())
+
+    def get(self, sid):
+        return self.items.get(sid)
+
+    def upsert(self, sched):
+        self.items[sched.id] = sched
+        return sched
+
+    def delete(self, sid):
+        return self.items.pop(sid, None) is not None
+
+
+class _MemScheduler:
+    def __init__(self):
+        self.rescheduled = []
+
+    def reschedule(self, sid=None):
+        self.rescheduled.append(sid)
+
+
+class TestWatchScopeVisibility(unittest.TestCase):
+    """v2.3.1：`astock_watch status/plan` 必须能回答「到底在盯什么」。
+
+    背景（真实缺口）：`diagnose()` 早先只读 interval/enabled/last_run，
+    **从不读 probe_config**；而精确价位规则只存在于计划级 `probe_config`，
+    设置页 schema 里没有 rules/codes/kinds 这些键。两者叠加的后果是：
+    7 条价位规则躺在计划里，模型既看不见也改不了（只能回"请去右栏手动改"）。
+    这一组测试锁住「看得见」与「改得动」两条。
+    """
+
+    RULES = [
+        {"code": "000651", "name": "格力电器", "kind": "stop_loss",
+         "price": 36.0, "op": "lt", "severity": "urgent",
+         "label": "跌破前低清仓"},
+        {"code": "002532", "name": "天山铝业", "kind": "take_profit",
+         "price": 13.71, "op": "gt", "severity": "action"},
+    ]
+
+    def setUp(self):
+        import datetime as dt
+        self.tmp = tempfile.mkdtemp(prefix="astock-scope-")
+        self.path = os.path.join(self.tmp, "l.sqlite")
+        lg = ledger_mod(self.path)
+        yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        lg.record_trade("600000", "buy", 10.0, 1000, trade_date=yday, name="浦发银行")
+        self.app = _WatchPlanApp(self.tmp, self.path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _plugin(self):
+        pl = astock.AstockPlugin()
+        pl._app = self.app
+        return pl
+
+    def _call(self, args):
+        import asyncio
+        pl = self._plugin()
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(pl.execute("astock_watch", args))
+        finally:
+            loop.close()
+
+    def _seed(self, cfg):
+        res = astock.plan_ctl.ensure_plan(self.app, self.tmp, interval=300,
+                                          probe_cfg=cfg)
+        self.assertTrue(res["ok"], res)
+        return res["schedule_id"]
+
+    # ---- 看得见 ----
+
+    def test_status_lists_rules(self):
+        self._seed({"rules": self.RULES, "min_level": "urgent"})
+        out = self._call({"action": "status"})
+        self.assertIn("在盯什么", out)
+        self.assertIn("2 条价位规则", out)
+        self.assertIn("格力电器(000651)", out, "status 里要能看见具体规则")
+
+    def test_status_without_config_says_defaults(self):
+        self._seed({})
+        out = self._call({"action": "status"})
+        self.assertIn("在盯什么", out)
+        self.assertIn("按默认范围盯", out)
+
+    def test_status_without_plan_points_forward(self):
+        out = self._call({"action": "status"})
+        self.assertIn("还没有可读的盯梢计划", out)
+
+    def test_plan_action_shows_raw_json(self):
+        self._seed({"rules": self.RULES, "codes": "600000"})
+        out = self._call({"action": "plan"})
+        self.assertIn("当前实际生效", out)
+        self.assertIn("```json", out)
+        self.assertIn("000651", out)
+        self.assertIn("覆盖代码", out)
+
+    def test_plan_action_without_plan(self):
+        out = self._call({"action": "plan"})
+        self.assertIn("没有可读的计划", out)
+
+    # ---- 改得动 ----
+
+    def test_set_rules_replaces(self):
+        self._seed({"rules": self.RULES, "min_level": "urgent"})
+        out = self._call({"action": "set_rules", "rules": [self.RULES[0]]})
+        self.assertIn("已写入盯盘规则（共 1 条）", out)
+        sched = self.app.schedule_store.all()[0]
+        self.assertEqual(len(sched.probe_config["rules"]), 1)
+        self.assertEqual(sched.probe_config["rules"][0]["code"], "000651")
+        # 只动 rules，别的键不能被静默清空——这是最容易造成的静默失效
+        self.assertEqual(sched.probe_config["min_level"], "urgent")
+
+    def test_set_rules_appends(self):
+        self._seed({"rules": [self.RULES[0]]})
+        out = self._call({"action": "set_rules", "add_rules": [self.RULES[1]]})
+        self.assertIn("已写入盯盘规则（共 2 条）", out)
+        codes = [r["code"] for r in self.app.schedule_store.all()[0].probe_config["rules"]]
+        self.assertEqual(codes, ["000651", "002532"])
+
+    def test_set_rules_removes_by_code(self):
+        self._seed({"rules": self.RULES})
+        self._call({"action": "set_rules", "remove_rules": ["000651"]})
+        rules = self.app.schedule_store.all()[0].probe_config["rules"]
+        self.assertEqual([r["code"] for r in rules], ["002532"])
+
+    def test_set_rules_also_updates_scope(self):
+        self._seed({"rules": self.RULES})
+        self._call({"action": "set_rules", "rules": self.RULES,
+                    "min_level": "info", "codes": "600000,000001"})
+        cfg = self.app.schedule_store.all()[0].probe_config
+        self.assertEqual(cfg["min_level"], "info")
+        self.assertEqual(cfg["codes"], "600000,000001")
+
+    def test_set_rules_rejects_invalid_without_writing(self):
+        self._seed({"rules": self.RULES})
+        out = self._call({"action": "set_rules",
+                          "rules": [{"code": "000651"}]})   # 缺 price
+        self.assertIn("[Error]", out)
+        self.assertEqual(len(self.app.schedule_store.all()[0].probe_config["rules"]), 2,
+                         "校验失败不该改动已有规则")
+
+    def test_set_rules_requires_something(self):
+        self._seed({"rules": self.RULES})
+        out = self._call({"action": "set_rules"})
+        self.assertIn("[Error]", out)
+        self.assertIn("add_rules", out)
+
+    def test_set_rules_without_plan(self):
+        out = self._call({"action": "set_rules", "rules": self.RULES})
+        self.assertIn("[Error]", out)
+        self.assertIn("action=start", out)
+
+    def test_set_rules_keeps_fingerprint_baseline(self):
+        """改规则不能丢 last_hash，否则恢复时把当前所有信号当"新变化"重报。"""
+        sid = self._seed({"rules": self.RULES})
+        self.app.schedule_store.get(sid).last_hash = "baseline-abc"
+        self._call({"action": "set_rules", "rules": [self.RULES[0]]})
+        self.assertEqual(self.app.schedule_store.get(sid).last_hash, "baseline-abc")
+
+    def test_set_rules_warns_when_switch_off(self):
+        """开关关着时写了规则也不会跑——必须点出来，否则用户以为已生效。"""
+        self.app.config["astock-plugin"]["watch_enabled"] = False
+        self._seed({"rules": self.RULES})
+        out = self._call({"action": "set_rules", "rules": [self.RULES[0]]})
+        self.assertIn("开关是**关闭**", out)
+
+    def test_set_rules_does_not_resume_paused_plan(self):
+        """回归：改规则不等于「启动盯盘」，绝不能把用户暂停的计划改回启用。
+
+        与 v2.3.0 修的「点了停用几分钟后被自愈推翻」同一类问题——系统推翻
+        用户的明确意图。`ensure_plan` 默认 respect_paused=False 会顺手
+        `enabled=True`，所以这条路径必须显式传 True。
+        """
+        sid = self._seed({"rules": self.RULES})
+        astock.plan_ctl.set_enabled(self.app, False)
+        self.assertFalse(self.app.schedule_store.get(sid).enabled)
+
+        out = self._call({"action": "set_rules", "rules": [self.RULES[0]]})
+        self.assertIn("已写入盯盘规则", out)
+        self.assertFalse(self.app.schedule_store.get(sid).enabled,
+                         "改规则不得重新启用用户暂停的计划")
+
+    def test_set_rules_empty_list_clears(self):
+        """`rules=[]` 是合法的「清空」——换成只按百分比阈值盯。"""
+        self._seed({"rules": self.RULES, "min_level": "urgent"})
+        out = self._call({"action": "set_rules", "rules": []})
+        self.assertIn("已清空价位规则", out)
+        cfg = self.app.schedule_store.all()[0].probe_config
+        self.assertEqual(cfg["rules"], [])
+        self.assertEqual(cfg["min_level"], "urgent", "清规则不该动别的键")
+
+
+class TestWatchPlanApp(unittest.TestCase):
+    """`_WatchPlanApp` 测试替身自身的契约（防止替身与真实宿主漂移）。"""
+
+    def test_store_and_scheduler(self):
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp(prefix="astock-fake-")
+        try:
+            app = _WatchPlanApp(tmp, os.path.join(tmp, "l.sqlite"))
+            self.assertEqual(app.workspace, tmp)
+            self.assertEqual(app.schedule_store.all(), [])
+            self.assertIsNotNone(app.watch_scheduler)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestPriceRulesInProbe(unittest.TestCase):

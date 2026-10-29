@@ -380,4 +380,157 @@ def diagnose(app: Any, now_watching: bool, only_hours: bool,
     else:
         out["verdict"] = (f"全链路就绪 —— 每 {out['plan_interval']} 秒探测一次，"
                           f"仅工作日 9:10–15:00 生效")
+    out["probe_config"] = _plan_probe_config(mine[0]) if mine else {}
+    out["summary"] = summarize_probe_config(out["probe_config"]) if mine else ""
+    return out
+
+
+# ---------------------------------------------------------------- 探针参数摘要
+#
+# 为什么这块必须补（v2.3.1）：`diagnose()` 早先只读 interval/enabled/last_run，
+# **从不读 probe_config**。于是 `astock_watch status` 的体检表能告诉你"在盯、
+# 每 300 秒"，却答不出用户真正要问的那句——**到底在盯什么**。
+# 实际后果：7 条精确价位规则躺在计划里，模型与用户都看不见；而设置页的
+# `contributes.settings` 里根本没有 rules/codes/kinds 这些键（它们只存在于
+# 计划级 probe_config），于是"改盯什么"也就成了纯 GUI 操作。
+#
+# 摘要而不是原始 JSON：窄栏与聊天里 JSON 会折成一行看不清，且人关心的是
+# "哪只股、什么价、什么动作"，不是字段名。
+
+#: probe_config 里**由插件读取**的键（顺序即展示顺序）。
+#: 与 `AStockWatch.config_schema` / `probe.pick()` 保持一致——这里多一个键会
+#: 让人以为配了就生效（实际探针不读），少一个键则是"配了却看不见"。
+PROBE_KEYS_READ = ("codes", "kinds", "min_level", "rules", "once_per_day")
+
+
+def _plan_probe_config(sched: Any) -> Dict[str, Any]:
+    """取计划里的 probe_config（非 dict 时返回空表，绝不抛）。"""
+    try:
+        cfg = getattr(sched, "probe_config", None)
+        return dict(cfg) if isinstance(cfg, dict) else {}
+    except Exception:  # noqa: BLE001 - 宿主结构变动时如实降级为空
+        return {}
+
+
+def summarize_probe_config(cfg: Dict[str, Any]) -> str:
+    """probe_config → 人类可读摘要（Markdown，可空）。
+
+    **只陈述配置，不做判断**：这里既不查行情也不评估"这个止损位合不合理"，
+    只把"你让它盯什么"如实翻译成一句话，避免体检页给出误导性结论。
+    """
+    if not isinstance(cfg, dict) or not cfg:
+        return ""
+    parts: List[str] = []
+
+    raw_rules = cfg.get("rules")
+    rules, errs = _parse_rules_lenient(raw_rules)
+    if rules:
+        codes = sorted({str(r.get("code") or "") for r in rules})
+        stop = sum(1 for r in rules if str(r.get("kind") or "") == "stop_loss")
+        take = sum(1 for r in rules if str(r.get("kind") or "") == "take_profit")
+        urgent = sum(1 for r in rules if str(r.get("severity") or "") == "urgent")
+        bits = [f"{len(rules)} 条价位规则", f"覆盖 {len(codes)} 只"]
+        if stop:
+            bits.append(f"止损 {stop}")
+        if take:
+            bits.append(f"止盈 {take}")
+        if urgent:
+            bits.append(f"紧急 {urgent}")
+        parts.append("、".join(bits))
+    if errs:
+        parts.append(f"⚠️ {len(errs)} 条规则配置有误")
+
+    codes_raw = str(cfg.get("codes") or "").strip()
+    if codes_raw:
+        parts.append(f"额外盯 {len([c for c in codes_raw.replace('，', ',').split(',') if c.strip()])} 只")
+    kinds_raw = str(cfg.get("kinds") or "").strip()
+    if kinds_raw:
+        parts.append(f"信号类型限 {kinds_raw}")
+    level = str(cfg.get("min_level") or "").strip()
+    if level:
+        parts.append(f"报告级别 {level} 起")
+    once = cfg.get("once_per_day")
+    if once not in (None, ""):
+        parts.append("当天去重 " + ("开" if _truthy(once) else "关"))
+
+    known = set(PROBE_KEYS_READ)
+    unknown = [k for k in cfg if k not in known]
+    text = "；".join(parts) if parts else "已配置但无可识别的键"
+    if unknown:
+        # 写了探针不读的键 = 静默不生效（最典型的"配了没反应"）
+        text += f"（另有未识别键：{'、'.join(sorted(unknown))}，探针不会读）"
+    return text
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "是", "开"}
+
+
+def _parse_rules_lenient(raw: Any) -> "Tuple[List[Dict[str, Any]], List[str]]":
+    """解析规则（复用 price_rule，但绝不因配置写错而让体检页报错）。
+
+    `astock_price_rule` 是单独模块且被探针依赖；这里**容忍 import 失败**
+    （单测里按文件加载时未插入插件目录的情况），退回"能数出几条就数几条"，
+    宁可摘要粗糙，也不能让 `status` 直接抛。
+    """
+    try:
+        import astock_price_rule as _pr
+        return _pr.parse_rules(raw)
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(raw, str):
+        try:
+            import json as _json
+            raw = _json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return [], ["rules 不是合法 JSON"]
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return [], []
+    out = [r for r in raw if isinstance(r, dict) and str(r.get("code") or "").strip()]
+    return out, []
+
+
+def describe_rules(cfg: Dict[str, Any], limit: int = 20) -> List[str]:
+    """逐条列出价位规则（发给人的清单，不参与任何判定）。
+
+    `limit` 兜底：规则多到几十条时全列会把 status 淹没，只列前 N 条并说明。
+    """
+    raw = (cfg or {}).get("rules")
+    rules, _errs = _parse_rules_lenient(raw)
+    if not rules:
+        return []
+    arrow = {"lt": "跌破", "le": "触及", "gt": "站上", "ge": "站上"}
+    out: List[str] = []
+    for r in rules[:max(1, limit)]:
+        code = str(r.get("code") or "")
+        name = str(r.get("name") or "")
+        label = str(r.get("label") or "")
+        op = str(r.get("op") or "lt")
+        price = r.get("price")
+        sev = str(r.get("severity") or "action")
+        try:
+            cond = f"{arrow.get(op, op)} {float(price):g}"
+        except (TypeError, ValueError):
+            cond = "(价位非法)"
+        head = f"{name}({code})" if name else code
+        line = f"- {head} {cond}"
+        if label:
+            line += f"｜{label}"
+        line += f"　`{sev}`"
+        vr_gt, vr_lt = r.get("vol_ratio_gt"), r.get("vol_ratio_lt")
+        if vr_gt not in (None, ""):
+            line += f"（放量 >{vr_gt}）"
+        if vr_lt not in (None, ""):
+            line += f"（缩量 <{vr_lt}）"
+        out.append(line)
+    if len(rules) > limit:
+        out.append(f"- …另有 {len(rules) - limit} 条未列出")
     return out

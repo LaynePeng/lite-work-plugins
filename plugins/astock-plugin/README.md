@@ -516,6 +516,41 @@ Agent 会调用 `astock_record`，先返回**预览**（费用明细、成本价
 
 **非交易时段零 token 消耗**——探针直接返回"无变化"，不会唤醒模型。
 
+### 看 / 改「到底在盯什么」（v2.3.1）
+
+盯盘规则（精确价位、代码范围、信号类型、报告级别）**只存在于计划级
+`probe_config`**，设置页 schema 里没有这些键。v2.3.1 之前这是两个死角的叠加：
+
+- `astock_watch status` 的体检表只读 interval/enabled/last_run，**从不读
+  `probe_config`** → 规则内容看不见；
+- 工具没有写入口 → 模型只能回"请到右栏「盯梢」页手动改"。
+
+现在补了三个动作：
+
+```
+# 看：体检（含「在盯什么」摘要）+ 完整规则
+astock_watch action=status      # 体检表 + 规则摘要 + 范围兜底说明
+astock_watch action=plan        # 完整规则清单 + 原始 probe_config JSON
+
+# 改：三种写法（都只动给出的键，其余保留）
+astock_watch action=set_rules rules=[...]                 # 整体替换
+astock_watch action=set_rules add_rules=[{...}]           # 追加
+astock_watch action=set_rules remove_rules=["000651"]     # 按代码删除
+astock_watch action=set_rules add_rules=[...] min_level=urgent   # 同时调阈值
+```
+
+`set_rules` 的三条安全语义（每条都对应一种真实误操作）：
+
+1. **只动给出的键**——改一条止损价不会把你配的 codes/kinds/min_level 清空
+   （整体覆盖 `probe_config` 的症状是"只改了个价位，其他提醒全没了"）；
+2. **先校验再写盘**——非法规则（缺 code/price、op 写错）直接报错，不落半截配置；
+3. **保留指纹基线**——走 `ensure_plan` 的合并语义，不会因为改规则就把当前
+   所有信号当"新变化"重报一遍。
+
+> 需要操作**非 astock 的盯梢计划**（邮箱、网页、命令、其他插件）时，用通用
+> 插件 `watch-plugin`：`schedule_list` / `schedule_get` / `schedule_upsert` /
+> `schedule_run` / `schedule_delete`，任何盯梢源通用。
+
 盯什么（四类优化）：
 
 - **A 股时段信号**：集合竞价异动（9:15–9:30）、开盘跳空（9:30–10:00）、尾盘异动（14:30–15:00）
@@ -627,7 +662,7 @@ rules: [
 | `astock_sync` | 成交回单批量同步 | "把这段成交同步进台账" |
 | `astock_portfolio` | 台账总览 / 流水 / 设资金 / 纠错 | "看持仓 / 我的成交记录" |
 | `astock_events` | 事件驱动筛股 | "今天有哪些回购公告" |
-| `astock_watch` | 自选股 + 盯盘开关 | "加自选 / 启动盯盘" |
+| `astock_watch` | 自选股 + 盯盘开关 + **盯盘规则读写** | "加自选 / 启动盯盘 / 现在在盯什么 / 把止损改成 35" |
 
 > `astock_pick` 与 `astock_screen` / `astock_events` 的分工：
 > **pick 是决策引擎**（多因子打分 → 算出股数），后两者是**信息检索**

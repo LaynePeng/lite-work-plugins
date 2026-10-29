@@ -446,6 +446,109 @@ class TestSetEnabled(unittest.TestCase):
         self.assertIn("还没有", res["message"])
 
 
+class TestProbeConfigSummary(unittest.TestCase):
+    """v2.3.1：体检必须能回答「到底在盯什么」。
+
+    此前 `diagnose()` 只读 interval/enabled/last_run，**从不读 probe_config**，
+    于是 7 条精确价位规则躺在计划里而模型与用户都看不见；设置页 schema 里
+    也没有 rules/codes/kinds，改内容只能走 GUI。这一组测试锁住"看得见"。
+    """
+
+    RULES = [
+        {"code": "000651", "name": "格力电器", "kind": "stop_loss",
+         "price": 36.0, "op": "lt", "severity": "urgent",
+         "label": "跌破前低 36.00 清仓"},
+        {"code": "002532", "name": "天山铝业", "kind": "stop_loss",
+         "price": 11.02, "op": "lt", "severity": "urgent"},
+        {"code": "002354", "name": "天娱数科", "kind": "observe",
+         "price": 7.93, "op": "lt", "severity": "info",
+         "vol_ratio_lt": 0.8},
+        {"code": "002532", "name": "天山铝业", "kind": "take_profit",
+         "price": 13.71, "op": "gt", "severity": "action"},
+    ]
+
+    def _app(self, cfg):
+        app = FakeApp()
+        sid = plan.ensure_plan(app, "/ws", interval=300)["schedule_id"]
+        app.schedule_store.get(sid).probe_config = dict(cfg)
+        return app
+
+    # ---- 概览 ----
+
+    def test_summary_counts_rules(self):
+        text = plan.summarize_probe_config({"rules": self.RULES})
+        self.assertIn("4 条价位规则", text)
+        self.assertIn("覆盖 3 只", text)
+        self.assertIn("止损 2", text)
+        self.assertIn("止盈 1", text)
+        self.assertIn("紧急 2", text)
+
+    def test_summary_includes_scope_keys(self):
+        text = plan.summarize_probe_config({
+            "codes": "600000,000001", "kinds": "stop_loss,tail",
+            "min_level": "urgent", "once_per_day": False})
+        self.assertIn("额外盯 2 只", text)
+        self.assertIn("信号类型限", text)
+        self.assertIn("报告级别 urgent", text)
+        self.assertIn("当天去重 关", text)
+
+    def test_summary_flags_unknown_keys(self):
+        """写了探针不读的键 = 静默不生效，必须点出来。"""
+        text = plan.summarize_probe_config({"stop_loss_pct": 8})
+        self.assertIn("未识别键", text)
+        self.assertIn("stop_loss_pct", text)
+
+    def test_summary_empty_config(self):
+        self.assertEqual(plan.summarize_probe_config({}), "")
+        self.assertEqual(plan.summarize_probe_config(None), "")
+
+    def test_summary_from_json_string(self):
+        """计划编辑器把 rules 存成 JSON 串时也要能读（否则摘要为空）。"""
+        import json
+        text = plan.summarize_probe_config({"rules": json.dumps(self.RULES)})
+        self.assertIn("4 条价位规则", text)
+
+    def test_summary_reports_broken_rules(self):
+        text = plan.summarize_probe_config({"rules": [{"no_code": 1}]})
+        self.assertIn("配置有误", text)
+
+    # ---- 逐条 ----
+
+    def test_describe_rules_lines(self):
+        lines = plan.describe_rules({"rules": self.RULES})
+        self.assertEqual(len(lines), 4)
+        joined = "\n".join(lines)
+        self.assertIn("格力电器(000651)", joined)
+        self.assertIn("跌破 36", joined)
+        self.assertIn("站上 13.71", joined)
+        self.assertIn("urgent", joined)
+        self.assertIn("缩量", joined, "量能附加条件必须显示")
+
+    def test_describe_rules_limit(self):
+        many = [dict(self.RULES[0], price=36 + i) for i in range(30)]
+        lines = plan.describe_rules({"rules": many}, limit=5)
+        self.assertEqual(len(lines), 6, "5 条 + 1 行省略说明")
+        self.assertIn("另有 25 条未列出", lines[-1])
+
+    def test_describe_rules_empty(self):
+        self.assertEqual(plan.describe_rules({}), [])
+        self.assertEqual(plan.describe_rules({"rules": "不是 JSON"}), [])
+
+    # ---- 接进 diagnose ----
+
+    def test_diagnose_exposes_probe_config(self):
+        app = self._app({"rules": self.RULES, "min_level": "urgent"})
+        d = plan.diagnose(app, True, True)
+        self.assertEqual(len(d["probe_config"]["rules"]), 4)
+        self.assertIn("4 条价位规则", d["summary"])
+        self.assertIn("报告级别 urgent", d["summary"])
+
+    def test_diagnose_without_plan_has_empty_summary(self):
+        d = plan.diagnose(FakeApp(), True, True)
+        self.assertEqual(d["probe_config"], {})
+        self.assertEqual(d["summary"], "")
+
+
 class TestNotTouchingForeignPlans(unittest.TestCase):
     def test_other_sources_untouched(self):
         """别的插件的盯梢计划绝不能被本模块修改。"""

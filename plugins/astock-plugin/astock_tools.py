@@ -450,12 +450,20 @@ def build_tools() -> List[ToolDefinition]:
         ToolDefinition(
             name="astock_watch",
             description=(
-                "盯盘与自选股管理。action=list 看自选；add/remove 增删自选；"
-                "**status 看盯盘状态**（是否在盯、当前时段、下次开始时间）；"
+                "盯盘与自选股管理。action=list 看自选；add/remove 增删自选；\n"
+                "**status 看盯盘状态**（是否在盯、当前时段、下次开始时间、**在盯什么**）；\n"
+                "**plan 看盯盘规则**（probe_config 里的价位规则/代码范围/信号类型/级别，"
+                "带原始 JSON）；\n"
+                "**set_rules 改盯盘规则**（rules 整体替换 | add_rules 追加 | "
+                "remove_rules 按代码删除；也可同时给 codes/kinds/min_level/once_per_day）；\n"
                 "**start 启动盯盘**（开启定时探测，非交易时段自动跳过不耗 token）；"
-                "**stop 暂停盯盘**。"
+                "**stop 暂停盯盘**。\n"
                 "盯盘时段：工作日「开始时间」至 15:00，午休 11:30–13:00 跳过；"
                 "开始时间由设置项 watch_start_time 决定（HH:MM，留空＝09:10）。\n"
+                "**为什么规则要用 set_rules 而不是设置页**：精确价位规则（rules）"
+                "只存在于**计划级 probe_config**，设置页 schema 里没有这些键——"
+                "这是历史上「模型看不见也改不了盯盘内容」的直接原因。"
+                "通用通道是 watch-plugin 的 `schedule_upsert merge_probe_config`。\n"
                 "**stop 是持久的**：暂停后插件重载、自愈、重启都不会自动恢复，"
                 "只有显式 start（或设置页按钮）才恢复。若用户抱怨「停不下来」，"
                 "先查 action=status 的「插件盯盘开关」而非计划 enabled——两者是不同开关。\n"
@@ -470,12 +478,45 @@ def build_tools() -> List[ToolDefinition]:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "add", "remove", "status", "start", "stop"],
+                        "enum": ["list", "add", "remove", "status", "plan",
+                                 "set_rules", "start", "stop"],
                         "description": "默认 list",
                     },
                     "code": code_prop,
                     "name": {"type": "string", "description": "名称（可选）"},
                     "note": {"type": "string", "description": "备注（可选）"},
+                    "rules": {
+                        "type": "array", "items": {"type": "object"},
+                        "description": ("action=set_rules 时整体替换价位规则。每条："
+                                        "{code, name?, kind, price, op, label?, "
+                                        "severity?, vol_ratio_gt?, vol_ratio_lt?}；"
+                                        "op: lt 跌破 / le 触及 / gt 站上 / ge 站上"),
+                    },
+                    "add_rules": {
+                        "type": "array", "items": {"type": "object"},
+                        "description": "action=set_rules 时追加（保留现有规则）",
+                    },
+                    "remove_rules": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "action=set_rules 时按股票代码删除对应规则",
+                    },
+                    "codes": {
+                        "type": "string",
+                        "description": "action=set_rules 时顺带设「额外盯的代码」（逗号分隔）",
+                    },
+                    "kinds": {
+                        "type": "string",
+                        "description": "action=set_rules 时顺带设要盯的信号类型（逗号分隔）",
+                    },
+                    "min_level": {
+                        "type": "string",
+                        "enum": ["info", "action", "urgent"],
+                        "description": "action=set_rules 时顺带设最低报告级别",
+                    },
+                    "once_per_day": {
+                        "type": "boolean",
+                        "description": "action=set_rules 时顺带设价位规则当天只报一次",
+                    },
                 },
                 "required": [],
             },
