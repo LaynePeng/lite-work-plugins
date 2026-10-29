@@ -38,7 +38,11 @@ lite-work-plugins/
 │   │   ├── astock_common.py      # 配置读取 / 格式化 / 表格（最底层）
 │   │   ├── astock_tools.py       # 16 个工具的 schema 声明（纯静态）
 │   │   ├── astock_sentiment*.py  # 舆情七类证据采集 → 归集/背离 → 渲染
-│   │   └── test_astock*.py       # 424 项离线单测（零网络、零真实台账写入）
+│   │   └── test_astock*.py       # 490 项离线单测（零网络、零真实台账写入）
+│   ├── watch-plugin/        #   盯梢 / 定时计划的**工具面**（通用，任何盯梢源可用）
+│   │   ├── plugin.py        #     schedule_sources/list/get/upsert/run/delete
+│   │   ├── test_watch_plugin.py  # 46 项离线单测（内存假 store，不碰真实计划）
+│   │   └── README.md        #     为什么需要它 + 安全边界（workspace 钉死/权限档/force）
 │   └── example-greeting/    #   示例插件（演示编写格式）
 │       └── plugin.py
 └── skills/                  # 技能（SKILL.md 指令文档）
