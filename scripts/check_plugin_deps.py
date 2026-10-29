@@ -102,6 +102,94 @@ def local_module_names(plugin_dir: Path, py_files: list) -> frozenset:
     return frozenset(names)
 
 
+def check_manifest_consistency() -> int:
+    """校验 manifest.json 与各插件实际声明是否一致。返回失败数。
+
+    为什么放进本脚本：AGENTS.md 把「manifest 登记」列为硬要求，但此前**只有
+    依赖这一项有 CI 兜底**，清单一致性靠人肉 review。实际后果已经发生过：
+    - 新增插件忘了登记 `tools`（安装后被 Agent 策略裁掉，症状是"装了但看不见工具"）；
+    - 插件加了工具却忘了更新 `tools`（同上）；
+    - `manifest.json` 顶层 `version` 连续多次发版都不 bump（停在 1.0.33，
+      读起来像"仓库没变"，见 AGENTS.md 第 2 条）。
+
+    只做**静态可判定**的检查（名称/路径/顶层版本号是数字），不导入插件模块——
+    导入需要宿主包，而 CI 里没有 litework（见 check.yml 只装 Python）。
+    工具名与 `get_tools()` 的严格比对留给各插件自带的单测。
+    """
+    import json
+
+    manifest_path = ROOT / "manifest.json"
+    if not manifest_path.is_file():
+        print("FAIL manifest.json 不存在")
+        return 1
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        print(f"FAIL manifest.json 不是合法 JSON: {exc}")
+        return 1
+
+    failures = 0
+
+    # 1) 顶层 version 必须存在且形如 semver（它是仓库内容版本，不参与判定但不该缺）
+    top = str(data.get("version") or "").strip()
+    if not top:
+        print("FAIL manifest.json 缺少顶层 version（仓库内容版本）")
+        failures += 1
+    elif not all(p.isdigit() for p in top.split(".")[:3]):
+        print(f"FAIL manifest.json 顶层 version 不是 semver: {top!r}")
+        failures += 1
+
+    # 2) 每个已登记插件：path 存在、入口文件存在、版本与插件源码一致
+    declared = {}
+    for entry in data.get("plugins") or []:
+        name = str(entry.get("name") or "").strip()
+        path = str(entry.get("path") or "").strip()
+        ver = str(entry.get("version") or "").strip()
+        if not name or not path:
+            print(f"FAIL manifest 插件条目缺 name/path: {entry!r}")
+            failures += 1
+            continue
+        declared[name] = path
+        plugin_dir = ROOT / path
+        if not plugin_dir.is_dir():
+            print(f"FAIL {name}: manifest 声明的 path 不存在 {path}")
+            failures += 1
+            continue
+        entry_py = next((plugin_dir / f for f in ("plugin.py", "__init__.py")
+                         if (plugin_dir / f).is_file()), None)
+        if entry_py is None:
+            print(f"FAIL {name}: {path} 下没有 plugin.py / __init__.py")
+            failures += 1
+            continue
+        # 版本号一致性：插件类 version（4 空格缩进的类属性）应等于 manifest.version
+        import re
+        src = entry_py.read_text(encoding="utf-8", errors="replace")
+        found = re.findall(r'^    version = "([\d.]+)"', src, re.M)
+        if found and ver and ver not in found:
+            print(f"FAIL {name}: manifest version={ver} 与 plugin.py 的 {found} 不一致")
+            failures += 1
+        elif not found:
+            # 允许继承基类默认版本（如未覆盖 version 的插件），仅提示
+            print(f"WARN {name}: plugin.py 未显式声明 version（继承基类）")
+
+    # 3) 反向检查：plugins/ 下有目录但 manifest 没登记（装了却搜不到的根因）
+    plugins_dir = ROOT / "plugins"
+    if plugins_dir.is_dir():
+        for d in sorted(plugins_dir.iterdir()):
+            if not d.is_dir() or d.name.startswith((".", "_")):
+                continue
+            has_entry = any((d / f).is_file() for f in ("plugin.py", "__init__.py"))
+            if has_entry and d.name not in declared:
+                print(f"FAIL plugins/{d.name}: 存在但未在 manifest.json 登记")
+                failures += 1
+
+    if failures:
+        print(f"\n清单一致性检查失败 {failures} 项")
+    else:
+        print(f"OK   manifest 一致性（{len(declared)} 个插件，顶层 version={top}）")
+    return failures
+
+
 def main() -> int:
     plugins_dir = ROOT / "plugins"
     if not plugins_dir.is_dir():
@@ -158,10 +246,17 @@ def main() -> int:
         else:
             print(f"OK   {plugin_dir.name}: {sorted(unresolved)} 已由 wheels 覆盖")
 
+    # 清单一致性（AGENTS.md 第 2/5 条）：与依赖检查各自独立计数，
+    # 两类问题同时报出来，避免"修完依赖才发现清单也错"来回折腾。
+    manifest_failures = check_manifest_consistency()
+
     if failures:
         print(f"\n{failures} 个插件依赖未满足——打包版将无法 import，禁止合入")
+    if manifest_failures:
+        print(f"{manifest_failures} 项清单不一致——AGENTS.md 第 2/5 条，禁止合入")
+    if failures or manifest_failures:
         return 1
-    print("\n全部插件依赖检查通过")
+    print("\n全部检查通过（依赖 + 清单一致性）")
     return 0
 
 

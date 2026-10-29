@@ -19,7 +19,13 @@
      python scripts/check_plugin_deps.py
      ```
 2. **版本号**：插件类 `version` 与 `manifest.json` 同步 bump（semver）；
-   与主程序内置版同源的插件（office / ocr / webfetch），版本号跟随主程序起点后独立演进
+   与主程序内置版同源的插件（office / ocr / webfetch），版本号跟随主程序起点后独立演进。
+   **`manifest.json` 顶层 `version` 也要一起 bump**（仓库内容版本，随任一新插件/技能
+   发布或插件重大改动递增）。历史坑：2.1.3→2.3.1 连续多次发版都只 bump 了插件版本、
+   顶层停在 `1.0.33`，导致清单首行读起来像是"仓库没变"。它目前不参与任何判定
+   （「检查社区更新」用的是**逐插件** `version` 对比，见
+   `web/src/components/SettingsModal.tsx` 的 `communityUpdates`），但作为仓库元信息
+   必须准确
 3. **`office-plugin` / `ocr-plugin` / `webfetch-plugin` 以本仓库为源**：
    直接在这三个插件里开发改动（本仓库是上游事实源）；需要进主程序内置时，
    再**按需同步回** lite-work 的 `litework/tools/{office,ocr,web}.py`。
