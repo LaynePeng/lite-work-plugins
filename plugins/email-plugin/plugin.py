@@ -508,17 +508,130 @@ def _resolve_from_addr(app, user: str) -> str:
     return user
 
 
+def _session_workspace(app) -> str:
+    """当前会话所属项目（session metadata.workspace）。
+
+    TaskManager 用**会话 metadata.workspace** 钉死任务工作区（见主程序
+    `server/tasks.py`：`session_ws = metadata["workspace"] or app.workspace`），
+    所以它才是「用户以为自己在哪个项目里」的权威答案。工具执行期经
+    `current_session_id` ContextVar 拿到会话；子 Agent 用根会话兜底。
+    """
+    try:
+        from litework.tools.todos import (current_root_session_id,
+                                          current_session_id)
+    except Exception:  # 旧宿主没有该模块：跳过这一来源
+        return ""
+    store = getattr(app, "session_store", None)
+    if store is None:
+        return ""
+    for var in (current_session_id, current_root_session_id):
+        try:
+            sid = str(var.get("") or "")
+        except Exception:
+            sid = ""
+        if not sid:
+            continue
+        try:
+            snap = store.load(sid)
+        except Exception:
+            continue
+        meta = getattr(snap, "metadata", None) or {}
+        ws = str(meta.get("workspace") or "") if isinstance(meta, dict) else ""
+        if ws:
+            return ws
+    return ""
+
+
+def _attachment_roots(app) -> List[str]:
+    """附件允许的根目录（多根、有序、去重；**绝不含进程 CWD**）。
+
+    为什么必须多根：宿主里「工作区」有三个来源，漏掉任何一个都会把合法附件
+    判成非法——
+
+    1. `header_context["workspace"]`：**当前任务钉死的工作区**（最权威）。普通
+       任务 = 会话所属项目；worktree 隔离任务 = `<项目>/.lite-work/worktrees/<会话>`。
+    2. 会话 `metadata.workspace`：任务外的工具调用没有任务上下文时的兜底。
+    3. 全局 `app.workspace`：单端（无 X-Client-Id）旧语义兜底。
+
+    **为什么不能直接用 app.workspace**（本函数存在的原因）：桌面端多窗口/多端
+    模式下 `POST /api/workspace` 只登记该端的项目视图（`X-Client-Id` →
+    client_views），**不再写全局 `app.workspace`**；全局值常常是 None。
+    更糟的是旧实现写的是 `os.path.abspath(getattr(app, "workspace", "") or "")`
+    ——`abspath("")` 返回的是**进程 CWD**而非空串，`if not ws` 这道兜底永远
+    不成立。打包版 Electron 以 `cwd = Contents/Resources` 拉起 Core（主程序
+    `electron/main.js` 的 `coreCwd()`），于是「工作区」变成应用安装目录，
+    只有把附件拷进 `/Applications/lite-work.app/Contents/Resources` 才能发送
+    （用户实际踩到的故障）。故此处：空值一律跳过；相对路径 / `.` / `..`
+    一律丢弃（`AgentLoop.workspace` 在无工作区时会被置为 `"."`，按 CWD 解析
+    等于把安装目录变成工作区）；根目录本身没有校验意义，也丢弃。
+    """
+    roots: List[str] = []
+    seen: set = set()
+
+    def add(candidate: Any) -> None:
+        raw = str(candidate or "").strip()
+        if not raw or not os.path.isabs(raw):
+            return
+        try:
+            path = os.path.abspath(os.path.expanduser(raw))
+        except Exception:
+            return
+        if path == os.path.abspath(os.sep):
+            return
+        key = os.path.normcase(path)
+        if key in seen or not os.path.isdir(path):
+            return
+        seen.add(key)
+        roots.append(path)
+
+    try:
+        from litework.core.types import header_context
+
+        ctx = header_context.get() or {}
+        if isinstance(ctx, dict):
+            add(ctx.get("workspace"))
+    except Exception:  # 旧宿主无 header_context：跳过这一来源
+        pass
+    add(_session_workspace(app))
+    add(getattr(app, "workspace", "") or "")
+    return roots
+
+
+def _resolve_attachment_detail(app, rel: str) -> Tuple[Optional[str], str]:
+    """解析附件绝对路径，返回 `(路径, 错误说明)`；成功时错误说明为空串。
+
+    分为三种失败，便于模型/用户判断下一步（旧实现一律「路径非法」，把
+    「没打开项目」和「文件不存在」混为一谈，误导排查）：
+    无工作区 / 越界 / 文件不存在。
+    """
+    if app is None:
+        return None, "插件未绑定宿主应用，无法定位工作区。"
+    raw_rel = str(rel or "").strip()
+    if not raw_rel:
+        return None, "附件路径为空。"
+    roots = _attachment_roots(app)
+    if not roots:
+        return None, ("无法确定当前会话的工作区（宿主未提供会话项目路径），"
+                      "附件路径无从校验。请确认当前会话已打开项目后重试。")
+    inside_root = ""
+    for root in roots:
+        target = os.path.abspath(
+            raw_rel if os.path.isabs(raw_rel) else os.path.join(root, raw_rel))
+        if not (target == root or target.startswith(root + os.sep)):
+            continue
+        if os.path.isfile(target):
+            return target, ""
+        inside_root = inside_root or root
+    if inside_root:
+        return None, (f"文件不存在：{raw_rel}（预期位于 {inside_root} 下）。"
+                      "请确认文件已生成/路径拼写正确。")
+    return None, ("附件路径非法或不在工作区内。允许的根目录："
+                  + "、".join(roots) + f"；收到：{raw_rel}")
+
+
 def _resolve_attachment(app, rel: str) -> Optional[str]:
-    """附件路径：仅允许 workspace 内（安全；发送动作本身已过审批）。"""
-    if app is None or not rel:
-        return None
-    ws = os.path.abspath(getattr(app, "workspace", "") or "")
-    if not ws:
-        return None
-    target = os.path.abspath(os.path.join(ws, rel))
-    if not (target == ws or target.startswith(ws + os.sep)):
-        return None
-    return target if os.path.isfile(target) else None
+    """附件绝对路径：仅允许工作区（多根白名单）内（安全；发送动作本身已过审批）。"""
+    return _resolve_attachment_detail(app, rel)[0]
 
 
 # ---------------------------------------------------------------- 草稿预览盒
@@ -1554,7 +1667,7 @@ class EmailPlugin(ToolPlugin):
     """邮件工具：发信（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱/搜索/读单封。"""
 
     name = "email-plugin"
-    version = "1.5.1"
+    version = "1.5.2"
     description = (
         "邮件：SMTP 发信 / 回复 / 转发（HTML 排版 + 附件，发送前审批）＋ IMAP 收件箱"
         "列表 / 关键词搜索 / 读取单封（含附件清单）/ 文件夹管理 / 删除·移动·标记。"
@@ -2317,9 +2430,9 @@ class EmailPlugin(ToolPlugin):
 
         attached = []
         for rel in atts[:MAX_ATTACHMENTS]:
-            p = _resolve_attachment(self._app, rel)
+            p, why = _resolve_attachment_detail(self._app, rel)
             if p is None:
-                return f"[Error]: 附件路径非法或不在工作区内：{rel}"
+                return f"[Error]: 附件无法附加：{why}"
             attached.append((p, os.path.basename(p)))
 
         if args.get("dry_run"):

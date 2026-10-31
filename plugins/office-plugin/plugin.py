@@ -3492,11 +3492,57 @@ class OfficeTools:
 from litework.tools.plugin import ToolPlugin
 
 
+def _current_workspace(app) -> Optional[str]:
+    """当前任务/会话的工作区（**不要**直接读 `app.workspace`）。
+
+    桌面端多窗口/多端模式下 `POST /api/workspace` 只登记该端项目视图
+    （`X-Client-Id` → client_views），**不再写全局 `app.workspace`**，全局值
+    常常是 None。此时 OfficeTools 会回落到家目录：产物（docx/xlsx/pptx）静默
+    写进 `~`、且项目内已有文件被 `_resolve_path` 判「路径越界」。按下列优先级
+    取真实工作区（同 email-plugin 的附件解析口径）：
+
+    1. `header_context["workspace"]`：当前任务钉死的工作区（worktree 隔离时
+       即工作树路径）；
+    2. 会话 `metadata.workspace`：任务外的调用没有任务上下文时兜底；
+    3. 全局 `app.workspace`：单端（无 X-Client-Id）旧语义兜底。
+    """
+    if app is None:
+        return None
+    try:
+        from litework.core.types import header_context
+
+        ctx = header_context.get() or {}
+        ws = str(ctx.get("workspace") or "") if isinstance(ctx, dict) else ""
+        if ws and os.path.isabs(ws) and os.path.isdir(ws):
+            return ws
+    except Exception:  # 旧宿主无 header_context
+        pass
+    try:
+        from litework.tools.todos import (current_root_session_id,
+                                          current_session_id)
+
+        store = getattr(app, "session_store", None)
+        if store is not None:
+            for var in (current_session_id, current_root_session_id):
+                sid = str(var.get("") or "")
+                if not sid:
+                    continue
+                snap = store.load(sid)
+                meta = getattr(snap, "metadata", None) or {}
+                meta_ws = str(meta.get("workspace") or "") if isinstance(meta, dict) else ""
+                if meta_ws and os.path.isdir(meta_ws):
+                    return meta_ws
+    except Exception:  # 旧宿主无 todos 模块 / 会话读取失败
+        pass
+    ws = str(getattr(app, "workspace", "") or "").strip()
+    return ws if ws and os.path.isabs(ws) and os.path.isdir(ws) else None
+
+
 class OfficePlugin(ToolPlugin):
     """office-plugin 社区独立分发版。"""
 
     name = "office-plugin"
-    version = "1.7.0"
+    version = "1.7.1"
     description = ("办公生产力：Word/Excel/PPT/PDF 生成与读取、PDF 中文排版（主题/表格/页码）、"
                    "格式化编辑与查找替换、数据分析、图表；LibreOffice 可选增强：Office→PDF "
                    "转换、页面 PNG 渲染预览、Excel 公式重算（soffice 缺失时优雅降级）；"
@@ -3514,7 +3560,7 @@ class OfficePlugin(ToolPlugin):
         super().install(kernel)
 
     def _workspace(self):
-        return getattr(self._app, "workspace", None) if self._app else None
+        return _current_workspace(self._app)
 
     def get_tools(self):
         return OfficeTools(self._workspace()).get_tools()

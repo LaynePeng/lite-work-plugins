@@ -1,10 +1,10 @@
 {
-  "version": "1.0.34",
+  "version": "1.0.35",
   "min_app_version": "0.5.0",
   "plugins": [
     {
       "name": "office-plugin",
-      "version": "1.7.0",
+      "version": "1.7.1",
       "description": "办公生产力：Word/Excel/PPT/PDF 生成与读取、PDF 中文排版（主题/表格/页码）、格式化编辑与查找替换、数据分析、图表；LibreOffice 可选增强：Office→PDF 转换、页面 PNG 渲染预览、Excel 公式重算（需本机 soffice，缺失时优雅降级）；v1.7.0 重库（pandas/matplotlib/pypdf/pymupdf）按需加载，空闲内存大幅下降",
       "path": "plugins/office-plugin",
       "tools": [
@@ -39,7 +39,7 @@
     },
     {
       "name": "ocr-plugin",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "description": "OCR 识别：图片/PDF 页面/PPT 内嵌图片中的文字提取",
       "path": "plugins/ocr-plugin",
       "tools": [
@@ -269,7 +269,7 @@
     },
     {
       "name": "email-plugin",
-      "version": "1.5.1",
+      "version": "1.5.2",
       "description": "邮件：SMTP 发信/回复/转发（HTML/附件，发送前审批）＋ IMAP 收件箱列表·全文检索·读单封（含附件清单）·文件夹管理·删除/移动/标记。认证：oauth2（XOAUTH2，设置页一键授权；设备码落盘可续接可取消）或 basic。含邮件盯梢源（watch email）：按关键字盯梢邮件变化",
       "path": "plugins/email-plugin",
       "tools": [

@@ -139,6 +139,118 @@ class UtilsTest(EmailPluginBase):
             shutil.rmtree(ws, ignore_errors=True)
 
 
+class AttachmentWorkspaceTest(unittest.TestCase):
+    """附件根目录解析：回归「工作区被认成应用安装目录」的真实故障。
+
+    故障链（两个原因叠加，缺一不可）：
+      ① `os.path.abspath(getattr(app, "workspace", "") or "")` —— app.workspace
+         为 None 时 `abspath("")` 返回**进程 CWD**，`if not ws` 永不成立；
+      ② 打包版 Electron 用 `cwd = Contents/Resources` 拉起 Core，且桌面多端
+         模式下切项目**只登记 client-view、不写全局 app.workspace**。
+    结果：附件只能放进 `/Applications/lite-work.app/Contents/Resources` 才认。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="lw-email-att-")
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+
+    def _mkws(self, name, filename=None, payload=b"%PDF"):
+        ws = os.path.join(self._tmp, name)
+        os.makedirs(ws, exist_ok=True)
+        if filename:
+            with open(os.path.join(ws, filename), "wb") as f:
+                f.write(payload)
+        return ws
+
+    # ---------------------------------------------------- ① 不把 CWD 当工作区
+
+    def test_missing_workspace_does_not_fall_back_to_cwd(self):
+        """app.workspace=None 时绝不能退化成进程 CWD（原 bug 的根）。"""
+        ws = self._mkws("cwdws", "cwd.pdf")
+        cwd = os.getcwd()
+        os.chdir(ws)
+        try:
+            p, why = emailplugin._resolve_attachment_detail(
+                SimpleNamespace(workspace=None), "cwd.pdf")
+            self.assertIsNone(p, "空 workspace 不得按 CWD 解析出附件")
+            self.assertIn("无法确定当前会话的工作区", why)
+        finally:
+            os.chdir(cwd)
+
+    def test_dot_and_relative_workspace_ignored(self):
+        """`.` / 相对路径不是有效工作区（AgentLoop 无项目时会把 workspace 置 "."）。"""
+        for bad in (".", "..", "relative/dir", "/"):
+            self.assertEqual(
+                emailplugin._attachment_roots(SimpleNamespace(workspace=bad)), [],
+                f"{bad!r} 不应被当作附件根目录")
+
+    # ---------------------------------------------------- ② 会话工作区优先
+
+    def test_session_metadata_workspace_wins_over_app_workspace(self):
+        """桌面多端模式：真工作区在会话 metadata，全局 app.workspace 是 None。"""
+        proj = self._mkws("proj", "报告.pdf")
+        resources = self._mkws("Resources", "install.pdf")   # 模拟安装目录
+
+        class _Store:
+            def load(self, sid):
+                return SimpleNamespace(metadata={"workspace": proj})
+
+        app = SimpleNamespace(workspace=resources, session_store=_Store())
+
+        from litework.tools import todos as _todos
+        token = _todos.current_session_id.set("session_x")
+        try:
+            roots = emailplugin._attachment_roots(app)
+            self.assertEqual(roots[0], proj, "会话工作区必须排在全局 app.workspace 之前")
+            self.assertIn(resources, roots, "全局值仍作兜底（单端旧语义）")
+            p, why = emailplugin._resolve_attachment_detail(app, "报告.pdf")
+            self.assertEqual(why, "")
+            self.assertEqual(p, os.path.join(proj, "报告.pdf"))
+        finally:
+            _todos.current_session_id.reset(token)
+
+    def test_header_context_workspace_has_highest_priority(self):
+        """任务钉死的工作区（worktree 隔离时是 worktree）排最前。"""
+        proj = self._mkws("proj2")
+        wt = self._mkws("wt", "wt.pdf")
+
+        import unittest.mock as _mock
+        from litework.core.types import header_context
+
+        token = header_context.set({"workspace": wt})
+        try:
+            roots = emailplugin._attachment_roots(SimpleNamespace(workspace=proj))
+            self.assertEqual(roots[0], wt)
+            self.assertIn(proj, roots)
+            self.assertIsNotNone(emailplugin._resolve_attachment(
+                SimpleNamespace(workspace=proj), "wt.pdf"))
+            # 绝对路径落在任一白名单根内也应放行
+            self.assertIsNotNone(emailplugin._resolve_attachment(
+                SimpleNamespace(workspace=proj), os.path.join(wt, "wt.pdf")))
+        finally:
+            header_context.reset(token)
+
+    # ---------------------------------------------------- ③ 错误信息可诊断
+
+    def test_error_messages_distinguish_causes(self):
+        ws = self._mkws("diag")
+        app = SimpleNamespace(workspace=ws)
+
+        p, why = emailplugin._resolve_attachment_detail(app, "../../etc/passwd")
+        self.assertIsNone(p)
+        self.assertIn("非法或不在工作区内", why)
+        self.assertIn(ws, why, "报错应列出允许的根目录，便于自查")
+
+        p, why = emailplugin._resolve_attachment_detail(app, "nope.pdf")
+        self.assertIsNone(p)
+        self.assertIn("文件不存在", why)
+
+    def test_none_app_and_empty_path(self):
+        self.assertIsNone(emailplugin._resolve_attachment(None, "a.pdf"))
+        self.assertIsNone(emailplugin._resolve_attachment(
+            SimpleNamespace(workspace=None), ""))
+
+
 class ExecutePathsTest(EmailPluginBase):
     def test_send_unconfigured(self):
         out = asyncio.run(self.plugin._send({"to": "a@x.com", "subject": "s", "body": "b"}))
@@ -1745,7 +1857,7 @@ class NewToolsRegisteredTest(EmailPluginBase):
             self.assertIn(n, names)
 
     def test_version_is_150(self):
-        self.assertEqual(emailplugin.EmailPlugin.version, "1.5.1")
+        self.assertEqual(emailplugin.EmailPlugin.version, "1.5.2")
 
 class ConfigHotReloadTest(EmailPluginBase):
     """on_config_changed 热生效：改账号/认证方式后不能还吃旧缓存。
