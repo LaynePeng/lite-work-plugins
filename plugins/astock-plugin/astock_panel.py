@@ -180,14 +180,33 @@ def render_pick_detail(app: Any, strategy: str,
 
 
 def _section(title: str, note: str = "") -> str:
-    """区块小标题（**粗体** 独占一段）。
+    """区块标题（`###`，比正文大一号）。
 
-    为什么不用 `###` 标题：面板正文是 13px，标题会被宿主放大成两级字号，
-    331px 窄栏里反而更挤；粗体 + 上下空行已足以表达"分块"。
+    **v2.5.6 改为真标题**（用户要求："大盘、我的资产、持仓、自选观察、盯盘
+    是标题，可以比其他字体大一点"）。此前用 `**粗体**`，理由是"`###` 会被
+    放大成两级字号、窄栏更挤"——实测那个顾虑夸大了：面板正文 13px，`###`
+    在宿主里约 15px（1.17em），比 13px 的卡片正文略大，正是标题该有的层次；
+    真正挤的是 margin，所以这里配 `.md` 的 `margin: 0.9em 0 0.4em` 由宿主
+    控制，我们只负责用对语义。
+
+    所以：**标题就是标题**（`###`），不再用粗体冒充。粗体留给正文强调。
     **末尾的空行是必须的**——markdown 只有空行才分段，单换行会并成一段
     （这正是用户报障"这堆太挤了"的直接原因）。
     """
-    return f"**{title}**" + (f"　{note}" if note else "")
+    return f"### {title}" + (f"　{note}" if note else "")
+
+
+def _caption(text: str) -> str:
+    """附注小字（`#####`，比正文小一号）。
+
+    **v2.5.6 新增**（用户要求："大盘里含义那一段的字小一点"）。宿主的
+    ReactMarkdown **没装 rehype-raw**，所以 `<small>` / `<span style>` 这类
+    内联 HTML 会被原样当文本输出——想改字号只能走 markdown 原生层级。
+    `#####` 在宿主里约 11px（0.83em），比 13px 正文小、又比 `######` 可读。
+
+    语义：这是**解释性附注**，不是标题——所以叫 caption 而不是 heading。
+    """
+    return f"##### {text}"
 
 
 def _kpi(label: str, value: str, delta: str = "", note: str = "",
@@ -338,12 +357,12 @@ def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None,
     if mctx is None:
         mctx = market_context(ctx)
     if mctx is None:
-        return ("**大盘**\n\n大盘数据获取失败（接口限流或断网），"
+        return (_section("大盘") + "\n\n大盘数据获取失败（接口限流或断网），"
                 "稍后自动重试")
     indices = mctx["indices"]
     breadth = mctx["breadth"]
     if not mctx["ok"]:
-        return ("**大盘**\n\n未取到指数与涨跌家数（接口限流或断网），"
+        return (_section("大盘") + "\n\n未取到指数与涨跌家数（接口限流或断网），"
                 "稍后自动重试")
 
     summary = mctx["summary"]
@@ -405,10 +424,10 @@ def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None,
         out += ["```kpi", _json.dumps({"items": cards}, ensure_ascii=False),
                 "```", ""]
 
-    # ── 含义：一行文字（不要破折号）
+    # ── 含义：一行说明，**小一号**（v2.5.6：用户要求"含义那段的字小一点"）
     style_note = _style_note(ranking) if ranking else ""
     if style_note:
-        out += [f"**含义**　{style_note}", ""]
+        out += [_caption(f"含义　{style_note}"), ""]
 
     div = summary.get("divergence")
     if div:
@@ -551,7 +570,7 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
                 "当前空仓。录入成交："
                 "`astock_record side=buy code=... price=... shares=...`"]
         if wline.strip():
-            out += ["", "---", "", "**盯盘**", "", wline.strip()]
+            out += ["", "---", "", _section("盯盘"), "", wline.strip()]
         return "\n".join(out).rstrip() + "\n"
 
     # ── ① 大盘（置顶）
@@ -740,9 +759,9 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
     #    合并成一行，三行状态就会粘在一起（v1.7.1 修复的真正原因）。
     blocks: List[str] = []
     if wline.strip():
-        blocks.append("**盯盘**\n\n" + wline.strip())
+        blocks.append(_section("盯盘") + "\n\n" + wline.strip())
     if flag and flag.strip():
-        blocks.append("**舆情**\n\n" + flag.strip())
+        blocks.append(_section("舆情") + "\n\n" + flag.strip())
     if blocks:
         out += ["", "---", ""]
         out.append("\n\n".join(blocks))
@@ -772,7 +791,7 @@ def render_tree(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         wl = watch_line(ctx.app).strip()
         return ("**0 只持仓**｜当前空仓\n\n"
                 "录入成交：`astock_record side=buy code=... price=... shares=...`"
-                + (f"\n\n---\n\n**盯盘**\n\n{wl}" if wl else ""))
+                + (f"\n\n---\n\n{_section('盯盘')}\n\n{wl}" if wl else ""))
     cfg = ctx.hints_cfg()
     total_mv = d["total_market_value"] or 0
     # 单票占比的分母＝账户总资产（持仓市值 + 可用现金）。
