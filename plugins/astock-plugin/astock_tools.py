@@ -1,4 +1,4 @@
-"""工具声明（16 个工具的 schema）：纯静态数据，不含任何逻辑。
+"""工具声明（17 个工具的 schema）：纯静态数据，不含任何逻辑。
 
 ────────────────────────────────────────────────────────────────────────
 为什么单独成文件
@@ -28,6 +28,75 @@ def build_tools() -> List[ToolDefinition]:
         "description": "股票代码：600000 / sh600000 / 000001.sz 均可",
     }
     return [
+        ToolDefinition(
+            name="astock_calc",
+            description=(
+                "**技术公式计算器**：把常用公式固化成可复算的调用，"
+                "不用手算也不用临时写脚本。"
+                "mode=summary 全套指标（均线/偏离/RSI/年化波动率/动量/区间回撤/区间位置）；"
+                "mode=ma 只算均线+偏离+位置（**盘后重算规则价用这个**）；"
+                "mode=rule_check **价位规则体检**（校验 op 方向是否可达 + 均线是否漂移>1%，"
+                "不传 rules 自动读当前盯盘计划）——能抓出「跌破 38.60 但现价 38.52」这类"
+                "**永远不响的死规则**；"
+                "mode=cost 算账（盈亏平衡价/止损止盈价/盈亏比/可买股数，注意「涨回成本价≠回本」）；"
+                "mode=adjust 除权影响估算（不复权算长周期均线会虚高多少）；"
+                "mode=ratio 收益/回撤比（选策略先看回撤）。"
+                "口径：均线默认前复权 qfq，缺数据返回 - 不用 0 代替。只做统计，不预测涨跌。"),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["summary", "ma", "rule_check", "cost",
+                                 "adjust", "ratio"],
+                        "description": ("summary 全套 / ma 只算均线 / rule_check 规则体检 / "
+                                        "cost 算账 / adjust 除权估算 / ratio 收益回撤比"),
+                    },
+                    "code": code_prop,
+                    "period": {"type": "string",
+                               "description": "K 线周期，默认 day（summary/ma 用）"},
+                    "limit": {"type": "integer",
+                              "description": "取多少根 K 线，默认 120"},
+                    "adjust": {"type": "string", "enum": ["qfq", "hfq", "none"],
+                               "description": "复权方式，默认 qfq（均线必须复权）"},
+                    "rules": {
+                        "type": "array", "items": {"type": "object"},
+                        "description": ("rule_check 用：规则数组 "
+                                        "[{code,price,op,label,ma_key}]。"
+                                        "留空＝自动读当前盯盘计划的 rules"),
+                    },
+                    "use_ma": {"type": "boolean",
+                               "description": "rule_check 是否做均线漂移检查，默认 true"},
+                    "entry_price": {"type": "number",
+                                    "description": "cost 用：成本价"},
+                    "shares": {"type": "integer", "description": "cost 用：持有股数"},
+                    "buy_fee": {"type": "number", "description": "cost 用：买入手续费"},
+                    "sell_fee_rate": {"type": "number",
+                                      "description": "cost 用：卖出费率合计（默认按主流费率）"},
+                    "stop_pct": {"type": "number", "description": "cost 用：止损百分比，默认 8"},
+                    "take_pct": {"type": "number", "description": "cost 用：止盈百分比，默认 15"},
+                    "cash": {"type": "number", "description": "cost 用：可用现金（给了才算股数）"},
+                    "equity": {"type": "number", "description": "cost 用：账户总资产"},
+                    "max_position_pct": {"type": "number",
+                                         "description": "cost 用：单票上限百分比"},
+                    "cash_usage_pct": {"type": "number",
+                                       "description": "cost 用：本轮最多动用现金百分比"},
+                    "price": {"type": "number",
+                              "description": "cost 用：拟买价（不给则用成本价）"},
+                    "prev_close": {"type": "number",
+                                   "description": "adjust 用：除权前收盘价"},
+                    "dividend_per_share": {"type": "number",
+                                           "description": "adjust 用：每股派现（10派20元→填2）"},
+                    "ma_period": {"type": "integer",
+                                  "description": "adjust 用：要估算的均线周期，默认 60"},
+                    "total_return_pct": {"type": "number",
+                                         "description": "ratio 用：累计收益%"},
+                    "max_drawdown_pct": {"type": "number",
+                                         "description": "ratio 用：最大回撤%（填负数）"},
+                },
+                "required": [],
+            },
+        ),
         ToolDefinition(
             name="astock_quote",
             description=(

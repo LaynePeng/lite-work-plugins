@@ -650,6 +650,7 @@ class TestPluginSurface(unittest.TestCase):
     def test_tool_names_match_manifest(self):
         names = {t.name for t in self.plugin.get_tools()}
         self.assertEqual(names, {
+            "astock_calc",
             "astock_quote", "astock_kline", "astock_search", "astock_screen",
             "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
             "astock_sentiment", "astock_events", "astock_sync", "astock_watch",
@@ -1799,8 +1800,12 @@ class TestPanelRender(unittest.TestCase):
         # 块与块之间必须空行分隔（单换行会被渲染器合并成一行）
         m = __import__("re").search(r"\*\*盯盘\*\*\n\n(.+?)\n\n\*\*舆情\*\*", out, __import__("re").S)
         self.assertTrue(m, "盯盘块与舆情块之间未用空行分隔")
-        # 数据区在分割线之前：数据在上、状态在下
-        self.assertLess(out.index("浦发银行"), out.index("\n---\n"))
+        # 数据区在分割线之前：数据在上、状态在下。
+        # v2.5.0 起面板有**两个** `---` 分割线（大盘区之后、状态区之前），
+        # 所以这里要看**最后一个**——它才是"数据/状态"的分界。
+        # 用 rindex 而非 index：断言 index 会误把"大盘后的分割线"当成分界，
+        # 从而在加入大盘区后必然失败（本次真实踩到）。
+        self.assertLess(out.index("浦发银行"), out.rindex("\n---\n"))
 
     def test_progress_is_safety_headroom_not_consumed(self):
         """进度条语义必须是「安全余量」而非「已消耗量」（v1.7.2）。

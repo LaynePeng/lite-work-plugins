@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 import astock_market as mkt
+import astock_market_mood as mood
 import astock_quant as quant
 import astock_quant_tool as quant_tool
 import astock_backtest_tool as backtest_tool
@@ -49,13 +50,19 @@ MAX_ROWS = 12
 class PanelContext:
     """面板渲染所需的外部能力（由 `plugin.py` 注入，避免反向 import）。
 
-    `snapshot` / `ledger` / `hints_cfg` 都是**取数**动作；其余是纯配置。
+    `snapshot` / `ledger` / `hints_cfg` / `mood` 都是**取数**动作；其余是纯配置。
+
+    `mood` 是 v2.5.0 新加大盘看板的数据来源，**必须是带缓存的回调**：
+    面板每 5 秒刷新，若每次都真打接口会被限流（实测东财 clist 就是这样挂的）。
+    由 plugin 注入 `lambda: self._mood_cache.get(time.monotonic())`。
+    允许为 None（老宿主或单测），此时大盘区块直接不渲染。
     """
 
     app: Any
     snapshot: Callable[..., Dict[str, Any]]     # plugin._snapshot
     hints_cfg: Callable[[], Any]                # plugin._hints_cfg
     ledger: Callable[[], Any]                   # plugin._get_ledger
+    mood: Optional[Callable[[], Dict[str, Any]]] = None   # 大盘（带缓存）
 
 
 # ====================================================================== 入口
@@ -216,6 +223,147 @@ def _pnl_pct_of(d: Dict[str, Any]) -> str:
     return _pct((d.get("float_pnl") or 0) / cost_base * 100)
 
 
+# ====================================================================== 大盘看板
+#
+# 为什么要在持仓面板里加大盘（v2.5.0）：
+# 只看自己的持仓，会**把市场普跌误读成"我选错了"**，也会把"普涨里的滞涨"
+# 当成正常。持仓跌 2% 是大事还是小事，取决于全市场在跌多少。
+#
+# 三条实现约束：
+# ① 数据来自 `ctx.mood()`（带 TTL 缓存的取数回调），**渲染函数本身不打网络**；
+# ② 任何失败都降级成一行说明，绝不让整个面板空白；
+# ③ 只描述当下分布，不给"多空信号"、不预测。
+
+
+def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None) -> str:
+    """大盘与整体形势看板（kpi + 表格 + 背离提示）。
+
+    回答三个面板此前无法回答的问题：
+      · 今天大盘什么状态？（指数 + 涨跌家数 + 成交额）
+      · 是什么风格在涨？（各指数强弱排序）
+      · 我的持仓相对大盘如何？（超额收益）
+
+    `d` 是持仓快照（可为 None／空仓）。**只在有持仓时**才渲染「持仓 vs 大盘」，
+    空仓时那一段没有意义（没有持仓可比较）。
+    """
+    if ctx.mood is None:
+        return ""
+    try:
+        snap = ctx.mood()
+    except Exception as exc:
+        logger.debug("[astock] 大盘数据获取失败: %s", exc)
+        return "**大盘**\n\n　　大盘数据获取失败（接口限流或断网），稍后自动重试"
+    indices = snap.get("indices") or []
+    breadth = snap.get("breadth")
+    if not indices and not breadth:
+        return ("**大盘**\n\n　　未取到指数与涨跌家数"
+                "（接口限流或断网），稍后自动重试")
+
+    total_amount = snap.get("amount")
+    summary = mood.market_summary(indices, breadth, total_amount)
+    ratio = summary.get("ratio")
+    tone = summary.get("tone") or "-"
+    sh_pct = summary.get("sh_pct")
+
+    by_code = {i["code"]: i for i in indices}
+    sh = by_code.get("000001") or {}
+    ss = by_code.get("399001") or {}
+
+    # ── 大盘压到**两张卡**（v2.5.2）。
+    #    用户明确要求："大盘就在一到两个卡片里"，而持仓才是重点。
+    #    因此把原来 4 张 KPI + 指数表 + 三段说明压成：
+    #      卡1「大盘」= 上证/深证涨跌 + 上涨占比定性
+    #      卡2「我的持仓 vs 大盘」= 组合涨幅与超额（**这张才是用户真正关心的**）
+    #    指数强弱排序、涨跌家数明细、背离提示都收进一张卡的文字里（不占块）。
+    cards: List[Dict[str, Any]] = []
+
+    # 卡1：大盘一句话（点位 + 涨跌幅 + 上涨占比）
+    mkt_bits = []
+    if sh.get("price") is not None:
+        mkt_bits.append(f"上证 {_f(sh.get('price'))} {_pct(sh.get('change_pct'))}")
+    if ss.get("price") is not None:
+        mkt_bits.append(f"深证 {_pct(ss.get('change_pct'))}")
+    cards.append({
+        "label": "大盘",
+        "value": f"{ratio:.0f}% {tone}" if ratio is not None else (tone or "-"),
+        "delta": "　".join(mkt_bits) if mkt_bits else "指数未取到",
+        "trend": "up" if (sh_pct or 0) >= 0 else "down",
+    })
+
+    # 卡2：持仓 vs 大盘（超额收益）——用户最关心的对照
+    pos_excess = _portfolio_excess(d, sh_pct) if d else None
+    if pos_excess is not None:
+        cards.append({
+            "label": "我的持仓",
+            "value": _pct(d.get("today_pnl_pct")),
+            "delta": f"vs 上证 {_pct(sh_pct)}　超额 {pos_excess:+.2f}pp",
+            "trend": "up" if pos_excess >= 0 else "down",
+        })
+
+    out: List[str] = ["```kpi",
+                      _json.dumps({"items": cards}, ensure_ascii=False),
+                      "```", ""]
+
+    # ── 卡片下只留**一行**补充：指数强弱排序（看出风格）+ 涨跌家数明细。
+    #    不放表格、不拆成多段——右栏太窄，多一段就要滚动。
+    ranking = mood.style_ranking(indices)
+    if ranking:
+        parts = []
+        for i in ranking[:4]:       # 只取前四强，够看出风格
+            chg = i.get("change_pct")
+            short = (i["name"].replace("指数", "").replace("成指", "").strip()
+                     or i["name"])
+            if chg is not None:
+                parts.append(f"{short}{chg:+.2f}%")
+        if parts:
+            out.append(f"　风格：{' · '.join(parts)}")
+
+    if breadth and summary.get("amount_yi"):
+        out.append(f"　{breadth['up']}↑ / {breadth['down']}↓　"
+                   f"成交 {summary['amount_yi'] / 10000:.2f} 万亿")
+
+    div = summary.get("divergence")
+    if div:
+        out.append(div)
+
+    rs = mood.rs_verdict(pos_excess) if pos_excess is not None else ""
+    if rs and rs != "基本同步":
+        out.append(f"　→ 今日{rs}"
+                   + ("，持仓拖了后腿" if pos_excess < 0 else "，持仓强于大盘"))
+    return "\n".join(x for x in out if x is not None).rstrip()
+
+
+def _portfolio_excess(d: Dict[str, Any],
+                      index_pct: Optional[float]) -> Optional[float]:
+    """组合今日涨跌幅相对指数的超额（百分点）。
+
+    组合涨跌幅用**市值加权**：小仓位大涨不该代表整个组合。
+    分母是昨日市值（今日市值 / (1+涨幅) 的近似不可靠，直接用成本+
+    昨收算），这里简化为「按持仓市值加权个股涨跌幅」——精确的做法需要
+    昨收价，而 `change_pct` 已经是个股相对昨收的涨幅，加权即得组合涨幅。
+    """
+    positions = d.get("positions") or []
+    if not positions:
+        return None
+    quotes = d.get("quotes") or {}
+    total_mv = 0.0
+    weighted = 0.0
+    for p in positions:
+        q = quotes.get(p.get("code")) or {}
+        chg = q.get("change_pct")
+        price = q.get("price") or p.get("cost_price") or 0
+        mv = float(price) * int(p.get("shares") or 0)
+        if chg is None or mv <= 0:
+            continue
+        total_mv += mv
+        weighted += float(chg) * mv
+    if total_mv <= 0:
+        return None
+    port_pct = weighted / total_mv
+    d["today_pnl_pct"] = round(port_pct, 2)      # 供上层显示
+    return mood.relative_strength(port_pct, index_pct)
+
+
 def watch_line(app: Any) -> str:
     """面板里的盯盘状态行（含"去哪儿点按钮"的指引）。
 
@@ -255,8 +403,13 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
     head = _head(d)
     wline = watch_line(ctx.app)
     if not d["positions"]:
+        # 空仓时大盘**更要显示**：此时用户最关心的是「市场转暖了吗、要不要进场」，
+        # 而面板此前在空仓时只留一句"当前空仓"，等于什么信息都不给。
         empty = head + ("\n\n当前空仓。录入成交："
                         "`astock_record side=buy code=... price=... shares=...`")
+        market_block = render_market(ctx, d)
+        if market_block:
+            empty += "\n\n---\n\n" + market_block
         if wline.strip():
             empty += "\n\n---\n\n**盯盘**\n\n" + wline.strip()
         return empty
@@ -278,12 +431,23 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         ]}
     out = [head, "", "```kpi", _json.dumps(kpi, ensure_ascii=False), "```", ""]
 
-    # ── 每股：名称行 + progress 双条（仓位/距止损） ──
+    # ── 大盘看板（v2.5.0）：先给市场背景，再看自己的持仓。
+    #    顺序有讲究：不知道大盘怎么样时，「浮亏 -8%」这个数字没有意义。
+    market_block = render_market(ctx, d)
+    if market_block:
+        out += [market_block, "", "---", ""]
+
+    # ── 每股：名称行 + progress 双条（仓位/距止损）。
+    #    v2.5.2 回滚了 v2.5.1 的"最多一条"压缩：用户明确说**持仓才是重点**，
+    #    把两条合成一条是为了给大盘腾地方——方向错了。正确做法是**压缩大盘**
+    #    （已压到 2 张卡 + 2 行字），把空间还给持仓。
     cfg = ctx.hints_cfg()
     total_mv = d.get("total_market_value") or 0
     # 单票占比的分母＝账户总资产（持仓市值 + 可用现金），与 hint 引擎同口径。
     # 用持仓市值当分母时，只持一只股就恒为 100%，仓位条永远画成「已超限」。
     equity_base = equity if equity > 0 else total_mv
+    cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
+    stop_pct = abs(float(cfg.stop_loss_pct or 0))
     for p in d["positions"][:MAX_ROWS]:
         q = d["quotes"].get(p["code"]) or {}
         price = q.get("price") or p["cost_price"]
@@ -296,27 +460,27 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         arrow = "▲" if (chg_pct or 0) > 0 else ("▼" if (chg_pct or 0) < 0 else "—")
         out.append(f"**{p['name'] or p['code']}**　{_f(price)}　{arrow}{_pct(chg_pct)}"
                    f"　{shares}股 · 成本{_f(cost, 3)} · 浮盈{_f(pnl)}（{_pct(pnl_pct)}）")
+
         # progress 语义对齐宿主色阶（<40 红 / ≥80 绿，为「健康度」设计）：
         # 一律喂**安全余量**——越高越安全越绿，触线/超限 = 0% = 红。
         # 此前喂「已消耗量」（浮亏触到止损线 → 100% 满条**绿色**，看着
         # 最健康实际最危险——语义反转，真实报障）。
         items: List[Dict[str, Any]] = []
-        if equity_base > 0:
+        if equity_base > 0 and cap > 0:
             weight = mv / equity_base * 100
-            cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
-            headroom = max(0.0, (cap - weight) / cap * 100) if cap > 0 else 0.0
+            headroom = max(0.0, (cap - weight) / cap * 100)
             items.append({"label": f"仓位空间（上限 {cap:g}%）",
                           "value": round(headroom, 1),
                           "note": (f"现占 {weight:.1f}%" +
                                    (" · 超限" if weight > cap else ""))})
-        stop_pct = abs(float(cfg.stop_loss_pct or 0))
         if pnl_pct is not None and stop_pct > 0:
             used = max(0.0, min(100.0, -pnl_pct / stop_pct * 100)) if pnl_pct < 0 else 0
             items.append({"label": f"距止损余量（跌破 -{stop_pct:g}% 触发）",
                           "value": round(100.0 - used, 1),
                           "note": _pct(pnl_pct) if pnl_pct < 0 else "浮盈中"})
         if items:
-            out += ["```progress", _json.dumps({"items": items}, ensure_ascii=False),
+            out += ["```progress",
+                    _json.dumps({"items": items}, ensure_ascii=False),
                     "```", ""]
     # ── 自选区（未持仓）：紧凑表 + 备注提示。与聊天看板「无需关注」列对齐——
     #    面板此前只画持仓，自选完全不出现，用户换 tab 看不到候选池。

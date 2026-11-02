@@ -9,7 +9,8 @@
 AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账数据与邮箱配置，
 属于个人自用型插件——进内置只会增加主程序维护面与体积，没有内置的必要。
 
-工具面（16 个）
+工具面（17 个）
+    astock_calc       **公式计算器**（v2.4.0：均线/指标/规则体检/算账/复权/收益回撤比）
     astock_act        **操作指示**（先卖后买 + 资金闭环；照着在券商 App 执行）
     astock_pick       **量化选股 + 买入数量**（全市场扫描→多因子池内打分→换算股数）
     astock_backtest   **策略回测 + 推荐率**（历史逐期重放→跑赢基准占比→分档）
@@ -27,8 +28,10 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_sync       成交回单同步（粘贴回单→解析多笔→匹配计划→校价→落账）
     astock_watch      自选股增删查 + 盯盘开关
 
-模块分层（v2.0.0 起；v2.1.2 把装配层再拆细）
+模块分层（v2.0.0 起；v2.1.2 把装配层再拆细；v2.4.0 加公式库）
     ── 纯函数 / 取数层（喂数据出结果、零网络，便于离线单测）
+    astock_formula                       **公式库**（均线/RSI/波动率/回撤/复权/成本/
+                                         规则方向校验；零依赖纯函数，35 个公开函数）
     astock_quant / astock_quant_tool    打分引擎 + 取数/缓存/渲染
     astock_backtest / _tool             回测（防未来函数）+ 推荐率
     astock_archive                      本地存档（不复权口径，累积窗口）
@@ -46,6 +49,7 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_mixin_market                 行情类：quote/kline/search/screen/flow
     astock_mixin_ledger                 台账类：record/portfolio/看板
     astock_mixin_hint                   下单提示 + 条件单落库
+    astock_mixin_calc                   **公式工具**（v2.4.0：取数 + 渲染，数学在 astock_formula）
     astock_mixin_sync                   回单同步 + 舆情分析
     astock_mixin_watch                  自选股 + 盯盘开关
     astock_mixin_quant                  选股/回测/操作指示/存档
@@ -85,6 +89,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from litework.core.types import ToolDefinition
@@ -150,6 +155,8 @@ import astock_receipt as receipt                    # noqa: F401
 import astock_sentiment as senti                    # noqa: F401
 import astock_sentiment_tool as senti_tool          # noqa: F401
 import astock_market as mkt
+import astock_market_mood as mood_mod
+from astock_mixin_calc import CalcToolsMixin
 from astock_mixin_hint import HintToolsMixin
 from astock_mixin_ledger import LedgerToolsMixin
 from astock_mixin_market import MarketToolsMixin
@@ -848,11 +855,17 @@ class AStockWatch(WatchSource):
 
 class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                    HintToolsMixin, SyncToolsMixin,
-                   WatchToolsMixin, QuantToolsMixin, ToolPlugin):
+                   WatchToolsMixin, QuantToolsMixin, CalcToolsMixin,
+                   ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.3.1"
+    version = "2.5.0"
+
+    #: 大盘看板缓存（v2.5.0）。**放类属性而非实例属性**：插件实例可能被重建
+    #: （切工作区/热重载），而大盘数据与实例无关，缓存留着反而减少请求。
+    #: 面板每 5 秒刷新 → 15 秒 TTL 内复用，避免打爆公共接口。
+    _mood_cache = mood_mod.MoodCache()
     description = ("A 股助手：行情/K线/选股/资金流 + 投资舆情分析（七类证据+背离提示） + 手工交易台账（持仓成本·T+1 可卖·"
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
@@ -1412,6 +1425,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
 
     async def execute(self, name: str, args: Dict[str, Any]) -> str:
         handlers = {
+            "astock_calc": self._tool_calc,
             "astock_quote": self._tool_quote,
             "astock_kline": self._tool_kline,
             "astock_search": self._tool_search,
@@ -1841,6 +1855,9 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             snapshot=self._snapshot,
             hints_cfg=self._hints_cfg,
             ledger=self._get_ledger,
+            # 大盘数据：必须走带 TTL 的缓存回调。面板每 5 秒刷新，
+            # 每次真打接口会被限流（东财 clist 实测就是这样挂的）。
+            mood=lambda: self._mood_cache.get(time.monotonic()),
         )
         return panel.render_panel(ctx, panel_id, config)
 
