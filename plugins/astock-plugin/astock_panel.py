@@ -191,13 +191,21 @@ def _section(title: str, note: str = "") -> str:
 
 
 def _kpi(label: str, value: str, delta: str = "", note: str = "",
-         trend: str = "flat") -> Dict[str, Any]:
-    """指标卡（空字段不写键——`note: ""` 会在宿主里渲染出一个空 span）。"""
+         trend: str = "flat", **extra: Any) -> Dict[str, Any]:
+    """指标卡（空字段不写键——`note: ""` 会在宿主里渲染出一个空 span）。
+
+    `trend` 决定颜色：up=绿 / down=红 / flat=中性，前端会自动补 ▲▼。
+    冗余字段（`sort` / `reasons` 等）以 `_` 前缀或由调用方清理，
+    避免内部键漏进宿主渲染的 JSON。
+    """
     item: Dict[str, Any] = {"label": label, "value": value, "trend": trend}
     if delta:
         item["delta"] = delta
     if note:
         item["note"] = note
+    for k, v in extra.items():
+        if v is not None:
+            item[f"_{k}"] = v
     return item
 
 
@@ -240,10 +248,14 @@ def _pnl_pct_of(d: Dict[str, Any]) -> str:
 
 
 def _arrow_pct(chg: Optional[float]) -> str:
-    """涨跌幅 + 方向箭头（表格里一眼分辨涨跌；None 显示 '-'）。"""
+    """涨跌幅 + 方向箭头（表格/卡片里一眼分辨涨跌；None 显示 '-'）。
+
+    不用「—」（em dash）表示零涨跌——用户明确要求不要这个符号，
+    且它和减号/破折号在窄栏里视觉上分不清。零涨跌用「0.00%」原样。
+    """
     if chg is None:
         return "-"
-    arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "—")
+    arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "")
     return f"{arrow}{_pct(chg)}"
 
 
@@ -261,29 +273,6 @@ def _hint_reason(h: Any) -> str:
     if not body:
         return title
     return f"{title} —— {body}" if title else body
-
-
-def _risk_card(r: Dict[str, Any], cap: float, stop_pct: float) -> Dict[str, Any]:
-    """把一只「需要处理」的持仓渲染成卡片（cards 围栏的一个 item）。
-
-    卡片只给**结论与依据**，不放进度条（进度条走紧随其后的 progress 围栏）——
-    cards 的 desc 会被宿主限制为两行（-webkit-line-clamp:2），塞多了会被截。
-    """
-    name = r["name"]
-    tags: List[str] = []
-    if r["weight"] > cap:
-        tags.append(f"仓位 {r['weight']:.0f}% 超限")
-    # 只有真的在浮亏时才给「距止损」标签——浮盈中的票距止损恒为 100%，
-    # 报它等于报「没事」，属于噪声（用户要的是风险，不是健康度打分）。
-    if stop_pct > 0 and r["pnl_pct"] is not None and r["pnl_pct"] < 0:
-        tags.append(f"距止损 {r['headroom']:.0f}%")
-    tags.append(f"可卖 {int(r.get('available_today') or r['shares'])}")
-    return {
-        "title": f"{name}　{_f(r['price'])}　{_arrow_pct(r['chg_pct'])}",
-        "price": f"浮盈 {_f(r['pnl'])}（{_pct(r['pnl_pct'])}）",
-        "desc": "；".join(r["reasons"]),
-        "tags": tags,
-    }
 
 
 # ====================================================================== 大盘看板
@@ -345,27 +334,34 @@ def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None) -> str:
 
     out: List[str] = [_section("大盘", _market_phase())]
 
-    # ── 两张 KPI 卡：① 上证（"大盘涨了多少"）② 上涨占比（"是普涨还是分化"）
+    # ── 大盘压成**两张卡**（v2.5.5，用户报障："上面五个，没必要"）。
+    #    331px 宽下 5 张卡会排成 3 行，比原来的文字行还费地方。
+    #    「一个卡里放多条数据」用 note 实现：
+    #      卡1 上证   = 点位 + 涨跌 + 深证同比 + 成交额 + 涨跌家数
+    #      卡2 领涨指数 = 最强的那个 + 四强明细
+    #    超额（跑输/跑赢）**不在这里**——它属于「我的资产」，见 render_markdown。
     cards: List[Dict[str, Any]] = []
-    sh_price = sh.get("price")
-    if sh_price is not None:
-        cards.append(_kpi("上证", _f(sh_price), _pct(sh.get("change_pct")),
-                          trend="up" if (sh.get("change_pct") or 0) >= 0
-                          else "down"))
-    elif ss.get("price") is not None:
-        cards.append(_kpi("深证", _f(ss.get("price")), _pct(ss.get("change_pct")),
-                          trend="up" if (ss.get("change_pct") or 0) >= 0
-                          else "down"))
-    if ratio is not None:
-        cards.append(_kpi(
-            f"上涨占比（{tone}）", f"{ratio:.0f}%",
-            (f"{breadth['up']}↑ / {breadth['down']}↓" if breadth else ""),
-            trend="up" if ratio >= 50 else "down"))
-    if cards:
-        out += ["```kpi", _json.dumps({"items": cards}, ensure_ascii=False),
-                "```", ""]
 
-    # ── 领涨指数：原名「风格」，改名 + 补一句含义（用户明确问过"风格是什么意思"）
+    # 卡1：上证（点位为主值，delta 涨跌，note 塞深证/成交/家数）
+    sh_price = sh.get("price")
+    if sh_price is not None or ss.get("price") is not None:
+        main_price = sh_price if sh_price is not None else ss.get("price")
+        main_pct = (sh.get("change_pct") if sh_price is not None
+                    else ss.get("change_pct"))
+        label = "上证" if sh_price is not None else "深证"
+        bits: List[str] = []
+        if sh_price is not None and ss.get("change_pct") is not None:
+            bits.append(f"深证{_pct(ss.get('change_pct'))}")
+        if summary.get("amount_yi"):
+            bits.append(f"成交{summary['amount_yi'] / 10000:.2f}万亿")
+        if breadth:
+            bits.append(f"{breadth['up']}↑/{breadth['down']}↓")
+        cards.append(_kpi(
+            label, _f(main_price), _pct(main_pct),
+            note=" · ".join(bits),
+            trend="up" if (main_pct or 0) >= 0 else "down"))
+
+    # 卡2：领涨指数（主值=最强指数名，delta=涨幅，note=四强全量 + 上涨占比）
     ranking = mood.style_ranking(indices)
     if ranking:
         parts = []
@@ -373,29 +369,30 @@ def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None) -> str:
             chg = i.get("change_pct")
             short = _short_index_name(i.get("name") or "")
             if chg is not None:
-                parts.append(f"{short} {chg:+.2f}%")
+                parts.append(f"{short}{chg:+.2f}%")
+        best = ranking[0]
         if parts:
-            out += [f"**领涨指数**　{' · '.join(parts)}", ""]
-            style_note = _style_note(ranking)
-            if style_note:
-                out += [f"**含义**　{style_note}", ""]
+            note = " · ".join(parts)
+            if ratio is not None:
+                note += f"（上涨 {ratio:.0f}% {tone}）"
+            cards.append(_kpi(
+                "领涨指数", _short_index_name(best.get("name") or ""),
+                _pct(best.get("change_pct")),
+                note=note,
+                trend="up" if (best.get("change_pct") or 0) >= 0 else "down"))
 
-    if summary.get("amount_yi"):
-        out += [f"**今日成交**　{summary['amount_yi'] / 10000:.2f} 万亿", ""]
+    if cards:
+        out += ["```kpi", _json.dumps({"items": cards}, ensure_ascii=False),
+                "```", ""]
+
+    # ── 含义：一行文字（不要破折号）
+    style_note = _style_note(ranking) if ranking else ""
+    if style_note:
+        out += [f"**含义**　{style_note}", ""]
 
     div = summary.get("divergence")
     if div:
         out += [div, ""]
-
-    # ── 持仓 vs 大盘：**独立成段**（此前缩进拼在成交额后面，用户看不清）
-    pos_excess = _portfolio_excess(d, sh_pct) if d else None
-    if pos_excess is not None:
-        rs = mood.rs_verdict(pos_excess)
-        if rs and rs != "基本同步":
-            tail = "持仓拖了后腿" if pos_excess < 0 else "持仓强于大盘"
-            out += [f"**今日{rs} {pos_excess:+.2f}pp** —— {tail}", ""]
-        else:
-            out += [f"**今日与大盘基本同步**（{pos_excess:+.2f}pp）", ""]
 
     return "\n".join(out).rstrip()
 
@@ -437,7 +434,8 @@ def _style_note(ranking: List[Dict[str, Any]]) -> str:
     if spread < 0.8:
         return (f"各指数涨跌接近（最强 {best_n} 与最弱 {worst_n} 仅差 "
                 f"{spread:.2f}pp），没有明显结构分化")
-    return (f"{best_n} 明显强于 {worst_n}（差 {spread:.2f}pp）——"
+    # 不用破折号（用户明确要求）：改为句号断句
+    return (f"{best_n} 明显强于 {worst_n}（差 {spread:.2f}pp）。"
             f"资金更偏向 {best_n} 这类标的，不是全面普涨")
 
 
@@ -497,22 +495,18 @@ def watch_line(app: Any) -> str:
 
 
 def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
-    """markdown 形态：富围栏版（宿主面板已支持 ```kpi / ```progress 渲染）。
+    """markdown 形态：富围栏版（宿主面板已支持 ```kpi / ```cards / ```progress）。
 
-    ── v2.5.3 版式重做（用户报障：顶部太挤 / 持仓太占地 / 一只票被折成丑断行）
-    ──
-    四块，块间用标准 `---` 分隔，**每块自带小标题**：
-      ① **大盘**（置顶）——不知道市场怎么样时，「浮亏 -8%」没有意义；
-      ② **我的资产**——4 张 KPI 卡，一眼看到钱；
-      ③ **持仓**——**表格为主体**（一票一行，最省地方），
-         只有「触发规则 / 超仓 / 逼近止损」的股票才**展开成卡片**
-         （带触发原因、建议动作、两根安全余量进度条）；
+    ── 四块版式（v2.5.5，用户连续三轮报障后的定稿）──
+      ① **大盘**——**2 张**指标卡（上证含深证/成交/家数 + 领涨指数含四强）；
+      ② **我的资产**——4 张指标卡 + **今日超额卡**（跑输/跑赢在这里，不在大盘）；
+      ③ **持仓**——**每只一张卡片**（用户明确要求），有风险的才额外画进度条；
       ④ **自选观察**——3 列窄表。
 
-    为什么持仓默认是表格而不是卡片（v2.5.3 取舍）：
-      卡片每只要 ~110px（名称行 + 两根进度条 + 两条 note），5 只就吃满一屏；
-      而 90% 的持仓当天**没有任何状况**，用卡片展示"没事"是浪费空间。
-      表格一票一行 ≈ 26px，风险股再用卡片放大——**常态省地方，风险时显眼**。
+    变化史（别再走回头路）：
+      v2.5.3 把持仓做成**表格** → 用户否决："我让你每一个持仓一个卡片"。
+      v2.5.4 大盘散成 5 张卡 → 用户否决："上面五个，没必要"。
+      本版把大盘压回 2 张、超额归入资产、持仓恢复一票一卡。
 
     老环境兜底：宿主若不支持富围栏（旧版 lite-work），围栏内容显示为代码块，
     数字仍在 JSON 里可读，不至于空白。
@@ -541,28 +535,51 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
     if market_block:
         out += [market_block, "", "---", ""]
 
-    # ── ② 我的资产：4 张 KPI 卡。
+    # ── ② 我的资产：4 张 KPI 卡 + **今日超额卡**。
     #    删掉了原先的 `_head()` 长句——它把"2 只持仓｜市值｜浮盈｜可用"
     #    又写一遍，与这 4 张卡完全重复，是"顶部太挤"的主因。
+    #    超额（跑输/跑赢）从大盘挪到这里（v2.5.5）：它是"我的"结果，
+    #    不是大盘信息，放一起用户才看得出「市场涨 vs 我涨」的对照。
     total_mv = d.get("total_market_value") or 0
     pnl_v = d.get("float_pnl") or 0
     today_pnl = d.get("today_pnl") or 0
     cash = d.get("cash") or 0
+    asset_cards: List[Dict[str, Any]] = [
+        _kpi("总资产", _money(equity), f"今日 {_f(today_pnl)}",
+             trend="up" if today_pnl >= 0 else "down"),
+        _kpi("持仓市值", _money(total_mv),
+             note=f"占总资产 {total_mv / equity * 100:.0f}%" if equity else ""),
+        _kpi("浮动盈亏", _f(pnl_v), _pnl_pct_of(d),
+             trend="up" if pnl_v >= 0 else "down"),
+        _kpi("可用资金", _money(cash),
+             note=f"占总资产 {cash / equity * 100:.0f}%" if equity else ""),
+    ]
+    # 今日超额：主值=超额 pp（红绿按跑赢/跑输），delta=定性，note=原因
+    sh_pct_now = None
+    if market_block:
+        try:
+            sh_now = {i["code"]: i for i in (ctx.mood() or {}).get("indices") or []}
+            sh_pct_now = (sh_now.get("000001") or {}).get("change_pct")
+        except Exception:
+            sh_pct_now = None
+    pos_excess = _portfolio_excess(d, sh_pct_now)
+    if pos_excess is not None:
+        rs = mood.rs_verdict(pos_excess)
+        if rs and rs != "基本同步":
+            asset_cards.append(_kpi(
+                "今日超额", f"{pos_excess:+.2f}pp", rs,
+                note=("持仓拖了后腿" if pos_excess < 0 else "持仓强于大盘"),
+                trend="up" if pos_excess >= 0 else "down"))
+        else:
+            asset_cards.append(_kpi(
+                "今日超额", f"{pos_excess:+.2f}pp", "基本同步",
+                note=f"vs 上证 {_pct(sh_pct_now)}", trend="flat"))
     out += [_section("我的资产", f"{len(d['positions'])} 只持仓"),
             "```kpi",
-            _json.dumps({"items": [
-                _kpi("总资产", _money(equity), f"今日 {_f(today_pnl)}",
-                     trend="up" if today_pnl >= 0 else "down"),
-                _kpi("持仓市值", _money(total_mv),
-                     note=f"占总资产 {total_mv / equity * 100:.0f}%" if equity else ""),
-                _kpi("浮动盈亏", _f(pnl_v), _pnl_pct_of(d),
-                     trend="up" if pnl_v >= 0 else "down"),
-                _kpi("可用资金", _money(cash),
-                     note=f"占总资产 {cash / equity * 100:.0f}%" if equity else ""),
-            ]}, ensure_ascii=False),
+            _json.dumps({"items": asset_cards}, ensure_ascii=False),
             "```", ""]
 
-    # ── ③ 持仓
+    # ── ③ 持仓：**一只一张卡片**（v2.5.4，用户明确要求："每一个持仓一个卡片"）
     cfg = ctx.hints_cfg()
     # 单票占比的分母＝账户总资产（持仓市值 + 可用现金），与 hint 引擎同口径。
     # 用持仓市值当分母时，只持一只股就恒为 100%，仓位条永远画成「已超限」。
@@ -570,8 +587,8 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
     cap = float(getattr(cfg, "position_cap_pct", 25.0) or 25.0)
     stop_pct = abs(float(cfg.stop_loss_pct or 0))
 
-    rows: List[Dict[str, Any]] = []      # {"cells": [...], "sort": 今日涨跌幅}
-    risky: List[Dict[str, Any]] = []
+    cards_pos: List[Dict[str, Any]] = []
+    progress_items: List[Dict[str, Any]] = []
     for p in d["positions"][:MAX_ROWS]:
         q = d["quotes"].get(p["code"]) or {}
         price = q.get("price") or p["cost_price"]
@@ -582,8 +599,6 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         pnl_pct = mkt.pct_change(price, cost)
         chg_pct = q.get("change_pct")
         name = p["name"] or p["code"]
-        rows.append({"cells": [name, _f(price), _arrow_pct(chg_pct), _f(pnl)],
-                     "sort": (chg_pct if chg_pct is not None else -999)})
 
         # 风险判定：与 hint 引擎同一套规则（不另立标准，避免"面板说没事、
         # astock_hint 说该卖"这种自相矛盾）。另加「逼近止损」这一条——
@@ -603,9 +618,7 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         if severe:
             top = max(severe, key=lambda h: 2 if h.severity == "urgent" else 1)
             reasons.append(_hint_reason(top))
-        # 超仓：hint 引擎已产出 position_cap 时不再重复——否则卡片里同一件事
-        # 会以两种措辞出现两遍（实测 desc 变成"…超上限：建议减到 25%…；
-        # 单票占比 33.8% 超过上限 25%，建议减到 25% 以内"，读起来像复读）。
+        # 超仓：hint 引擎已产出 position_cap 时不再重复（否则同一件事复读两遍）
         if "position_cap" not in covered and equity_base > 0 and weight > cap:
             reasons.append(f"单票占比 {weight:.1f}% 超过上限 {cap:g}%，"
                            f"建议减到 {cap:g}% 以内")
@@ -615,52 +628,67 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
                 and pnl_pct < 0 and headroom < 30):
             reasons.append(f"距止损只剩 {headroom:.0f}%（浮亏 {abs(pnl_pct):.1f}% / "
                            f"阈值 −{stop_pct:g}%）")
-        if not reasons:
-            continue
-        risky.append({
-            "name": name, "price": price, "chg_pct": chg_pct,
-            "shares": shares, "cost": cost, "mv": mv, "pnl": pnl,
-            "pnl_pct": pnl_pct, "weight": weight, "headroom": headroom,
-            "available_today": int(p.get("available_today") or shares),
-            "reasons": reasons,
-            "tone": "bad" if severe and severe[0].severity == "urgent" else "warn",
-        })
+
+        # 卡片：**一票一张 kpi 卡**（v2.5.5）。
+        #    为什么用 kpi 而不是 cards：宿主 `cards` 组件的 CardItem 只有
+        #    title/price/desc/tags，**没有颜色字段**，涨跌只能是黑字；
+        #    而 kpi 卡的 delta 走 trend（up=绿 / down=红），是宿主里唯一
+        #    能实现「红涨绿跌」的卡片形态（用户明确要求："卡片内能涨跌
+        #    为什么不能用红色绿色的那种表示"）。
+        #    ▲▼ 由前端按 trend 自动加，这里只传纯数字百分比。
+        #    note 只放**数值事实**（盈亏/股数/仓位/可卖）；"为什么该处理"
+        #    另起一行写在卡片下方——两处都写会复读（实测踩到）。
+        pnl_word = "浮盈" if pnl >= 0 else "浮亏"
+        bits = [f"{pnl_word} {_f(pnl)}（{_pct(pnl_pct)}）", f"{shares} 股"]
+        if equity_base > 0:
+            bits.append(f"占仓 {weight:.0f}%")
+        available = int(p.get("available_today") or shares)
+        if available < shares:
+            bits.append(f"可卖 {available}")
+        cards_pos.append(_kpi(
+            name, _f(price), _pct(chg_pct),
+            note=" · ".join(bits),
+            trend="up" if (chg_pct or 0) >= 0 else "down",
+            sort=(chg_pct if chg_pct is not None else -999),
+            reasons=reasons))
+
+        # 进度条：**只给真有风险的票**（仓位超限 / 浮亏已进黄区-红区）——
+        # 全绿满条等于没信息，还会把卡片挤长。
+        # 阈值 40 与宿主色阶一致（<40 红 / 40-79 黄 / ≥80 绿）：余量 ≥40%
+        # 说明这条进度条本身就会画成黄绿，属于"没事"，不展示。
+        pi: List[Dict[str, Any]] = []
+        if equity_base > 0 and cap > 0 and weight > cap:
+            pi.append({"label": f"{name} 仓位空间（上限 {cap:g}%）",
+                       "value": round(max(0.0, (cap - weight) / cap * 100), 1),
+                       "note": f"现占 {weight:.1f}% · 超限"})
+        if stop_pct > 0 and pnl_pct is not None and pnl_pct < 0 and headroom < 40:
+            pi.append({"label": f"{name} 距止损余量（跌破 -{stop_pct:g}% 触发）",
+                       "value": round(headroom, 1),
+                       "note": _pct(pnl_pct)})
+        progress_items += pi
 
     # 按今日涨跌排序：涨的在上（用户第一眼该看到"今天谁在拉我"）。
     # 行情缺失（chg 为 None）的排末尾——不能让"没数据"混在中间冒充持平。
-    rows.sort(key=lambda r: r["sort"], reverse=True)
-    out += [_section("持仓", f"{len(rows)} 只 · 按今日涨跌排"), ""]
-    out.append(_table(["名称", "现价", "今日", "浮盈"],
-                      [r["cells"] for r in rows]))
-    out.append("")
+    cards_pos.sort(key=lambda c: c.get("_sort", -999), reverse=True)
+    # 风险原因单独收集：kpi 卡的 note 会被前端省略号截断，把"为什么"
+    # 塞进 note 会看不见，所以另起一行写在卡片下面。
+    reasons_lines: List[str] = []
+    for c in cards_pos:
+        c.pop("_sort", None)          # 内部排序键不能漏进宿主渲染的 JSON
+        rs = c.pop("_reasons", None)
+        if rs:
+            reasons_lines.append(f"- **{c['label']}**：{rs[0]}")
 
-    # 风险股：卡片（比表格多给"为什么"与"怎么办"）+ 两根安全余量进度条。
-    # progress 语义对齐宿主色阶（<40 红 / ≥80 绿，为「健康度」设计）：
-    # 一律喂**安全余量**——越高越安全越绿，触线/超限 = 0% = 红。
-    # 此前喂「已消耗量」（浮亏触到止损线 → 100% 满条**绿色**，看着最健康
-    # 实际最危险——语义反转，真实报障）。
-    if risky:
-        out += [f"**需要处理**　{len(risky)} 只", "", "```cards",
-                _json.dumps({"items": [_risk_card(r, cap, stop_pct)
-                                       for r in risky]}, ensure_ascii=False),
+    out += [_section("持仓", f"{len(cards_pos)} 只 · 按今日涨跌"),
+            "```kpi",
+            _json.dumps({"items": cards_pos}, ensure_ascii=False),
+            "```", ""]
+    if reasons_lines:
+        out += ["\n".join(reasons_lines), ""]
+    if progress_items:
+        out += ["```progress",
+                _json.dumps({"items": progress_items[:8]}, ensure_ascii=False),
                 "```", ""]
-        for r in risky:
-            items: List[Dict[str, Any]] = []
-            if equity_base > 0 and cap > 0:
-                items.append({"label": f"仓位空间（上限 {cap:g}%）",
-                              "value": round(max(0.0, (cap - r["weight"]) / cap * 100), 1),
-                              "note": (f"现占 {r['weight']:.1f}%" +
-                                       (" · 超限" if r["weight"] > cap else ""))})
-            if r["pnl_pct"] is not None and stop_pct > 0:
-                # 浮盈中的票不画止损条（余量恒 100% = 一条满绿的无信息条）
-                if r["pnl_pct"] < 0:
-                    items.append({"label": f"距止损余量（跌破 -{stop_pct:g}% 触发）",
-                                  "value": round(r["headroom"], 1),
-                                  "note": _pct(r["pnl_pct"])})
-            if items:
-                out += ["```progress",
-                        _json.dumps({"items": items}, ensure_ascii=False),
-                        "```", ""]
 
     # ── 自选区（未持仓）：紧凑表 + 备注提示。与聊天看板「无需关注」列对齐——
     #    面板此前只画持仓，自选完全不出现，用户换 tab 看不到候选池。
