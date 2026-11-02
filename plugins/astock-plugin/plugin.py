@@ -28,10 +28,12 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_sync       成交回单同步（粘贴回单→解析多笔→匹配计划→校价→落账）
     astock_watch      自选股增删查 + 盯盘开关
 
-模块分层（v2.0.0 起；v2.1.2 把装配层再拆细；v2.4.0 加公式库）
+模块分层（v2.0.0 起；v2.1.2 把装配层再拆细；v2.4.0 加公式库；v2.5.0 加大盘）
     ── 纯函数 / 取数层（喂数据出结果、零网络，便于离线单测）
     astock_formula                       **公式库**（均线/RSI/波动率/回撤/复权/成本/
-                                         规则方向校验；零依赖纯函数，35 个公开函数）
+                                         规则方向校验；零依赖纯函数，29 个公开函数）
+    astock_market_mood                   **大盘与市场宽度**（指数 + 涨跌家数 + 背离归因，
+                                         v2.5.0；15 秒 TTL 缓存，面板高频刷新不卡）
     astock_quant / astock_quant_tool    打分引擎 + 取数/缓存/渲染
     astock_backtest / _tool             回测（防未来函数）+ 推荐率
     astock_archive                      本地存档（不复权口径，累积窗口）
@@ -40,8 +42,8 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_advise                       策略推荐器（三套 → 一句人话结论）
     ── 本插件专用的支撑层（v2.1.2 从本文件拆出）
     astock_common                       配置读取 / 格式化 / 表格（最底层）
-    astock_tools                        16 个工具的 schema 声明（纯静态，450 行）
-    astock_panel                        右栏面板渲染（持仓两形态 + 选股对比）
+    astock_tools                        17 个工具的 schema 声明（纯静态）
+    astock_panel                        右栏面板渲染（持仓两形态 + 选股对比 + 大盘卡）
     astock_rich                         聊天侧富围栏渲染（kpi + board + table，v2.2.0）
     astock_report                       组合舆情报告 + 事件推荐 + 自选体检
     astock_plan                         宿主盯梢计划的自动创建/维护/体检
