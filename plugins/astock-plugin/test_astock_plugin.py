@@ -1760,6 +1760,65 @@ class TestPanelRender(unittest.TestCase):
         # ⑥ 未触发风险 → 不画进度条
         self.assertNotIn("```progress", out)
 
+    def test_market_snapshot_fetched_once_per_render(self):
+        """整个面板渲染只能取一次大盘快照——这是"刷新不闪"的根。
+
+        回归背景：`ctx.mood()` 虽有 TTL 缓存，但一次渲染里调两次，两次
+        可能落在 TTL 边界两侧（第一次取到旧值、第二次新值）。后果有两层：
+        ① 同一面板里「上证 +1.08%」与「vs 上证 +1.09%」自相矛盾；
+        ② 内容每 5 秒微变 → 宿主 `loadPluginPanel` 判定内容变了 →
+           setState 重渲染 → KPI 卡的入场动画重播。用户两次强调
+           "刷新不要有动画"，根因就在这里（不是 CSS）。
+
+        这条测试把「一次渲染只取一次」钉死：调用计数必须 == 1。
+        """
+        pl = self._snapshot_stub(self._plugin("markdown"))
+        calls = {"n": 0}
+
+        def _mood_get(now):
+            calls["n"] += 1
+            return {
+                "indices": [
+                    {"code": "000001", "name": "上证指数", "price": 3638.03,
+                     "change_pct": 1.08},
+                    {"code": "000688", "name": "科创50指数", "price": 1200,
+                     "change_pct": 3.11},
+                    {"code": "000300", "name": "沪深300指数", "price": 4000,
+                     "change_pct": 0.79},
+                ],
+                "breadth": {"up": 4429, "down": 790, "total": 5300},
+                "amount": 1.78e12,
+            }
+
+        # 插件把 `self._mood_cache.get(time.monotonic())` 注入 context，
+        # 所以替换缓存对象的 get 就能精确计数（这里是唯一取数入口）。
+        pl._mood_cache = types.SimpleNamespace(get=_mood_get)
+        out = pl.panel_content("portfolio", {})
+        # 大盘卡 + 超额卡必须都在（证明两处都用到了同一份快照）
+        groups = _fences(out, "kpi")
+        self.assertEqual(len(groups), 3, "面板区块缺失")
+        labels = [it["label"] for it in groups[1]["items"]]
+        self.assertIn("今日超额", labels)
+        self.assertIn("上证", [it["label"] for it in groups[0]["items"]])
+        # 关键断言：一次渲染只取一次（多取就会抖）
+        self.assertEqual(calls["n"], 1,
+                         f"一次渲染取了 {calls['n']} 次大盘快照（应为 1）")
+
+    def test_render_is_byte_stable_across_repeats(self):
+        """同样输入的多次渲染必须**字节级一致**（宿主据此跳过重渲染）。
+
+        宿主前端 `loadPluginPanel` 的逻辑是「内容相同不 setState」，
+        所以只要输出稳定，刷新时 DOM 不动 → 入场动画不会重播。
+        任何随机/时间/顺序不确定混进渲染路径都会破坏这一点。
+        """
+        pl = self._snapshot_stub(self._plugin("markdown"))
+        outs = {pl.panel_content("portfolio", {}) for _ in range(5)}
+        self.assertEqual(len(outs), 1, "渲染结果不稳定（5 次出现多种输出）")
+        text = outs.pop()
+        # 输出里不能带任何动画/过渡标记（面板是静态快照，动画由宿主 CSS 管）
+        for marker in ("animation", "transition", "animate"):
+            self.assertNotIn(marker, text)
+
     def test_position_cards_use_trend_color(self):
         """持仓卡的涨跌必须走 trend 通道（红绿），不能只有黑白文字。
 

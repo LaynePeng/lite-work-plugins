@@ -287,50 +287,71 @@ def _hint_reason(h: Any) -> str:
 # ③ 只描述当下分布，不给"多空信号"、不预测。
 
 
-def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None) -> str:
-    """大盘区块（置顶）：2 张 KPI 卡 + 若干**各自独立成段**的短行。
+def market_context(ctx: PanelContext) -> Optional[Dict[str, Any]]:
+    """取一次大盘快照并做完全部派生计算（供大盘区块与「今日超额」共用）。
 
-    回答三个问题：
-      · 今天大盘什么状态？（上证点位、上涨占比、成交额）
-      · 是哪类指数在领涨？（强弱排序 + 一句人话解释）
-      · 我的持仓相对大盘如何？（独立一行的超额结论）
+    ── 为什么必须只取一次（这关系到"刷新会不会闪/重播动画"）──
+    面板每 5 秒刷新，宿主前端是**按内容是否变化**决定要不要重渲染的
+    （`loadPluginPanel`：内容相同不 setState）。之前 `render_markdown` 里
+    既调 `render_market()`、又为算超额单独调了一次 `ctx.mood()`：
+    `ctx.mood()` 虽有 TTL 缓存，但两次调用**可能落在 TTL 边界两侧**
+    （第一次命中旧值、第二次拿到新值），于是同一个面板里「上证 +1.08%」
+    和「vs 上证 +1.09%」自相矛盾，且内容每次微变 → 宿主判定"变了"
+    → 重渲染 → 入场动画重播。用户两次强调"刷新不要有动画"，
+    根因就在这里：不是 CSS 问题，是**输出不稳定**。
 
-    ── v2.5.3 版式重做（用户报障：「这堆太挤了」「风格是什么意思」）
-    ──
-    ① **每行都是独立段落**（`\\n\\n` 分隔）。此前用 `　` 全角空格缩进 +
-       单换行拼接，markdown 会把连续几行并成同一段，渲染后挤成一坨；
-       「→ 今日跑输…」也因此粘在成交额后面，看不出来它是个结论。
-    ② **「风格」这个词被删掉**。它其实是"按涨跌给指数排序、看哪类最强"，
-       属于内部术语；现在分两行说清：`领涨指数`（是什么）+ `含义`
-       （说明强弱的实际含义），用户不需要猜。
-    ③ 涨跌家数挪进 KPI 卡的 delta（`4429↑ / 790↓`），不再单独占一行。
-
-    `d` 是持仓快照（可为 None／空仓）。空仓时不给「跑输/跑赢」结论
-    （没有持仓可比较），但大盘本身照常显示。
+    修法：整个面板只取一次快照，派生值全部从这里出。
+    返回 None 表示大盘不可用（回调没注入 / 取数失败），调用方各自降级。
     """
     if ctx.mood is None:
-        return ""
+        return None
     try:
         snap = ctx.mood()
     except Exception as exc:
         logger.debug("[astock] 大盘数据获取失败: %s", exc)
-        return ("**大盘**\n\n大盘数据获取失败（接口限流或断网），"
-                "稍后自动重试")
+        return None
+    if not isinstance(snap, dict):
+        return None
     indices = snap.get("indices") or []
     breadth = snap.get("breadth")
-    if not indices and not breadth:
+    summary = mood.market_summary(indices, breadth, snap.get("amount"))
+    by_code = {i.get("code"): i for i in indices if isinstance(i, dict)}
+    return {
+        "snap": snap,
+        "indices": indices,
+        "breadth": breadth,
+        "summary": summary,
+        "sh": by_code.get("000001") or {},
+        "ss": by_code.get("399001") or {},
+        "ranking": mood.style_ranking(indices),
+        "ok": bool(indices or breadth),
+    }
+
+
+def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None,
+                  mctx: Optional[Dict[str, Any]] = None) -> str:
+    """大盘区块（置顶）：2 张 KPI 卡 + 一段「含义」文字。
+
+    `mctx` 由 `market_context()` 预先算好传入（避免二次取数，见其注释）；
+    不传时自己取一次（单独调用本函数的场景，如单测）。
+    """
+    if mctx is None:
+        mctx = market_context(ctx)
+    if mctx is None:
+        return ("**大盘**\n\n大盘数据获取失败（接口限流或断网），"
+                "稍后自动重试")
+    indices = mctx["indices"]
+    breadth = mctx["breadth"]
+    if not mctx["ok"]:
         return ("**大盘**\n\n未取到指数与涨跌家数（接口限流或断网），"
                 "稍后自动重试")
 
-    total_amount = snap.get("amount")
-    summary = mood.market_summary(indices, breadth, total_amount)
+    summary = mctx["summary"]
     ratio = summary.get("ratio")
     tone = summary.get("tone") or "-"
-    sh_pct = summary.get("sh_pct")
-
-    by_code = {i["code"]: i for i in indices}
-    sh = by_code.get("000001") or {}
-    ss = by_code.get("399001") or {}
+    sh = mctx["sh"]
+    ss = mctx["ss"]
+    ranking = mctx["ranking"]
 
     out: List[str] = [_section("大盘", _market_phase())]
 
@@ -362,7 +383,6 @@ def render_market(ctx: PanelContext, d: Optional[Dict[str, Any]] = None) -> str:
             trend="up" if (main_pct or 0) >= 0 else "down"))
 
     # 卡2：领涨指数（主值=最强指数名，delta=涨幅，note=四强全量 + 上涨占比）
-    ranking = mood.style_ranking(indices)
     if ranking:
         parts = []
         for i in ranking[:4]:       # 只取前四强，够看出强弱
@@ -512,7 +532,11 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
     数字仍在 JSON 里可读，不至于空白。
     """
     wline = watch_line(ctx.app)
-    market_block = render_market(ctx, d)
+    # **只取一次大盘快照**，两处（大盘区块 / 今日超额）共用同一份派生值。
+    # 二次调用 ctx.mood() 会落在 TTL 边界两侧拿到不同数据 → 输出抖动 →
+    # 宿主判定"内容变了" → 重渲染 → 入场动画重播（用户两次强调的痛点）。
+    mctx = market_context(ctx)
+    market_block = render_market(ctx, d, mctx) if mctx is not None else ""
     equity = (d.get("total_market_value") or 0) + (d.get("cash") or 0)
 
     if not d["positions"]:
@@ -554,14 +578,9 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         _kpi("可用资金", _money(cash),
              note=f"占总资产 {cash / equity * 100:.0f}%" if equity else ""),
     ]
-    # 今日超额：主值=超额 pp（红绿按跑赢/跑输），delta=定性，note=原因
-    sh_pct_now = None
-    if market_block:
-        try:
-            sh_now = {i["code"]: i for i in (ctx.mood() or {}).get("indices") or []}
-            sh_pct_now = (sh_now.get("000001") or {}).get("change_pct")
-        except Exception:
-            sh_pct_now = None
+    # 今日超额：主值=超额 pp（红绿按跑赢/跑输），delta=定性，note=原因。
+    # 上证涨跌幅取自**已算好的** mctx（不二次取数，见上方注释）。
+    sh_pct_now = (mctx or {}).get("summary", {}).get("sh_pct")
     pos_excess = _portfolio_excess(d, sh_pct_now)
     if pos_excess is not None:
         rs = mood.rs_verdict(pos_excess)
