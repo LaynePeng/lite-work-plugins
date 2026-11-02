@@ -13,6 +13,23 @@ import unittest
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def _fences(text: str, name: str) -> list:
+    """取出文本里**所有** ```name 围栏并解析成 JSON 列表（按出现顺序）。
+
+    面板里同名围栏会出现多次（大盘 kpi / 我的资产 kpi；风险股可能有多组
+    progress），所以不能用「只取第一个」的写法——那会把"第二个区块消失了"
+    这个真实回归掩盖掉。
+    """
+    import json as _json
+    out, rest = [], text
+    marker = f"```{name}\n"
+    while marker in rest:
+        rest = rest.split(marker, 1)[1]
+        body, rest = rest.split("\n```", 1)
+        out.append(_json.loads(body))     # 必须合法 JSON，否则前端降级成代码块
+    return out
+
+
 # ---------------------------------------------------------------- 桩
 def _install_litework_stubs() -> None:
     """插件模块级 import litework.*；测试环境没有主程序包，按最小契约打桩。
@@ -1688,11 +1705,13 @@ class TestPanelRender(unittest.TestCase):
         self.assertEqual(self._plugin().panel_content("nope", {}), "")
 
     def test_markdown_is_richbox_kpi_and_progress(self):
-        """markdown 形态：富围栏版——头部 ```kpi 指标卡 + 每股 ```progress 条。
+        """markdown 形态：大盘置顶 + 我的资产（4 张 KPI 卡）+ 持仓表格。
 
-        宿主面板（lite-work 2.0.4+）已支持富围栏渲染；面板输出从纯文本短行
-        升级为「KPI 卡 + 进度条」结构。旧宿主不识别时围栏降级为代码块，
-        数字仍在 JSON 里可读。
+        v2.5.3 版式重做后的口径变化（用户报障「顶部太挤」「持仓太占地」）：
+        - **第一段 kpi 是大盘**（2 张），第二段才是「我的资产」（4 张）。
+          原先只有一个 4 张卡的 kpi，大盘被塞在资产下面，两块混在一起。
+        - **常态不画 progress**：持仓默认是表格（一票一行），只有触发
+          规则/超仓/逼近止损的股票才展开成卡片 + 进度条。
         """
         import json as _json
         pl = self._snapshot_stub(self._plugin("markdown"))
@@ -1700,25 +1719,151 @@ class TestPanelRender(unittest.TestCase):
         self.assertIn("浦发银行", out)
         self.assertNotIn("lite-tree", out)
         self.assertNotIn("| 名称 | 股数 |", out)
-        # kpi 围栏：可解析、4 张卡
-        self.assertIn("```kpi", out)
-        kpi_json = out.split("```kpi\n", 1)[1].split("\n```", 1)[0]
-        kpi = _json.loads(kpi_json)
-        self.assertEqual(len(kpi["items"]), 4)
-        labels = [it["label"] for it in kpi["items"]]
+        # 两个 kpi 围栏：① 大盘（2 张）② 我的资产（4 张）
+        kpis = _fences(out, "kpi")
+        self.assertEqual(len(kpis), 2)
+        self.assertEqual(len(kpis[0]["items"]), 2)
+        self.assertEqual(len(kpis[1]["items"]), 4)
+        labels = [it["label"] for it in kpis[1]["items"]]
         self.assertIn("总资产", labels)
         self.assertIn("可用资金", labels)
-        # progress 围栏：仓位空间 + 距止损余量两条（v1.7.2 改为「安全余量」语义）
-        self.assertIn("```progress", out)
-        pr_json = out.split("```progress\n", 1)[1].split("\n```", 1)[0]
-        pr = _json.loads(pr_json)
-        plabels = [it["label"] for it in pr["items"]]
-        self.assertTrue(any("仓位空间" in x for x in plabels))
-        self.assertTrue(any("距止损余量" in x for x in plabels))
-        # 数值在 0-100 区间
-        for it in pr["items"]:
-            self.assertGreaterEqual(it["value"], 0)
-            self.assertLessEqual(it["value"], 100)
+        # 大盘区块必须在资产区块之前（置顶）
+        self.assertLess(out.index("**大盘**"), out.index("**我的资产**"))
+        # 持仓走表格（一票一行），不再是一票一段纯文本 + 两根进度条
+        self.assertIn("| 名称 | 现价 | 今日 | 浮盈 |", out)
+        # 该 fixture 没有触发任何规则（浮亏 -4.76%，未到 8%；仓位 24%，未超 25%）
+        # → 不展开风险卡片，也不画进度条（常态省地方）
+        self.assertNotIn("```progress", out)
+        self.assertNotIn("需要处理", out)
+
+    def test_risky_position_expands_to_card_and_progress(self):
+        """触发规则/逼近止损的持仓才展开成卡片 + 安全余量进度条（v2.5.3）。
+
+        这是「表格为主体 + 风险时展开」的另一半：省空间不能以漏掉风险为代价。
+        """
+        import json as _json
+        pl = self._plugin("markdown")
+        quote = {"price": 8.0, "prev_close": 9.5, "change_pct": -15.8,
+                 "limit_up": 10.45, "limit_down": 8.55}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
+            "total_market_value": 8000.0, "equity": 8000.0, "cash": 0.0,
+            "float_pnl": -2000.0, "today_pnl": -1500.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        # 风险区块 + 卡片
+        self.assertIn("需要处理", out)
+        cards = _fences(out, "cards")[0]["items"]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("浦发银行", cards[0]["title"])
+        self.assertTrue(cards[0]["desc"])          # 卡片必须写清"为什么"
+        # 进度条（安全余量语义：触线 = 0）
+        pr = _fences(out, "progress")[0]
+        stop = next(it for it in pr["items"] if "距止损余量" in it["label"])
+        self.assertEqual(stop["value"], 0)
+        room = next(it for it in pr["items"] if "仓位空间" in it["label"])
+        self.assertEqual(room["value"], 0)
+        self.assertIn("超限", room["note"])
+
+    def test_big_loss_within_stop_shows_noise_free_warning(self):
+        """破位前 30% 余量内就预警——hint 只在**跌破**阈值才报，太晚（v2.5.3）。"""
+        pl = self._plugin("markdown")
+        # 成本 10.0，现价 9.4 → 浮亏 6%（止损 -8% 未破），余量 25% < 30%
+        quote = {"price": 9.4, "prev_close": 9.5, "change_pct": -1.05}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
+            "total_market_value": 9400.0, "equity": 39400.0, "cash": 30000.0,
+            "float_pnl": -600.0, "today_pnl": -100.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("距止损只剩", out)
+        # 且必须说清是哪条阈值（否则用户不知道 25% 是怎么算出来的）
+        self.assertIn("阈值 −8%", out)
+
+    def test_risk_reason_not_duplicated(self):
+        """卡片 desc 里同一条原因不能出现两遍（v2.5.3 实测踩到）。
+
+        回归背景：hint 引擎产出 `position_cap`（一条 action 提示），
+        面板又用自己的判断追加了一次"单票占比超上限"——卡片 desc 变成
+        "…超上限 —— 建议至少减至 25%…；单票占比 33.8% 超过上限 25%，
+        建议减到 25% 以内"，同一件事用两种措辞复读。
+        """
+        pl = self._plugin("markdown")
+        quote = {"price": 8.62, "change_pct": 1.53, "prev_close": 8.49}
+        pos = [{"code": "002532", "name": "天山铝业", "shares": 1000,
+                "cost_price": 8.60, "available_today": 1000}]
+        # 持仓市值 8620 / 总资产 25476 = 33.8% > 25% 上限
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"002532": quote}, "watch_quotes": {},
+            "total_market_value": 8620.0, "equity": 25476.0, "cash": 16856.0,
+            "float_pnl": 20.0, "today_pnl": 20.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        desc = _fences(out, "cards")[0]["items"][0]["desc"]
+        self.assertEqual(desc.count("超过上限") + desc.count("超上限"), 1,
+                         f"同一原因重复了：{desc}")
+        # 浮盈中的票不该出「距止损」标签（100% 余量 = 报"没事"，纯噪声）
+        tags = _fences(out, "cards")[0]["items"][0]["tags"]
+        self.assertFalse(any("距止损" in t for t in tags), tags)
+        # 也不该画止损进度条
+        pr = _fences(out, "progress")[0]
+        self.assertFalse(any("距止损" in it["label"] for it in pr["items"]))
+
+    def test_style_note_threshold_matches_mood(self):
+        """「含义」一行的分化判据与 `mood.style_verdict` 保持一致（0.8pp）。
+
+        两处措辞不同（面板要短语、聊天侧要整句），但**判据必须一致**——
+        否则同一组指数在面板里说"分化"、在聊天里说"均衡"。
+        """
+        import astock_market_mood as _mood
+        cases = [
+            ([{"name": "A", "change_pct": 2.0}, {"name": "B", "change_pct": 1.6}], True),
+            ([{"name": "A", "change_pct": 3.0}, {"name": "B", "change_pct": 1.0}], False),
+        ]
+        for ranking, balanced in cases:
+            verdict = _mood.style_verdict(ranking)
+            spread = ranking[0]["change_pct"] - ranking[-1]["change_pct"]
+            self.assertEqual(spread < 0.8, balanced)
+            # 阈值两侧的措辞分界：<0.8 说"均衡/接近"，否则说"最强/分化"
+            if balanced:
+                self.assertIn("均衡", verdict)
+            else:
+                self.assertIn("最强", verdict)
+
+    def test_market_block_explains_style_in_plain_words(self):
+        """「风格」这个内部术语被删掉，改用「领涨指数 + 含义」两行说明。
+
+        回归背景（用户原话）：「风格是什么意思？」——面板用了一个只有作者
+        懂的标签。现在标签说清"是什么"，另有「含义」一行说清"意味着什么"。
+        """
+        pl = self._snapshot_stub(self._plugin("markdown"))
+        out = pl.panel_content("portfolio", {})
+        self.assertNotIn("风格：", out)
+        self.assertIn("**领涨指数**", out)
+        self.assertIn("**含义**", out)
+        # 每行独立成段（前后有空行），不再用全角空格缩进拼成一块
+        self.assertIn("**领涨指数**", out)
+        self.assertNotIn("　风格", out)
+
+    def test_excess_verdict_is_own_paragraph(self):
+        """「今日跑输，持仓拖了后腿」必须独立成段（用户报障：挤在后面看不见）。"""
+        import re as _re
+        pl = self._plugin("markdown")
+        # 持仓今日 -3%、上证 +1% → 跑输；用单票构造组合加权涨幅
+        quote = {"price": 9.7, "prev_close": 10.0, "change_pct": -3.0}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
+            "total_market_value": 9700.0, "equity": 39700.0, "cash": 30000.0,
+            "float_pnl": -300.0, "today_pnl": -300.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        # 独立段落：**加粗结论 + 原因说明** 独占一行，前后都有空行
+        m = _re.search(r"\n\n\*\*今日[^\n]*跑输[^\n]*\*\*[^\n]*拖了后腿[^\n]*\n\n", out)
+        self.assertTrue(m, f"跑输结论未独立成段：\n{out}")
+        # 且不能再用全角空格缩进（那正是"挤在后面看不见"的写法）
+        self.assertNotIn("　→ 今日", out)
 
     def test_tree_is_valid_litetree_json(self):
         import json
@@ -1882,7 +2027,8 @@ class TestPanelRender(unittest.TestCase):
             "float_pnl": -500.0, "today_pnl": -100.0, "realized_pnl": 0.0}}
         out = pl.panel_content("portfolio", {})
         self.assertIn("自选观察", out)
-        self.assertIn("招商银行（600036）", out)
+        # 名称与代码都要在（下单要代码）；v2.5.3 把全角括号换成半角空格省宽度
+        self.assertIn("招商银行 600036", out)
         self.assertIn("42.50", out)
         self.assertIn("| 名称 |", out)   # 表格本身必须在，不能只出标题
 

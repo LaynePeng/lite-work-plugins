@@ -922,9 +922,11 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
              "default": 60.0},
             {"key": "panel_style", "type": "str", "label": "右栏持仓面板形态",
              "default": "markdown",
-             "hint": "markdown＝紧凑表格（横向数值对齐，适合盘后核对）；"
-                     "tree＝一只股一张卡，卡内写触发规则与建议动作并按严重度着色"
-                     "（适合盘中扫一眼）。两者数据完全相同，只是排版不同"},
+             "hint": "markdown＝四块版式（大盘 → 我的资产 → 持仓表格 → 自选），"
+                     "**持仓默认是一票一行的紧凑表格，只有触发规则/超仓/逼近止损的"
+                     "股票才展开成卡片与安全余量进度条**（常态省地方、风险时显眼）；"
+                     "tree＝全部改成一只股一张卡，卡内写触发规则与建议动作并按严重度"
+                     "着色（适合盘中逐只排查）。两者数据完全相同，只是排版不同"},
             {"key": "watch_interval_seconds", "type": "number",
              "label": "盯盘探测间隔（秒）", "default": 300,
              "hint": "插件会自动按这个间隔创建/维护宿主盯梢计划（最小 60 秒）。"
