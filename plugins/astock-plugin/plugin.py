@@ -918,7 +918,31 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.5.9"
+    version = "2.6.0"
+
+    #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
+    #:
+    #: 为什么必须声明：插件工具默认归 `misc` 域，而无人值守任务（盯梢/定时）
+    #: 只保留 read 域的工具。不声明的话，盯盘计划里**一个 astock 工具都调不到**，
+    #: Agent 只能回「四道门槛的输入我一条都拿不到，无法生成简报」。
+    #:
+    #: 收录标准（任何一条不满足就不能列进来）：
+    #:   · 只读行情/舆情/K线（网络 GET）或只读台账，**不写任何本地状态**；
+    #:   · 不改台账、不写存档、不改计划、不落回单。
+    #:
+    #: 因此**刻意排除**这些有写副作用的工具——它们在盯梢任务里仍被禁：
+    #:   - astock_watch    action=set_rules/start 会改盯盘计划
+    #:   - astock_record   写成交台账
+    #:   - astock_sync     落账成交回单
+    #:   - astock_archive  写本地 SQLite 行情存档
+    #:   - astock_act      生成/改写操作指示
+    #:   - astock_backtest 会自动回写行情存档
+    #:   - astock_pick     会按需更新存档
+    read_only_tools = [
+        "astock_quote", "astock_kline", "astock_events", "astock_flow",
+        "astock_search", "astock_screen", "astock_calc", "astock_hint",
+        "astock_sentiment", "astock_portfolio",
+    ]
 
     #: 大盘看板缓存（v2.5.0）。**放类属性而非实例属性**：插件实例可能被重建
     #: （切工作区/热重载），而大盘数据与实例无关，缓存留着反而减少请求。
