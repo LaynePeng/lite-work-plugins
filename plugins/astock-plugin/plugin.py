@@ -141,6 +141,62 @@ except ImportError:  # 旧宿主降级
 
     ProbeContext = None  # type: ignore[assignment,misc]
 
+# ================================================================ 热重载支持
+# **为什么必须在 import 同目录模块之前清一次 sys.modules**（真实缺陷）：
+#
+# 宿主 `plugin_loader._load_module` 重载插件时只 `exec_module` 本文件（入口），
+# 名字是固定 `litework_plugin_<name>`；而本文件下面那几十个 `import astock_*`
+# 走的是**普通的 sys.modules 缓存**——它们不会被重新加载。后果：
+#
+#   · 覆盖安装更新后，插件元信息（version）立刻变新；
+#   · 但执行代码仍是**旧的兄弟模块**（mixin、面板、价规引擎全是旧对象）；
+#   · 表现是"明明升了版，行为一点没变"——用户只能重启整个 Core 才生效。
+#     实测：v2.5.9 装好后 `action=plan` 输出的仍是 v2.5.7 的文案。
+#
+# 宿主侧修（在 load_plugins 里按插件目录清 sys.modules）需要改主程序；插件
+# 自己能做的就是在入口处清掉**属于本插件目录**的模块名，让下面的 import
+# 重新执行。只清"文件位于本目录内"的模块，不误伤第三方依赖与宿主模块。
+#
+# 注意：清 sys.modules 只影响**后续 import**，本进程里已存在的旧类实例
+# （旧插件对象）不受影响——那本来就该由宿主丢弃重建，二者配合才完整。
+def _purge_sibling_modules(modules: Optional[Dict[str, Any]] = None,
+                           here: Optional[str] = None) -> list:
+    """把 sys.modules 里来自本插件目录的兄弟模块移出，返回被清的名字。
+
+    参数只为**可测试**而存在（默认就是真实 sys.modules + 本文件目录）：
+    清理是破坏性操作，单测必须能在假表上验证，绝不能拿运行中的真实模块
+    做实验——那样会让后续 import 重新执行几十个模块（实测把整套测试从
+    1.3 秒拖到 100 秒，且模块身份全变，31 个无关用例连带失败）。
+    """
+    import sys as _sys
+    mods = _sys.modules if modules is None else modules
+    _here = here or os.path.dirname(os.path.abspath(__file__))
+    # 只清理本文件连同目录下的模块；`litework.*`、标准库、site-packages 全不动。
+    prefixes = ("astock_", "plugin")
+    dropped = []
+    for _name, _mod in list(mods.items()):
+        if _name.startswith(("litework", "email", "watch_plugin")):
+            continue
+        _file = getattr(_mod, "__file__", None)
+        if not _file:
+            continue
+        if os.path.dirname(os.path.abspath(_file)) != _here:
+            continue
+        if not _name.startswith(prefixes):
+            continue
+        # 自己（入口模块）不能删：宿主正拿着它的引用
+        if _name.startswith("litework_plugin"):
+            continue
+        mods.pop(_name, None)
+        dropped.append(_name)
+    return dropped
+
+
+_purged = _purge_sibling_modules()
+if _purged:
+    logger_early = logging.getLogger("litework.plugins.astock")
+    logger_early.debug("[astock] 热重载：已清理 %d 个旧子模块", len(_purged))
+
 import astock_backtest_tool as backtest_tool
 import astock_archive as archive_mod
 import astock_data as data
@@ -862,7 +918,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.5.8"
+    version = "2.5.9"
 
     #: 大盘看板缓存（v2.5.0）。**放类属性而非实例属性**：插件实例可能被重建
     #: （切工作区/热重载），而大盘数据与实例无关，缓存留着反而减少请求。

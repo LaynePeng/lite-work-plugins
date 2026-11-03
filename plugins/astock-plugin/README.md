@@ -4,7 +4,7 @@
 
 ---
 
-## 0. 持仓面板的四块版式（v2.5.8）
+## 0. 持仓面板的四块版式（v2.5.9）
 
 面板从上到下四块，块间用 `---` 分隔，每块自带**真标题**（`###`，比正文大一号）。
 **大盘在最上面**——不知道市场怎么样时，「浮亏 -8%」这个数字没有意义。
@@ -707,7 +707,7 @@ astock_watch action=set_rules rules=[...]                 # 整体替换
 astock_watch action=set_rules add_rules=[{...}]           # 追加
 astock_watch action=set_rules remove_rules=["000651"]     # 按代码删除
 astock_watch action=set_rules remove_rules=["600900"] \
-    add_rules=[{...600900 新规则...}]                     # 同代码＝替换（v2.5.8）
+    add_rules=[{...600900 新规则...}]                     # 同代码＝替换（v2.5.9）
 astock_watch action=set_rules add_rules=[...] min_level=urgent   # 同时调阈值
 ```
 

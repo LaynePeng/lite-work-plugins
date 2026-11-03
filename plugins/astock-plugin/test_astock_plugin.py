@@ -5336,9 +5336,19 @@ class TestActionSurface(unittest.TestCase):
         self.assertIn("astock-act", cmds)
 
     def test_all_tools_declared_in_manifest(self):
+        """manifest 声明的工具面必须与 get_tools() 一致（CI 依赖这条）。
+
+        **装在插件目录里时没有 manifest.json**：本文件随插件一起被复制到
+        `~/.lite-work/plugins/astock-plugin/`，那里的 `../../manifest.json`
+        不存在——早先直接 open() 会让「装完后自测」报 FileNotFoundError，
+        看着像装坏了，其实只是这条用例绑定了仓库结构。
+        它的作用对象是**社区仓库的清单**，所以找不到清单时跳过而不是失败。
+        """
         import json
-        with open(os.path.join(_HERE, "..", "..", "manifest.json"),
-                  encoding="utf-8") as f:
+        man_path = os.path.join(_HERE, "..", "..", "manifest.json")
+        if not os.path.isfile(man_path):
+            self.skipTest("不在仓库内（已安装到插件目录），manifest 校验由 CI 负责")
+        with open(man_path, encoding="utf-8") as f:
             man = json.load(f)
         entry = [p for p in man["plugins"] if p["name"] == "astock-plugin"][0]
         declared = set(entry["tools"])
@@ -5428,6 +5438,65 @@ class ConfigHotReloadTest(unittest.TestCase):
         for _ in range(3):
             self.plugin.on_config_changed(self.plugin._app.config)
         self.assertEqual(astock.data._TIMEOUT, 11.0)
+
+
+class TestHotReload(unittest.TestCase):
+    """覆盖安装后**执行代码**必须跟着更新（v2.5.9）。
+
+    真实缺陷：宿主 `plugin_loader._load_module` 重载插件时只 `exec_module`
+    入口 `plugin.py`，而入口里几十个 `import astock_*` 走普通 sys.modules
+    缓存——子模块不会被重新执行。现象是"版本号变了、行为一点没变"，
+    只能重启整个 Core。实测 v2.5.9 装好后 `action=plan` 仍输出 v2.5.7 的文案。
+
+    修法是在入口 import 兄弟模块之前，把**本插件目录内**的模块移出
+    sys.modules。这一组测试锁住"清了什么 / 没误伤什么"。
+    """
+
+    def test_purge_drops_sibling_modules(self):
+        """本插件目录内的 astock_* 模块会被清掉（下次 import 重新执行）。
+
+        **只在假表上验证**：真去清运行中的 sys.modules 会让后续 import
+        重新执行几十个模块（实测把整套测试从 1.3s 拖到 100s，31 个无关
+        用例连带失败）。所以 `_purge_sibling_modules` 接受 modules/here
+        参数，这里传一个假表 + 假目录。
+        """
+        here = "/fake/plugin/dir"
+        fake_sib = types.ModuleType("astock_fake_sibling")
+        fake_sib.__file__ = os.path.join(here, "astock_fake_sibling.py")
+        fake_other = types.ModuleType("astock_fake_elsewhere")
+        fake_other.__file__ = "/tmp/elsewhere/astock_fake_elsewhere.py"
+        fake_entry = types.ModuleType("litework_plugin_astock")
+        fake_entry.__file__ = os.path.join(here, "plugin.py")
+        mods = {"astock_fake_sibling": fake_sib,
+                "astock_fake_elsewhere": fake_other,
+                "litework_plugin_astock": fake_entry,
+                "sys": astock.os.sys if hasattr(astock.os, "sys") else __import__("sys")}
+
+        dropped = astock._purge_sibling_modules(mods, here)
+
+        self.assertIn("astock_fake_sibling", dropped, "本目录的兄弟模块应被清理")
+        self.assertNotIn("astock_fake_sibling", mods)
+        self.assertNotIn("astock_fake_elsewhere", dropped,
+                         "别处的同名模块不能误伤")
+        self.assertIn("astock_fake_elsewhere", mods)
+        self.assertNotIn("litework_plugin_astock", dropped,
+                         "入口模块不能被自己清掉（宿主还拿着引用）")
+
+    def test_purge_keeps_host_modules(self):
+        """宿主模块、标准库都不在清理范围（假表上验证）。"""
+        import sys
+        here = "/fake/plugin/dir"
+        fake = types.ModuleType("astock_fake")
+        fake.__file__ = os.path.join(here, "astock_fake.py")
+        host = types.ModuleType("litework")
+        host.__file__ = "/somewhere/litework/__init__.py"
+        mods = {"astock_fake": fake, "litework": host, "sys": sys}
+
+        dropped = astock._purge_sibling_modules(mods, here)
+
+        self.assertEqual(dropped, ["astock_fake"])
+        self.assertIn("litework", mods)
+        self.assertIn("sys", mods)
 
 
 
