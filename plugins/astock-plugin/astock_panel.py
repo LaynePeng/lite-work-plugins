@@ -291,7 +291,12 @@ def _hint_reason(h: Any) -> str:
         title = title[len(name):].strip()
     if not body:
         return title
-    return f"{title} —— {body}" if title else body
+    # 不用破折号（用户明确要求「不要破折号」）：改为句号断句。
+    # 早先写成 `title —— body`，在面板里渲染成 `- **浦发银行**：触发止损线
+    # （浮亏 -20.00%） —— 按计划应减仓/清仓 …`——正是用户反复要求去掉的那个
+    # 符号；且 em dash 在窄栏里与减号/破折号分不清。
+    sep = "" if title.endswith(("。", "！", "？", "；", "，", "、", "：")) else "。"
+    return f"{title}{sep}{body}" if title else body
 
 
 # ====================================================================== 大盘看板
@@ -741,7 +746,12 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         out.append("")
         wrows = []
         for code, q in list(wq.items())[:MAX_ROWS]:
-            wrows.append([f"{q.get('name') or code} {code}", _f(q.get("price")),
+            # 行情没带 name 时**不能**退回 code——否则拼出来是 `002532 002532`
+            # 这种代码写两遍的怪行（自选股名称缺失很常见：行情源偶尔只回
+            # 价格/涨跌幅）。缺名时只留代码。
+            name = q.get("name")
+            head = f"{name} {code}" if name else code
+            wrows.append([head, _f(q.get("price")),
                           _arrow_pct(q.get("change_pct"))])
         out.append(_table(["名称", "现价", "今日"], wrows))
         out.append("")

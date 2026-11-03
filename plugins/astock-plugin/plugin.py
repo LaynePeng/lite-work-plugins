@@ -862,7 +862,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.5.7"
+    version = "2.5.8"
 
     #: 大盘看板缓存（v2.5.0）。**放类属性而非实例属性**：插件实例可能被重建
     #: （切工作区/热重载），而大盘数据与实例无关，缓存留着反而减少请求。

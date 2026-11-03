@@ -272,12 +272,14 @@ def market_summary(indices: List[Dict[str, Any]],
     }
 
     # 背离提示：指数方向 vs 个股宽度方向不一致时，**指数会骗人**
+    # 不用破折号（用户明确要求）：改为句号断句。这段会直接进右栏面板与
+    # 聊天输出，两处都在字符宽度紧张的窄栏里，em dash 与减号分不清。
     if sh_pct is not None and ratio is not None:
         if sh_pct > 0 and ratio < 45:
-            out["divergence"] = (f"⚠️ 指数上涨 {sh_pct:+.2f}% 但只有 {ratio:.1f}% 个股上涨——"
+            out["divergence"] = (f"⚠️ 指数上涨 {sh_pct:+.2f}% 但只有 {ratio:.1f}% 个股上涨。"
                                  f"**指数被权重股拉动，多数个股在跌**，别把指数红盘当成普涨")
         elif sh_pct < 0 and ratio > 55:
-            out["divergence"] = (f"⚠️ 指数下跌 {sh_pct:+.2f}% 但仍有 {ratio:.1f}% 个股上涨——"
+            out["divergence"] = (f"⚠️ 指数下跌 {sh_pct:+.2f}% 但仍有 {ratio:.1f}% 个股上涨。"
                                  f"**是权重股拖累指数，多数个股在涨**，别被指数绿盘吓到")
 
     if ratio is not None and breadth:

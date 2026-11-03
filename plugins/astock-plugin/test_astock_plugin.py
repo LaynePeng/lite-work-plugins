@@ -1774,15 +1774,24 @@ class TestPanelRender(unittest.TestCase):
     def setUp(self):
         import tempfile
         import datetime as dt
+        import astock_sentiment_data as _sd
         self.tmp = tempfile.mkdtemp(prefix="astock-panel-")
         self.path = os.path.join(self.tmp, "ledger.sqlite")
         lg = ledger_mod(self.path)
         yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
         lg.record_trade("600000", "buy", 10.0, 1000, trade_date=yday, name="浦发银行")
         lg.set_cash(30000)
+        # 舆情速查同样会打网络（只查 1 只 + 4 个便宜类别，但仍是请求）。
+        # 面板每次渲染都会调它 → 不打桩等于每个用例 0.5 秒的网络等待，
+        # 且盘中的研报/两融数据会变，字节稳定性用例因此随机红。
+        # 需要真实舆情行为的用例自己 patch（见 test_sentiment_failure_*）。
+        self._real_senti_collect = _sd.collect
+        _sd.collect = lambda *a, **k: {"items": [], "errors": [], "extras": {}}
 
     def tearDown(self):
         import shutil
+        import astock_sentiment_data as _sd
+        _sd.collect = self._real_senti_collect
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _plugin(self, style="markdown"):
@@ -1790,10 +1799,42 @@ class TestPanelRender(unittest.TestCase):
         pl._app = types.SimpleNamespace(
             workspace=self.tmp,
             config={"astock-plugin": {"panel_style": style}})
+        # **默认就离线**：面板每次渲染都会取大盘快照，不打桩就等于让整个
+        # TestPanelRender 联网（本文件红线：不连任何行情接口），而且盘中
+        # 涨跌幅秒秒在变 → 字节稳定性用例随机红。这里统一在造插件时就钉死。
+        return self._mood_stub(pl)
+
+    #: 面板单测的固定大盘快照。
+    #:
+    #: **必须打桩、不能让它走真实取数**：`_mood_cache.get()` 过期（或首次）
+    #: 时会真的去请求指数与涨跌家数。早先这里没打桩，于是：
+    #: ① 整个 TestPanelRender 在跑测试的机器上联网（违反本文件顶部的
+    #:    「不连任何行情接口」红线）；② 盘中的涨跌幅每秒都在变
+    #:    `test_render_is_byte_stable_across_repeats` 就会像枪一样随机红
+    #:    （实测：同一次全量跑里它红了，单独跑又绿）。
+    MOOD_SNAP = {
+        "indices": [
+            {"code": "000001", "name": "上证指数", "price": 3638.03,
+             "change_pct": 1.08, "amount_yuan": 9.0e11},
+            {"code": "399001", "name": "深证成指", "price": 11000.0,
+             "change_pct": 1.63, "amount_yuan": 8.8e11},
+            {"code": "000688", "name": "科创50指数", "price": 1200.0,
+             "change_pct": 3.11},
+            {"code": "000300", "name": "沪深300指数", "price": 4000.0,
+             "change_pct": 0.79},
+            {"code": "000905", "name": "中证500指数", "price": 6000.0,
+             "change_pct": 2.46},
+        ],
+        "breadth": {"up": 4429, "down": 790, "flat": 75, "total": 5294},
+        "amount": 1.78e12,
+    }
+
+    def _mood_stub(self, pl):
+        pl._mood_cache = types.SimpleNamespace(get=lambda now, **kw: self.MOOD_SNAP)
         return pl
 
     def _snapshot_stub(self, pl):
-        """替换 _snapshot，避免联网（面板逻辑才是测试目标）。"""
+        """替换 _snapshot 与大盘取数，全程离线（面板逻辑才是测试目标）。"""
         quote = {"price": 9.53, "prev_close": 9.62, "change_pct": -0.94,
                  "low": 9.40, "high": 9.80,
                  "limit_up": 10.58, "limit_down": 8.66}
@@ -1803,10 +1844,9 @@ class TestPanelRender(unittest.TestCase):
                 "updated_at": "2026-10-20", "note": ""}]
         pl._snapshot = lambda **kw: {"data": {
             "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
-            "watch_quotes": {},
             "total_market_value": 9530.0, "equity": 39530.0, "cash": 30000.0,
             "float_pnl": -475.1, "today_pnl": -90.0, "realized_pnl": 0.0}}
-        return pl
+        return self._mood_stub(pl)
 
     def test_unknown_panel_returns_empty(self):
         self.assertEqual(self._plugin().panel_content("nope", {}), "")
@@ -1842,7 +1882,11 @@ class TestPanelRender(unittest.TestCase):
         for need in ("总资产", "持仓市值", "浮动盈亏", "可用资金", "今日超额"):
             self.assertIn(need, labels)
         # ③ 大盘置顶
-        self.assertLess(out.index("**大盘**"), out.index("**我的资产**"))
+        #
+        # v2.5.6 把区块标题从 `**粗体**` 改成了真标题 `###`（用户要求
+        # "大盘、我的资产、持仓…是标题，可以比其他字体大一点"），所以这里
+        # 断言 `###`——标题就该用标题语法，粗体留给正文强调。
+        self.assertLess(out.index("### 大盘"), out.index("### 我的资产"))
         # ④ 持仓是卡片（kpi 组），不是表格
         self.assertNotIn("| 名称 | 现价 | 今日 | 浮盈 |", out)
         pos = _pos_cards(out)
@@ -1945,19 +1989,56 @@ class TestPanelRender(unittest.TestCase):
         # 涨的排前面（按今日涨跌排序）
         self.assertEqual(pos_cards[0]["label"], "涨的")
 
+    def _assert_no_em_dash(self, out, hint=""):
+        """逐行断言没有 em dash（JSON 体里允许容器本身用 - 占位）。"""
+        for line in out.splitlines():
+            if line.startswith("```") or line.strip().startswith("{"):
+                continue
+            self.assertNotIn("——", line, f"{hint}｜{line}")
+            self.assertNotIn("—", line, f"{hint}｜{line}")
+
     def test_no_em_dash_in_output(self):
         """输出里不许出现 em dash「—」（用户明确要求）。
 
         零涨跌、无数据都曾有「—」占位；它在窄栏里与减号/破折号分不清。
         现在：涨跌用 ▲▼（或零涨跌无箭头），缺失用 '-'。
+
+        **只测一种快照是不够的**（这是本条用例的历史缺口）：破折号实际藏在
+        两条它没覆盖的路径上——
+          ① 风险原因行 `_hint_reason` 拼的是 `title —— body`；
+          ② 大盘背离提示 `market_summary` 拼的是 `…个股上涨——**是权重股…`。
+        标准快照既没有触发风险的持仓、也没有背离数据，于是两句都渲染不到，
+        用例长期"绿着"，而用户实际面板里两处破折号都在。所以这里逐路径各测一遍。
         """
+        # ① 常规快照
         pl = self._snapshot_stub(self._plugin("markdown"))
+        self._assert_no_em_dash(pl.panel_content("portfolio", {}), "常规")
+
+        # ② 触发风险提示（走 _hint_reason 的 title + body 拼接）
+        pl = self._plugin("markdown")
+        quote = {"price": 8.0, "prev_close": 9.5, "change_pct": -15.8,
+                 "limit_up": 10.45, "limit_down": 8.55}
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"600000": quote}, "watch_quotes": {},
+            "total_market_value": 8000.0, "equity": 8000.0, "cash": 0.0,
+            "float_pnl": -2000.0, "today_pnl": -1500.0, "realized_pnl": 0.0}}
         out = pl.panel_content("portfolio", {})
-        for line in out.splitlines():
-            if line.startswith("```") or line.strip().startswith("{"):
-                continue          # JSON 体里允许容器本身用 - 占位
-            self.assertNotIn("——", line, line)
-            self.assertNotIn("—", line, line)
+        self.assertIn("触发止损", out, "这条快照没走到风险原因行，用例失效")
+        self._assert_no_em_dash(out, "风险原因")
+
+        # ③ 大盘背离提示（指数跌但多数个股涨）
+        pl = self._plugin("markdown")
+        pl._mood_cache = types.SimpleNamespace(get=lambda now, **kw: {
+            "indices": [{"code": "000001", "name": "上证指数", "price": 3600.0,
+                         "change_pct": -0.87}],
+            "breadth": {"up": 3500, "down": 1500, "flat": 100, "total": 5100},
+            "amount": 8.0e11,
+        })
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("权重股拖累", out, "这条快照没走到背离提示，用例失效")
+        self._assert_no_em_dash(out, "大盘背离")
 
     def test_risky_position_draws_progress(self):
         """仓位超限 / 浮亏逼近止损的票才画进度条（v2.5.5）。
@@ -2067,9 +2148,10 @@ class TestPanelRender(unittest.TestCase):
         self.assertNotIn("**领涨指数**　科创", out)
         self.assertNotIn("**今日成交**　", out)
         # 「含义」保留成一行文字，但**不许有破折号**
-        self.assertIn("**含义**", out)
+        # v2.5.6：从 `**含义**` 改成 `##### 含义`（用户要求「含义那段的字小一点」）。
+        self.assertIn("##### 含义", out)
         note_line = next(ln for ln in out.splitlines()
-                         if ln.startswith("**含义**"))
+                         if ln.startswith("##### 含义"))
         self.assertNotIn("——", note_line)
         self.assertNotIn("—", note_line.split("含义", 1)[1])
 
@@ -2161,7 +2243,7 @@ class TestPanelRender(unittest.TestCase):
         回归背景（真实报障两轮）：① 状态行直接 append 到末尾与自选表
         粘成一片；② v1.7.0 用自造的 `──` 文本当分隔线，markdown 渲染器
         不认，且盯盘/舆情之间只有单换行——渲染时三行全合并成一行。
-        v1.7.1 改为标准 `---` 分割线 + **盯盘**/**舆情** 各自成块。
+        v1.7.1 改为标准 `---` 分割线 + 盯盘/舆情各自成块（v2.5.6 起为 `###` 真标题）。
         """
         pl = self._snapshot_stub(self._plugin("markdown"))
         # 面板渲染已拆到 astock_panel（v2.1.2），所以打桩要打在模块函数上，
@@ -2176,11 +2258,13 @@ class TestPanelRender(unittest.TestCase):
         self.assertIn("\n---\n", out)
         self.assertNotIn("──", out)
         # 两块各有小标题，且顺序：盯盘在前、舆情在后
-        self.assertIn("**盯盘**", out)
-        self.assertIn("**舆情**", out)
-        self.assertLess(out.index("**盯盘**"), out.index("**舆情**"))
+        # v2.5.6：小标题从 `**盯盘**` 改成真标题 `### 盯盘`（用户原话
+        # "盯盘是标题，可以比其他字体大一点"）——所以这里断言 `###`。
+        self.assertIn("### 盯盘", out)
+        self.assertIn("### 舆情", out)
+        self.assertLess(out.index("### 盯盘"), out.index("### 舆情"))
         # 块与块之间必须空行分隔（单换行会被渲染器合并成一行）
-        m = __import__("re").search(r"\*\*盯盘\*\*\n\n(.+?)\n\n\*\*舆情\*\*", out, __import__("re").S)
+        m = __import__("re").search(r"### 盯盘\n\n(.+?)\n\n### 舆情", out, __import__("re").S)
         self.assertTrue(m, "盯盘块与舆情块之间未用空行分隔")
         # 数据区在分割线之前：数据在上、状态在下。
         # v2.5.0 起面板有**两个** `---` 分割线（大盘区之后、状态区之前），
@@ -2273,6 +2357,30 @@ class TestPanelRender(unittest.TestCase):
         self.assertIn("招商银行 600036", out)
         self.assertIn("42.50", out)
         self.assertIn("| 名称 |", out)   # 表格本身必须在，不能只出标题
+
+    def test_watch_without_name_does_not_repeat_code(self):
+        """行情没带 name 时，自选表不能把代码写成两遍（`002532 002532`）。
+
+        真实缺陷：`f"{q.get('name') or code} {code}"`——name 缺失时
+        `or code` 兜底成代码，再拼一次 code，渲染出「002532 002532」。
+        自选股行情源偶尔只回价格/涨跌幅（不带证券简称），这条分支不是
+        理论情况；而现有用例都用带 name 的快照，所以一直是绿的。
+        """
+        pl = self._plugin("markdown")
+        pos = [{"code": "600000", "name": "浦发银行", "shares": 1000,
+                "cost_price": 10.0, "available_today": 1000}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos,
+            "quotes": {"600000": {"price": 9.5, "change_pct": -1.2}},
+            "watch_quotes": {"002532": {"price": 13.7, "change_pct": 1.2}},
+            "watch_count": 1,
+            "total_market_value": 9500.0, "equity": 39500.0, "cash": 30000.0,
+            "float_pnl": -500.0, "today_pnl": -100.0, "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("自选观察", out)
+        self.assertIn("| 002532 |", out, "缺名时应只留代码")
+        self.assertNotIn("002532 002532", out, "代码不该写两遍")
+        self.assertNotIn("None", out)
 
     def test_watch_fetch_failure_shows_notice_not_silence(self):
         """自选行情拉取失败不得静默消失（v1.7.2）。
