@@ -1135,6 +1135,102 @@ class TestWatchScopeVisibility(unittest.TestCase):
         self.assertEqual(cfg["rules"], [])
         self.assertEqual(cfg["min_level"], "urgent", "清规则不该动别的键")
 
+    # ---- 回归：同代码 remove + add 是「替换」而不是「删光」（2026-11-03）----
+    #
+    # 真实事故：`remove_rules=["600900"] + add_rules=[<600900 新规则>]` 让该代码
+    # 规则**整条消失**（旧的和新的都没了），而返回值仍显示"已写入（共 7 条）"——
+    # 条数是对的、语义是错的，从返回值完全看不出来。
+    # 根因：先 extend(add) 再按 code 过滤 remove，新规则被自己的 remove 删掉。
+
+    OLD_600900 = {"code": "600900", "name": "长江电力", "kind": "stop_loss",
+                  "price": 29.50, "op": "lt", "severity": "urgent",
+                  "label": "跌破 29.50 清仓"}
+    NEW_600900 = {"code": "600900", "name": "长江电力", "kind": "stop_loss",
+                  "price": 28.80, "op": "lt", "severity": "urgent",
+                  "label": "跌破 28.80 清仓"}
+
+    def _rules_now(self):
+        return self.app.schedule_store.all()[0].probe_config["rules"]
+
+    def test_set_rules_remove_and_add_same_code_replaces(self):
+        """同一代码同时传 remove 与 add：必须替换（恰好 1 条，且是新的那条）。"""
+        self._seed({"rules": [self.OLD_600900] + self.RULES})
+
+        out = self._call({"action": "set_rules",
+                          "remove_rules": ["600900"],
+                          "add_rules": [self.NEW_600900]})
+
+        rules = self._rules_now()
+        codes = [r["code"] for r in rules]
+        # ① 该代码恰好 1 条（0 = 这次的事故，2 = 没删掉旧的）
+        self.assertEqual(codes.count("600900"), 1,
+                         f"600900 应恰好 1 条，实际 {codes}")
+        # ② 保留的必须是**新**规则：价位与 label 都要核对，不能只看 code 在不在
+        got = next(r for r in rules if r["code"] == "600900")
+        self.assertEqual(got["price"], self.NEW_600900["price"], "应为新规则的价位")
+        self.assertEqual(got["label"], self.NEW_600900["label"], "应为新规则的文案")
+        # ③ 其他代码未被误伤
+        self.assertEqual([c for c in codes if c != "600900"],
+                         [r["code"] for r in self.RULES])
+        # ④ 可观测性：返回文案要写明「替换」，不能只报条数
+        self.assertIn("已替换盯盘规则", out)
+        self.assertIn("600900", out)
+        self.assertIn("替换", out)
+        self.assertNotIn("已写入盯盘规则", out)
+
+    def test_plan_readback_shows_replacement(self):
+        """回归的第二道闸：`action=plan` 回读必须能看见 600900 的新规则。
+
+        `status` 只显示条数、返回值里的数字也对——只有 plan 的完整 JSON
+        回读才能发现"某只代码的规则没了"。所以这条测试直接断言回读结果。
+        """
+        self._seed({"rules": [self.OLD_600900] + self.RULES})
+        self._call({"action": "set_rules", "remove_rules": ["600900"],
+                    "add_rules": [self.NEW_600900]})
+        out = self._call({"action": "plan"})
+        self.assertIn("长江电力(600900) 跌破 28.8", out, "回读应显示新规则")
+        self.assertNotIn("跌破 29.5", out, "回读里不该再有旧规则")
+        self.assertNotIn("29.50 清仓", out, "旧 label 也不该残留")
+
+    def test_set_rules_add_only_still_says_written(self):
+        """只传 add（不同代码）不得被误报成「替换」——文案不能一改就漂。"""
+        self._seed({"rules": [self.OLD_600900]})
+        out = self._call({"action": "set_rules", "add_rules": [self.RULES[0]]})
+        self.assertIn("已写入盯盘规则（共 2 条）", out)
+        self.assertNotIn("已替换", out)
+
+    def test_set_rules_remove_only_still_says_written(self):
+        """只传 remove 时也不会出现「替换」字样（语义是纯删除）。"""
+        self._seed({"rules": [self.OLD_600900] + self.RULES})
+        out = self._call({"action": "set_rules", "remove_rules": ["600900"]})
+        self.assertIn("已写入盯盘规则（共 2 条）", out)
+        self.assertNotIn("已替换", out)
+        self.assertNotIn("600900", [r["code"] for r in self._rules_now()])
+
+    def test_set_rules_remove_and_add_absent_code_is_plain_add(self):
+        """remove 一个本来就没有的代码 + add 新代码：不是替换，不能谎报替换。"""
+        self._seed({"rules": [self.OLD_600900]})
+        out = self._call({"action": "set_rules",
+                          "remove_rules": ["601398"],     # 原本不存在
+                          "add_rules": [self.RULES[0]]})
+        self.assertIn("已写入盯盘规则（共 2 条）", out)
+        self.assertNotIn("已替换", out)
+
+    def test_set_rules_replace_wins_and_warns_ignored_add(self):
+        """给 `rules`（整体替换）时 add/remove 不生效——必须点出来。
+
+        同属「静默丢参数」家族：不提示的话用户以为三样都做了，
+        而实际上只有 `rules` 生效（返回值照样正常，看不出差别）。
+        """
+        self._seed({"rules": [self.OLD_600900]})
+        out = self._call({"action": "set_rules",
+                          "rules": [self.RULES[1]],
+                          "add_rules": [self.RULES[0]]})
+        self.assertIn("未生效", out)
+        self.assertIn("add_rules", out)
+        self.assertEqual([r["code"] for r in self._rules_now()], ["002532"],
+                         "rules 整体替换生效，add_rules 被忽略")
+
 
 class TestWatchPlanApp(unittest.TestCase):
     """`_WatchPlanApp` 测试替身自身的契约（防止替身与真实宿主漂移）。"""

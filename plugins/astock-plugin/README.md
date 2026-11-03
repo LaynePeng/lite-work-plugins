@@ -694,16 +694,29 @@ astock_watch action=plan        # 完整规则清单 + 原始 probe_config JSON
 astock_watch action=set_rules rules=[...]                 # 整体替换
 astock_watch action=set_rules add_rules=[{...}]           # 追加
 astock_watch action=set_rules remove_rules=["000651"]     # 按代码删除
+astock_watch action=set_rules remove_rules=["600900"] \
+    add_rules=[{...600900 新规则...}]                     # 同代码＝替换（v2.5.7）
 astock_watch action=set_rules add_rules=[...] min_level=urgent   # 同时调阈值
 ```
 
-`set_rules` 的三条安全语义（每条都对应一种真实误操作）：
+**同代码 `remove_rules` + `add_rules` ＝ 替换**（v2.5.7 修正）：`remove`
+**只作用于已有规则**，本次 `add_rules` 进来的新规则一定保留。返回值会写
+「✅ 已替换盯盘规则」并点名哪几只被替换——而不是笼统的「已写入（共 N 条）」。
+
+> 历史缺陷（2026-11-03）：早先执行顺序是「先 extend(add) 再按 code 过滤
+> remove」，于是同代码的 remove 把**刚加的新规则一起删了**，净效果是该代码
+> 规则整条消失；而 `len(new_rules)` 与返回值都是对的，从返回值完全看不出问题。
+> **所以改完规则请用 `action=plan` 回读**——`status` 只显示条数。
+
+`set_rules` 的四条安全语义（每条都对应一种真实误操作）：
 
 1. **只动给出的键**——改一条止损价不会把你配的 codes/kinds/min_level 清空
    （整体覆盖 `probe_config` 的症状是"只改了个价位，其他提醒全没了"）；
 2. **先校验再写盘**——非法规则（缺 code/price、op 写错）直接报错，不落半截配置；
 3. **保留指纹基线**——走 `ensure_plan` 的合并语义，不会因为改规则就把当前
-   所有信号当"新变化"重报一遍。
+   所有信号当"新变化"重报一遍；
+4. **`remove` 只删已有规则**——同代码 `remove` + `add` 是替换，新规则一定保留
+   （v2.5.7 修）。返回值会点名被替换的代码，不再只报一个看不出语义的条数。
 
 > 需要操作**非 astock 的盯梢计划**（邮箱、网页、命令、其他插件）时，用通用
 > 插件 `watch-plugin`：`schedule_list` / `schedule_get` / `schedule_upsert` /

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import astock_data as data
 import astock_market as mkt
@@ -210,7 +210,8 @@ class WatchToolsMixin:
         lines.append("```")
         lines.append("")
         lines.append("改动：`astock_watch action=set_rules`（rules 整体替换 / "
-                     "add_rules 追加 / remove_rules 删除指定代码）。"
+                     "add_rules 追加 / remove_rules 删除指定代码；"
+                     "同代码 remove + add ＝替换）。"
                      "通用通道：`schedule_upsert merge_probe_config={...}`。")
         return "\n".join(lines)
 
@@ -228,6 +229,10 @@ class WatchToolsMixin:
           不让半截配置落盘；
         - **写盘走 `ensure_plan` 的 probe_cfg 合并语义**：保留指纹基线（last_hash），
           不会因为改规则就把当前所有信号当"新变化"重报一遍。
+        - **remove 只作用于原有规则，add 的新规则一定保留**（顺序不能反）：
+          同代码同时传 remove+add 的语义是「**替换**」，不是「先加再删」。
+          早先先 extend(add) 再按 code 过滤，会把刚加的新规则一起删掉，
+          症状是该代码规则整条消失、而返回值仍显示"共 N 条"（2026-11-03 真实事故）。
         """
         replace, add, remove = _rules_from_args(args)
         if replace in (None, "") and not add and not remove:
@@ -253,19 +258,30 @@ class WatchToolsMixin:
             # 但要把旧问题带上，否则改完看不出"之前就是坏的"
             logger.info("[astock] 现有 rules 有 %d 处问题，继续按新配置覆盖", len(errs))
 
+        #: 同代码既 remove 又 add 的代码列表（语义是「替换」，返回文案要写清）
+        replaced: List[str] = []
         if isinstance(replace, (list, tuple)):
             # 显式给了数组（含空数组＝清空）：整体替换
             new_rules, perrs = plan_ctl._parse_rules_lenient(replace)
         else:
             new_rules, perrs = list(current), []
+            drop = {str(c).strip() for c in remove if str(c).strip()}
+            had = {str(r.get("code") or "") for r in current}
+            if drop:
+                # **顺序不能反**：remove 只作用在原有规则上。
+                # 早先是先 extend(add) 再按 code 过滤，于是同代码 add+remove
+                # 会把刚加的新规则一起删掉——净效果是该代码规则整条消失，
+                # 而 len(new_rules) 与返回值都是对的，用户完全看不出来。
+                new_rules = [r for r in new_rules
+                             if str(r.get("code") or "") not in drop]
             if add:
                 add_ok, aerrs = plan_ctl._parse_rules_lenient(add)
                 perrs = list(aerrs)
                 new_rules.extend(add_ok)
-            if remove:
-                drop = {str(c).strip() for c in remove if str(c).strip()}
-                new_rules = [r for r in new_rules
-                             if str(r.get("code") or "") not in drop]
+                # 同代码既 remove 又 add，且该代码**原本就有**规则 → 这是「替换」。
+                # 只对"确实删掉了旧规则"的代码这么报，避免把单纯的追加说成替换。
+                added = {str(r.get("code") or "") for r in add_ok}
+                replaced = sorted(added & drop & had)
 
         if perrs:
             return ("[Error] 规则有误，未写入：\n"
@@ -286,6 +302,10 @@ class WatchToolsMixin:
         head = "✅ 已写入盯盘规则"
         if clearing:
             head = "✅ 已清空价位规则（改为只按百分比阈值盯）"
+        elif replaced:
+            # 用「已替换」而不是「已写入」：这次事故的直接教训是返回值看不出
+            # 语义差异——条数对、数字对，但规则没了。
+            head = "✅ 已替换盯盘规则"
         # respect_paused=True：**改规则不是"启动盯盘"**。传 False（默认）会让
         # ensure_plan 顺手把 enabled 改回 True——用户明明暂停了盯盘，只是让模型
         # 加一条规则，结果计划被静默重新启用。这与 v2.3.0 修的「点了停用几分钟后
@@ -301,11 +321,26 @@ class WatchToolsMixin:
 
         # 触发面同步：规则改了但插件开关关着时，写了也不会跑
         enabled = _as_bool(_cfg(self._app, "watch_enabled", True), True)
-        if not clearing:
+        no_change = (not clearing) and res.get("action") == "existing"
+        if no_change:
             # 无改动时如实说"无需改动"，避免让人以为写坏了
-            if res.get("action") == "existing":
-                head = "✅ 规则与当前一致（无需改动）"
+            head = "✅ 规则与当前一致（无需改动）"
         lines = [f"{head}（共 {len(new_rules)} 条）", ""]
+        if replaced and not no_change:
+            lines.append(f"🔁 {'、'.join(replaced)} 是**替换**：该代码的旧规则已删除，"
+                         f"现在生效的是本次 add_rules 里的新规则。")
+            lines.append("")
+            lines.append("> 核对请用 `action=plan` 回读完整规则（`status` 只显示条数，"
+                         "看不出某只代码的规则是否还在）。")
+            lines.append("")
+        if isinstance(replace, (list, tuple)) and (add or remove):
+            # 同为「静默丢参数」家族：给了 rules 时 add/remove 不生效。不点出来，
+            # 用户会以为三样都做了（与本次事故同类：返回值对、语义不对）。
+            skipped = "、".join(k for k, v in (("add_rules", add),
+                                               ("remove_rules", remove)) if v)
+            lines.append(f"⚠️ 本次同时给了 `rules`，已按**整体替换**处理，"
+                         f"{skipped} **未生效**（两者互斥，只能选一种写法）。")
+            lines.append("")
         refreshed = plan_ctl.summarize_probe_config(dict(payload))
         if refreshed:
             lines.append(f"**概览**：{refreshed}")

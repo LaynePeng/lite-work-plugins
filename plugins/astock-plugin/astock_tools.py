@@ -524,7 +524,9 @@ def build_tools() -> List[ToolDefinition]:
                 "**plan 看盯盘规则**（probe_config 里的价位规则/代码范围/信号类型/级别，"
                 "带原始 JSON）；\n"
                 "**set_rules 改盯盘规则**（rules 整体替换 | add_rules 追加 | "
-                "remove_rules 按代码删除；也可同时给 codes/kinds/min_level/once_per_day）；\n"
+                "remove_rules 按代码删除；也可同时给 codes/kinds/min_level/once_per_day）；"
+                "同一代码同时传 remove_rules 与 add_rules ＝ **替换**（删除旧规则、保留新规则），"
+                "返回值会写「已替换」而不是「已写入」；改完建议用 action=plan 回读核对；\n"
                 "**start 启动盯盘**（开启定时探测，非交易时段自动跳过不耗 token）；"
                 "**stop 暂停盯盘**。\n"
                 "盯盘时段：工作日「开始时间」至 15:00，午休 11:30–13:00 跳过；"
@@ -567,7 +569,8 @@ def build_tools() -> List[ToolDefinition]:
                     },
                     "remove_rules": {
                         "type": "array", "items": {"type": "string"},
-                        "description": "action=set_rules 时按股票代码删除对应规则",
+                        "description": ("action=set_rules 时按股票代码删除对应规则"
+                                        "（只删原有规则；与 add_rules 同代码合用＝替换）"),
                     },
                     "codes": {
                         "type": "string",
