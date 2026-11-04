@@ -200,11 +200,15 @@ class SyncToolsMixin:
             return (f"[Error] 舆情数据采集失败：{type(exc).__name__}: {exc}。"
                     f"可先用 astock_quote / astock_kline 看行情，稍后重试舆情。")
 
-        report = senti.summarize(collected["items"], code, name,
-                                collected["errors"], collected["extras"])
+        # ⚠️ 局部变量不能叫 report：本函数顶部 `import astock_report as report`，
+        # 一旦在函数内给 report 赋值，Python 会把它当作**整个函数的局部变量**，
+        # 于是组合模式（code=portfolio）走 `report.build_report(...)` 时
+        # 抛出 UnboundLocalError —— 这就是 11-04 组合舆情失败的真实原因。
+        rep = senti.summarize(collected["items"], code, name,
+                              collected["errors"], collected["extras"])
         if args.get("brief"):
-            line = senti_tool.render_brief(report)
-            conflicts = senti_tool.render_conflict_lines(report)
+            line = senti_tool.render_brief(rep)
+            conflicts = senti_tool.render_conflict_lines(rep)
             out = [line]
             if conflicts:
                 out.append("")
@@ -214,4 +218,4 @@ class SyncToolsMixin:
                 out += ["", "数据缺口：" + "；".join(
                     f"{k}={v}" for k, v in collected["errors"].items())]
             return "\n".join(out)
-        return senti_tool.render(report, collected["items"], collected["extras"])
+        return senti_tool.render(rep, collected["items"], collected["extras"])

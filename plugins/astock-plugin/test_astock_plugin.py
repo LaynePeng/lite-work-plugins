@@ -3,6 +3,8 @@
 # 🚫 红线：不连任何行情接口。数据层用内存替身（`_fetch_stub`）替换，
 #   台账一律写到 tempfile 目录，绝不碰用户真实 .astock/ledger.sqlite。
 # 运行：python3 -m unittest plugins.astock-plugin.test_astock_plugin
+import ast
+import glob
 import importlib.util
 import os
 import sys
@@ -5529,6 +5531,124 @@ class TestMixinModuleImports(unittest.TestCase):
                     hasattr(mod, attr),
                     f"{mod_name} 缺少模块级 {attr}（源码里用了却未 import）",
                 )
+
+
+class TestNoShadowedModuleAliases(unittest.TestCase):
+    """函数内局部赋值不得遮蔽同名的模块级别名（静态 AST 扫描）。
+
+    回归背景（2026-11-04 实测）：
+    `astock_mixin_sync.py` 顶部有 `import astock_report as report`，
+    而 `_tool_sentiment()` 内部又写了 `report = senti.summarize(...)`。
+    Python 的规则是：**只要函数体里出现对某名字的赋值，该名字在整个函数内
+    都是局部变量**——于是 `code=portfolio` 分支里的
+    `report.build_report(...)` 直接抛
+    `UnboundLocalError: cannot access local variable 'report'
+     where it is not associated with a value`。
+
+    用户看到的是「组合舆情分析一调用就失败」，而单票模式完全正常
+    （单票走的分支在赋值之后），所以常规用例覆盖不到、也很难凭报错定位。
+    改成 `rep` 后修复。
+
+    这个扫描对所有插件模块通用：**只要「模块级别名」∩「函数内赋值」∩
+    「函数内 NAME.attr 引用」三者非空**，那就是一颗随时会炸的地雷。
+    """
+
+    def test_no_function_shadows_module_alias(self):
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(_HERE, "*.py"))):
+            if os.path.basename(path).startswith("test_"):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                src = f.read()
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue
+
+            # 模块级别名表：import a.b as X / from m import n as X
+            aliases = {}
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        if a.asname:
+                            aliases[a.asname] = a.name
+                elif isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        aliases[a.asname or a.name] = a.name
+            if not aliases:
+                continue
+
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                stores = {n.id for n in ast.walk(fn)
+                          if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                # 函数内以 NAME.attr 形式使用（= 需要 NAME 是模块对象）
+                loaded_attrs = {n.value.id for n in ast.walk(fn)
+                                if isinstance(n, ast.Attribute)
+                                and isinstance(n.value, ast.Name)}
+                bad = (stores & loaded_attrs) & set(aliases)
+                if bad:
+                    offenders.append(
+                        f"{os.path.basename(path)}:{fn.lineno} {fn.name}() "
+                        f"局部赋值遮蔽模块别名 {sorted(bad)}")
+
+        self.assertEqual(
+            [], offenders,
+            "函数内局部赋值遮蔽了同名的模块级别名，走该分支必抛 "
+            "UnboundLocalError：\n  " + "\n  ".join(offenders))
+
+    def test_sentiment_branches_do_not_shadow(self):
+        """`_tool_sentiment` 的 portfolio 分支必须真的能拿到 report 模块。
+
+        只针对**模块级别名**判定：`out.append(...)`、`scope.strip()` 这类
+        局部 list/str 的属性访问是合法的，不能误报（第一版就误报了 4 个）。
+        """
+        with open(os.path.join(_HERE, "astock_mixin_sync.py"), "r",
+                  encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        # 该文件里被 import 成别名的模块（report 就在其中）
+        aliases = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.asname:
+                        aliases.add(a.asname)
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    aliases.add(a.asname or a.name)
+        self.assertIn("report", aliases,
+                      "astock_mixin_sync 应当 `import astock_report as report`")
+
+        target = None
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.AsyncFunctionDef) and fn.name == "_tool_sentiment":
+                target = fn
+                break
+        self.assertIsNotNone(target, "astock_mixin_sync 里找不到 _tool_sentiment")
+
+        stores = {n.id for n in ast.walk(target)
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        loaded_attrs = {n.value.id for n in ast.walk(target)
+                        if isinstance(n, ast.Attribute)
+                        and isinstance(n.value, ast.Name)}
+        overlap = (stores & loaded_attrs) & aliases
+        self.assertEqual(
+            set(), overlap,
+            f"_tool_sentiment 内被局部赋值遮蔽的模块别名：{sorted(overlap)}"
+            " —— 一旦遮蔽，走赋值之前的分支（如 portfolio 的 "
+            "report.build_report）必抛 UnboundLocalError")
+
+    def test_regression_rep_alias_present(self):
+        """固化修复：局部结果叫 `rep`，不再占用 `report` 这个名字。"""
+        with open(os.path.join(_HERE, "astock_mixin_sync.py"), "r",
+                  encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn("report = senti.summarize", src,
+                         "又在用 report 接 summarize 结果了——会遮蔽 "
+                         "`import astock_report as report`")
+        self.assertIn("rep = senti.summarize", src, "局部结果变量应为 rep")
 
 
 if __name__ == "__main__":

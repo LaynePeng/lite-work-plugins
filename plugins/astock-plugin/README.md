@@ -4,6 +4,49 @@
 
 ---
 
+## 0.0 v2.6.1 修复：`astock_sentiment code=portfolio` 一调必炸
+
+**现象**：`astock_sentiment code=portfolio`（组合舆情报告）必报
+
+```
+UnboundLocalError: cannot access local variable 'report'
+where it is not associated with a value
+```
+
+而**单票模式完全正常**。
+
+**根因是变量遮蔽，不是网络、不是台账路径**：
+
+```python
+import astock_report as report              # 模块级别名
+
+async def _tool_sentiment(self, args):
+    if code_raw.lower() == "portfolio":
+        return await report.build_report(...)   # ← 走这里必炸
+    ...
+    report = senti.summarize(...)           # ← 函数内有赋值
+```
+
+Python 的规则是：**函数体内只要出现对某个名字的赋值，该名字在整个函数内都是局部变量**。
+所以 `report` 在整个 `_tool_sentiment` 里都是局部的，走 portfolio 分支时它**还没绑定**
+→ `UnboundLocalError`。单票模式走的是赋值**之后**的分支，所以一切正常，
+常规用例根本覆盖不到——这也是它藏了很久的原因。
+
+**修法**：局部结果改名 `rep`（`astock_mixin_sync.py`，+9/-5 行）。
+
+**回归防护**（3 个用例，防同一个坑再犯）：
+
+| 用例 | 检查什么 |
+|---|---|
+| `test_no_function_shadows_module_alias` | 全插件 AST 扫描「模块级别名 ∩ 函数内赋值 ∩ 函数内 `NAME.attr`」**三重交集** |
+| `test_sentiment_branches_do_not_shadow` | `_tool_sentiment` 专项：只比对模块级别名，不误报 `out.append()` / `scope.strip()` 这类局部对象 |
+| `test_regression_rep_alias_present` | 固化断言：源码不得再出现 `report = senti.summarize` |
+
+> 扫描逻辑对所有插件模块通用。写第一版时判据过宽（把所有局部 list/str 的属性访问
+> 也算进去），一口气误报 4 个名字——**收紧为只与模块级别名取交集**才正确。
+
+---
+
 ## 0. 持仓面板的四块版式（v2.5.9）
 
 面板从上到下四块，块间用 `---` 分隔，每块自带**真标题**（`###`，比正文大一号）。
