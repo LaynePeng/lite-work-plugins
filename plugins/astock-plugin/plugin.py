@@ -918,7 +918,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.7.2"
+    version = "2.7.3"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
@@ -942,6 +942,10 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         "astock_quote", "astock_kline", "astock_events", "astock_flow",
         "astock_search", "astock_screen", "astock_calc", "astock_hint",
         "astock_sentiment", "astock_portfolio",
+        # 只读东财 F10 主营构成（纯网络 GET，不写任何本地状态）——门槛② 判定用。
+        # 必须列进来：盘前简报是 read 权限档的无人值守任务，不声明就等于
+        # 简报里写了"调 astock_business"，实际却调不到，门槛② 又变回"无法核实"。
+        "astock_business",
     ]
 
     #: 大盘看板缓存（v2.5.0）。**放类属性而非实例属性**：插件实例可能被重建

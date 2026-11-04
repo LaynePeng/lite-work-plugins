@@ -6002,3 +6002,49 @@ class TestBusinessToolArgs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestReadOnlyToolsCoverage(unittest.TestCase):
+    """只读工具清单必须覆盖「无人值守任务真正要用」的那几个。
+
+    回归背景（2026-11-04）：`astock_business` 加好了、也注册进 get_tools 了，
+    **但忘了加进 read_only_tools**。后果很隐蔽：
+      · 手动对话里能正常调（权限不受限），所以自测完全通过；
+      · 而盘前简报是 `read` 权限档的定时任务，只保留 read 域工具，
+        **简报里写着"调 astock_business 判门槛②"，实际调不到**——
+        于是门槛② 又悄悄退回"无法核实"，正是这次要消灭的状态。
+
+    「手动能调 ≠ 定时能调」这个差异，只有把清单本身断言住才能防住。
+    """
+
+    def test_business_is_read_only(self):
+        self.assertIn("astock_business", astock.AstockPlugin.read_only_tools)
+
+    def test_all_declared_tools_exist(self):
+        """只读清单里的名字必须都是真实存在的工具（防手写清单拼错）。"""
+        declared = {t.name for t in astock.AstockPlugin().get_tools()}
+        for name in astock.AstockPlugin.read_only_tools:
+            with self.subTest(tool=name):
+                self.assertIn(name, declared,
+                              f"{name} 在 read_only_tools 里但工具不存在")
+
+    def test_briefing_tools_are_read_only(self):
+        """盘前简报要用的工具必须全部只读可达。
+
+        这份清单对应定时计划 sch_045f567238 的流程：硬事件扫描 → 门槛②
+        → 持仓对照 → 均线重算。任何一个漏在清单外，无人值守时就是"工具缺失"。
+        """
+        ro = set(astock.AstockPlugin.read_only_tools)
+        for name in ("astock_events", "astock_business", "astock_portfolio",
+                     "astock_quote", "astock_kline", "astock_calc"):
+            with self.subTest(tool=name):
+                self.assertIn(name, ro,
+                              f"{name} 是简报必需工具，但不在 read_only_tools 里")
+
+    def test_write_side_effect_tools_excluded(self):
+        """有写副作用的工具**不能**进只读清单（否则无人值守任务能改台账/计划）。"""
+        ro = set(astock.AstockPlugin.read_only_tools)
+        for name in ("astock_record", "astock_sync", "astock_watch",
+                     "astock_archive", "astock_act", "astock_backtest", "astock_pick"):
+            with self.subTest(tool=name):
+                self.assertNotIn(name, ro, f"{name} 有写副作用，不该算只读")
