@@ -5942,3 +5942,63 @@ class TestGzipDecompress(unittest.TestCase):
         import astock_data as data
         broken = b"\x1f\x8bnot-a-valid-gzip"
         self.assertEqual(data._decompress(broken, "gzip"), broken)
+
+
+class TestBusinessToolArgs(unittest.TestCase):
+    """`_tool_business` 的参数分支顺序（离线，不发网络请求）。
+
+    回归背景（2026-11-04 实测踩到）：早先实现**先校验 code 再判 codes**，
+    于是只传 `codes`（批量体检）时被「需要 code」直接挡回去，
+    批量分支永远走不到——参数在 schema 里声明了却用不了。
+    这类 bug 单测不会报错（没有异常、只是走了错分支），只能靠断言输出文本。
+    """
+
+    def _plugin(self):
+        """最小的 SyncToolsMixin 实例（只测参数分流，不碰网络）。"""
+        import astock_mixin_sync as ms
+
+        class T(ms.SyncToolsMixin):
+            def __init__(self):
+                self.batch_called = None
+
+            async def _business_batch(self, codes, event_text, keywords):
+                self.batch_called = (list(codes), event_text, tuple(keywords))
+                return "BATCH_OK"
+
+        return T()
+
+    def test_codes_only_enters_batch_branch(self):
+        """只传 codes 时必须进批量分支，不能被「需要 code」挡回。"""
+        import asyncio
+        t = self._plugin()
+        out = asyncio.run(t._tool_business({"codes": ["002532", "512890"]}))
+        self.assertEqual(out, "BATCH_OK")
+        self.assertEqual(t.batch_called[0], ["002532", "512890"])
+
+    def test_codes_string_split(self):
+        """codes 传逗号分隔字符串也要能拆。"""
+        import asyncio
+        t = self._plugin()
+        asyncio.run(t._tool_business({"codes": "002532，512890"}))
+        self.assertEqual(t.batch_called[0], ["002532", "512890"])
+
+    def test_neither_code_nor_codes_errors(self):
+        """两者都没传时给明确错误（提示可传 codes）。"""
+        import asyncio
+        t = self._plugin()
+        out = asyncio.run(t._tool_business({}))
+        self.assertIn("[Error]", out)
+        self.assertIn("codes", out)
+        self.assertIsNone(t.batch_called)
+
+    def test_keywords_string_split(self):
+        """keywords 传逗号字符串要能拆成列表（批量分支同样适用）。"""
+        import asyncio
+        t = self._plugin()
+        asyncio.run(t._tool_business({
+            "codes": ["000678"], "keywords": "机器人,减速器"}))
+        self.assertEqual(t.batch_called[2], ("机器人", "减速器"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -234,23 +234,25 @@ class SyncToolsMixin:
         尤其 `absent`（分部表里没这块业务）是**否定证据**，不是数据缺失——
         分部披露有重要性门槛，进不了表就意味着远低于 5%。
         """
-        code_raw = str(args.get("code") or "").strip()
-        if not code_raw:
-            return ("[Error] 需要 code（如 002273）。这是按标的查分部收入构成的工具，"
-                    "用于判定选股方法论第②道门槛「相关业务收入占营收 ≥5%」。"
-                    "想批量核对持仓可传 codes 数组。")
-
         event_text = str(args.get("event") or "").strip()
         keywords = args.get("keywords") or []
         if isinstance(keywords, str):
             keywords = [k.strip() for k in keywords.replace("，", ",").split(",") if k.strip()]
 
-        # 批量模式：一次核多只（持仓/候选池体检用）
+        # **批量模式必须先判**（2026-11-04 踩到）：
+        # 早先先校验 code 再判 codes，导致只传 codes 时被「需要 code」挡回去，
+        # 批量分支永远走不到——参数都声明了却用不了，属于典型的顺序错。
         codes_raw = args.get("codes") or []
+        if isinstance(codes_raw, str):
+            codes_raw = [c.strip() for c in codes_raw.replace("，", ",").split(",") if c.strip()]
         if codes_raw:
-            if isinstance(codes_raw, str):
-                codes_raw = [c.strip() for c in codes_raw.replace("，", ",").split(",") if c.strip()]
             return await self._business_batch(list(codes_raw), event_text, keywords)
+
+        code_raw = str(args.get("code") or "").strip()
+        if not code_raw:
+            return ("[Error] 需要 code（如 002273）或 codes 数组。这是按标的查分部收入构成的工具，"
+                    "用于判定选股方法论第②道门槛「相关业务收入占营收 ≥5%」。"
+                    "单只传 code，批量核持仓/候选池传 codes。")
 
         code, _ = mkt.normalize_code(code_raw)
         name = ""
