@@ -312,6 +312,7 @@ class SyncToolsMixin:
         rows: List[str] = []
         stats = {business.PASS: 0, business.BELOW: 0, business.ABSENT: 0,
                  business.NA: 0, business.UNKNOWN: 0}
+        no_event = 0          # 未指定业务，只列了分部构成（不算任何判定结果）
         for raw in codes[:20]:
             try:
                 code, _ = mkt.normalize_code(raw)
@@ -326,15 +327,29 @@ class SyncToolsMixin:
                 name = ""
             res = await asyncio.to_thread(
                 business.check, code, event_text, name, tuple(keywords))
+            if res.result == business.UNKNOWN and not event_text and not keywords:
+                # 没给 event/keywords 时没法判门槛②，但分部构成本身仍然有用：
+                # 直接把主要业务列出来，让人一眼看到"这家靠什么赚钱"，
+                # 比一整列「未核实」有意义得多。
+                top = "、".join(f"{s.item} {s.ratio_pct:.1f}%"
+                                for s in res.candidates[:3])
+                rows.append(f"| {name or code}（{code}）| ➖ 未指定业务 | {top or '—'} |")
+                no_event += 1
+                continue
             stats[res.result] = stats.get(res.result, 0) + 1
             detail = (f"{res.matched} {res.ratio_pct:.1f}%" if res.ratio_pct is not None
                       else (res.reason[:34] + ("…" if len(res.reason) > 34 else "")))
             rows.append(f"| {name or code}（{code}）| {res.verdict} | {detail} |")
 
-        total = sum(stats.values())
+        total = sum(stats.values()) + no_event
         lines = [f"## 门槛②批量体检（{total} 只）", ""]
-        lines.append(f"**过 {stats[business.PASS]} 只 · 不过 {stats[business.BELOW] + stats[business.ABSENT]} 只"
-                     f" · 不适用 {stats[business.NA]} 只 · 未核实 {stats[business.UNKNOWN]} 只**")
+        judged = sum(stats.values())
+        if judged:
+            lines.append(f"**过 {stats[business.PASS]} 只 · 不过 {stats[business.BELOW] + stats[business.ABSENT]} 只"
+                         f" · 不适用 {stats[business.NA]} 只 · 未核实 {stats[business.UNKNOWN]} 只**")
+        if no_event:
+            lines.append(f"**{no_event} 只未指定业务，只列主营构成**"
+                         f"（传 event 或 keywords 才判门槛②）")
         lines.append("")
         lines.append("| 标的 | 结论 | 命中分部/原因 |")
         lines.append("|---|---|---|")
