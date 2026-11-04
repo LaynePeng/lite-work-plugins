@@ -5534,6 +5534,86 @@ class TestMixinModuleImports(unittest.TestCase):
                 )
 
 
+class TestKlineMultiSource(unittest.TestCase):
+    """K 线**多源链**必须存在且能自动降级（离线，全部打桩）。
+
+    回归背景（2026-11-04，真实事故）：当时只有「腾讯 web.ifzq + 东财
+    push2his」两家，而这两家当天**同时挂掉**（web.ifzq 回 501、push2his 回
+    Empty reply），于是 K 线、均线、选股、回测全天不可用，插件只能回一句
+    「等 30 秒再试」。教训：
+      ① 同厂商的多个域名不算备源（会被一起限流），必须**跨厂商**；
+      ② 任何单一源失败都必须能被下一家接住，不能让整个功能停摆。
+    """
+
+    def _stub_env(self):
+        sys.path.insert(0, _HERE)
+        _install_litework_stubs()
+        import astock_data
+        return astock_data
+
+    def test_source_chain_covers_multiple_vendors(self):
+        """源链至少覆盖三家不同厂商，且首源是腾讯。"""
+        d = self._stub_env()
+        names = [n for n, _ in d._kline_source_fns()]
+        self.assertEqual(len(names), 3, f"源链数量不足：{names}")
+        self.assertEqual(names[0], "腾讯")
+        self.assertIn("雪球", names, "缺少跨厂商备源（雪球）")
+        self.assertIn("东财", names)
+
+    def test_tencent_has_multiple_hosts(self):
+        """腾讯必须有多个域名入口——单域名 501 就等于主源全废。"""
+        d = self._stub_env()
+        self.assertGreaterEqual(len(d.TENCENT_KLINE_HOSTS), 2)
+        self.assertGreaterEqual(len(d.TENCENT_MKLINE_HOSTS), 2)
+        # web.ifzq 是历史上最容易被限流的那个，必须仍在链里（它会自动跳过）
+        hosts = " ".join(d.TENCENT_KLINE_HOSTS)
+        self.assertIn("ifzq.gtimg.cn", hosts)
+        self.assertIn("proxy.finance.qq.com", hosts)
+
+    def test_failover_when_primary_down(self):
+        """腾讯全挂 → 雪球接管，且拿到的是有效 Bar。"""
+        d = self._stub_env()
+
+        def boom(*a, **k):
+            raise d.DataError("模拟 501")
+
+        fake = [d.Bar(date="2026-11-04", open=10.0, close=10.5,
+                      high=10.6, low=9.9, volume_lot=1000.0)]
+        orig_t, orig_x = d._fetch_klines_tencent, d._fetch_klines_xueqiu
+        try:
+            d._fetch_klines_tencent = boom
+            d._fetch_klines_xueqiu = lambda *a, **k: list(fake)
+            d._CACHE.clear() if hasattr(d._CACHE, "clear") else None
+            bars = d.fetch_klines("600000", period="day", limit=1)
+        finally:
+            d._fetch_klines_tencent, d._fetch_klines_xueqiu = orig_t, orig_x
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].close, 10.5)
+
+    def test_all_sources_down_message_is_actionable(self):
+        """三家全挂时报错必须点名三个源，而不是只说"等 30 秒"。"""
+        d = self._stub_env()
+
+        def boom(*a, **k):
+            raise d.DataError("模拟故障")
+
+        orig = (d._fetch_klines_tencent, d._fetch_klines_xueqiu,
+                d._fetch_klines_em)
+        try:
+            d._fetch_klines_tencent = boom
+            d._fetch_klines_xueqiu = boom
+            d._fetch_klines_em = boom
+            with self.assertRaises(d.DataError) as ctx:
+                d._CACHE.clear() if hasattr(d._CACHE, "clear") else None
+                d.fetch_klines("600000", period="day", limit=1)
+        finally:
+            (d._fetch_klines_tencent, d._fetch_klines_xueqiu,
+             d._fetch_klines_em) = orig
+        msg = str(ctx.exception)
+        for name in ("腾讯", "雪球", "东财"):
+            self.assertIn(name, msg, f"报错未点名 {name}：{msg}")
+
+
 class TestNoShadowedModuleAliases(unittest.TestCase):
     """函数内局部赋值不得遮蔽同名的模块级别名（静态 AST 扫描）。
 

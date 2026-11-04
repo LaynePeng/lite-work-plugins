@@ -50,8 +50,26 @@ _EM_HEADERS = dict(_HEADERS, Referer="https://www.eastmoney.com/")
 
 TENCENT_QUOTE = "https://qt.gtimg.cn/q="
 SINA_QUOTE = "https://hq.sinajs.cn/list="
-TENCENT_KLINE = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-TENCENT_MKLINE = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
+#: 腾讯 K 线**域名链**（同一接口的多个入口）。web.ifzq 会被限流成 501，
+#: 换域名常能绕过——2026-11 实测 web.ifzq 挂了一整天而 ifzq / proxy.finance
+#: 正常，写成单域名就等于 K 线全废（回测、均线、选股一起停摆）。
+TENCENT_KLINE_HOSTS = (
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+)
+TENCENT_MKLINE_HOSTS = (
+    "https://ifzq.gtimg.cn/appstock/app/kline/mkline",
+    "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline",
+)
+#: 兼容旧引用（代码里有按模块常量取 URL 的地方）
+TENCENT_KLINE = TENCENT_KLINE_HOSTS[0]
+TENCENT_MKLINE = TENCENT_MKLINE_HOSTS[0]
+
+#: 雪球 K 线（**不同厂商**的备源）。腾讯全家桶同源限流时它仍可用，
+#: 且是唯一同时支持 前复权/后复权/不复权 + 日周月分钟 的免费源。
+XQ_KLINE = "https://stock.xueqiu.com/v5/stock/chart/kline.json"
 EM_SUGGEST = "https://searchapi.eastmoney.com/api/suggest/get"
 EM_CLIST = "https://push2.eastmoney.com/api/qt/clist/get"
 EM_FFLOW = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
@@ -570,89 +588,277 @@ def _fetch_klines_em(code: str, venue: str, period: str, limit: int,
     return out
 
 
+def _kline_source_fns() -> Tuple[Tuple[str, Any], ...]:
+    """K 线源链（顺序即优先级）。三家**不同厂商**，任一家被限流不会连带全挂：
+    腾讯（域名链内再轮换）→ 雪球 → 东财（push2his 常年 Empty reply，仅兜底）。"""
+    return (
+        ("腾讯", _fetch_klines_tencent),
+        ("雪球", _fetch_klines_xueqiu),
+        ("东财", _fetch_klines_em),
+    )
+
+
+#: 源失败记忆：某个源刚刚整体失败过就在一段时间内排到末尾，避免每次都先
+#: 在挂掉的源上白等一轮超时（回测要连发几十次，这个开销会被放大）。
+_SOURCE_COOLDOWN = 120.0
+_SOURCE_DOWN: Dict[str, float] = {}
+
+
+def _ordered_sources() -> Tuple[Tuple[str, Any], ...]:
+    now = time.monotonic()
+    fns = _kline_source_fns()
+
+    def key(item: Tuple[str, Any]) -> Tuple[int, float]:
+        name = item[0]
+        down_at = _SOURCE_DOWN.get(name)
+        if down_at is None or now - down_at > _SOURCE_COOLDOWN:
+            return (0, 0.0)
+        return (1, down_at)
+
+    return tuple(sorted(fns, key=key))
+
+
 def fetch_klines(raw_code: str, period: str = "day", limit: int = 120,
                  adjust: str = "qfq", kind: str = "stock") -> List[Bar]:
-    """取 K 线（前复权默认）。period: day/week/month/5m/15m/30m/60m。
+    """取 K 线（前复权默认）。period: day/week/month/1m/5m/15m/30m/60m。
 
-    分钟线只支持近期（腾讯接口约 320 根上限），且不复权。
+    **多源链**：腾讯（3 个域名轮换）→ 雪球 → 东财。设计依据是 2026-11 的
+    真实故障：`web.ifzq` 501 + `push2his.eastmoney` Empty reply 同时发生，
+    而当时只有这两家做源，结果 K 线、均线、选股、回测**全天不可用**。
+    同厂商的多个域名不算备源（会被一起限流），所以第二家必须换厂商。
 
-    **双源**：腾讯为主、东财为备。腾讯 web.ifzq 在批量请求下会返回 501
-    （实测：跑一轮回测连发 25 次就被掐），没有备用源等于 K 线与回测全废。
-    备用源同时补齐成交额（腾讯日 K 不含 amount）。
+    复权口径：`qfq/hfq/none` 三档都会透传给各源。注意腾讯前复权只有约
+    641 根上限，要更长历史请用 `none`（存档层即按不复权落库）。
     """
     code, venue = normalize_code(raw_code, kind)
     limit = max(1, min(int(limit or 120), 640))
     period = (period or "day").lower()
-    cache_key = f"k:{venue}{code}:{period}:{limit}:{adjust}"
+    adj_key = (adjust or "qfq").lower()
+    cache_key = f"k:{venue}{code}:{period}:{limit}:{adj_key}"
     cached = _CACHE.get(cache_key, _KLINE_TTL)
     if cached is not None:
         return cached
 
+    errors: List[str] = []
     bars: List[Bar] = []
-    primary_error: Optional[Exception] = None
-    try:
-        bars = _fetch_klines_tencent(code, venue, period, limit, adjust)
-    except Exception as exc:        # 501/超时/解析失败 → 走备用源
-        primary_error = exc
-        logger.warning("[astock] 腾讯 K 线失败，改用东财备用源 %s: %s",
-                       code, exc)
-    if not bars:
+    for name, fn in _ordered_sources():
         try:
-            bars = _fetch_klines_em(code, venue, period, limit, adjust)
-        except Exception as exc:
-            logger.warning("[astock] 东财 K 线也失败 %s: %s", code, exc)
-            if primary_error is not None:
-                raise DataError(
-                    f"{code} K 线获取失败（腾讯与东财都不通：{primary_error}）"
-                    f"，通常是接口限流，等 30 秒再试") from exc
-            raise
+            bars = fn(code, venue, period, limit, adj_key) or []
+        except Exception as exc:        # 单源失败不影响后续源
+            errors.append(f"{name}: {exc}")
+            _SOURCE_DOWN[name] = time.monotonic()
+            logger.warning("[astock] K 线源「%s」失败 %s %s: %s",
+                           name, code, period, exc)
+            continue
+        if bars:
+            _SOURCE_DOWN.pop(name, None)
+            break
+        errors.append(f"{name}: 返回空")
+
     if not bars:
-        raise DataError(f"{code} 未返回 {period} K 线数据（代码可能不存在，"
-                        f"或该周期无历史数据）")
+        detail = "；".join(errors) if errors else "无可用源"
+        raise DataError(
+            f"{code} {period} K 线获取失败（已尝试腾讯/雪球/东财：{detail}）。"
+            f"若三家同时失败通常是网络或全部限流，稍后重试；"
+            f"若长期如此请检查设置页「请求速率上限」是否过高")
+
     bars.sort(key=lambda b: b.date)
-    _CACHE.set(cache_key, bars)
-    return bars
+    # 去重（同一交易日被两个源拼进来时保留最后一条）
+    deduped: List[Bar] = []
+    seen: set = set()
+    for b in reversed(bars):
+        if b.date in seen:
+            continue
+        seen.add(b.date)
+        deduped.append(b)
+    deduped.reverse()
+    # 各源返回根数不一致（腾讯某域名会多给 1 根），统一截断到 limit，
+    # 否则「换源前后均线值变化」会被误读成行情漂移。
+    if len(deduped) > limit:
+        deduped = deduped[-limit:]
+    _CACHE.set(cache_key, deduped)
+    return deduped
+
+
+#: 腾讯 K 线专用头（Referer 必须是腾讯自己的域名之一）
+_KLINE_HEADERS = dict(_HEADERS, Referer="https://gu.qq.com/")
+
+
+def _parse_tencent_rows(node: Dict[str, Any], keys: Sequence[str]) -> List[Bar]:
+    """从腾讯返回的 node 里按 keys 顺序找第一个非空数组并解析。
+
+    腾讯同一份数据在不同域名/不同复权下会挂在 `qfqday` / `day` / `qfqweek`
+    等不同键上，键名不稳定，所以按候选键依次探测（这是历史踩坑点）。
+    """
+    for key in keys:
+        rows = node.get(key)
+        if not isinstance(rows, list) or not rows:
+            continue
+        out: List[Bar] = []
+        for r in rows:
+            if not isinstance(r, (list, tuple)) or len(r) < 6:
+                continue
+            out.append(Bar(date=str(r[0]),
+                           open=to_float(r[1], 0.0) or 0.0,
+                           close=to_float(r[2], 0.0) or 0.0,
+                           high=to_float(r[3], 0.0) or 0.0,
+                           low=to_float(r[4], 0.0) or 0.0,
+                           volume_lot=to_float(r[5], 0.0) or 0.0))
+        if out:
+            return out
+    return []
 
 
 def _fetch_klines_tencent(code: str, venue: str, period: str, limit: int,
                           adjust: str) -> List[Bar]:
-    """腾讯 K 线（主源）。"""
+    """腾讯 K 线（主源，**逐个域名重试**）。
+
+    单个域名 501 不代表厂商挂了——web.ifzq 被限流时 ifzq / proxy 往往仍通。
+    全部域名失败才抛错，把最后一次异常带出去供上层汇总。
+    """
     sym = tencent_symbol(code, venue)
-    bars: List[Bar] = []
-    if period in _MINUTE_PERIODS:
+    minute = period in _MINUTE_PERIODS
+    if minute:
         mcode = _MINUTE_PERIODS[period]
-        url = (f"{TENCENT_MKLINE}?param={sym},{mcode},,{limit}")
-        data = _http_get_json(url)
-        node = ((data or {}).get("data") or {}).get(sym) or {}
-        rows = node.get(mcode) or []
-        for r in rows:
-            if len(r) < 6:
-                continue
-            bars.append(Bar(date=_fmt_tencent_time(str(r[0])),
-                            open=to_float(r[1], 0.0) or 0.0,
-                            close=to_float(r[2], 0.0) or 0.0,
-                            high=to_float(r[3], 0.0) or 0.0,
-                            low=to_float(r[4], 0.0) or 0.0,
-                            volume_lot=to_float(r[5], 0.0) or 0.0))
-        return bars
-    api_period, adj_key, plain_key = _PERIODS.get(period, _PERIODS["day"])
-    adj = _ADJUST.get((adjust or "qfq").lower(), "qfq")
-    param = f"{sym},{api_period},,,{limit},{adj}" if adj else \
-        f"{sym},{api_period},,,{limit}"
-    url = f"{TENCENT_KLINE}?param={param}"
-    data = _http_get_json(url)
-    node = ((data or {}).get("data") or {}).get(sym) or {}
-    rows = node.get(adj_key) or node.get(plain_key) or node.get(api_period) or []
-    for r in rows:
-        if len(r) < 6:
+        urls = [f"{h}?param={sym},{mcode},,{limit}"
+                for h in TENCENT_MKLINE_HOSTS]
+    else:
+        api_period, adj_key, plain_key = _PERIODS.get(period, _PERIODS["day"])
+        adj = _ADJUST.get((adjust or "qfq").lower(), "qfq")
+        param = (f"{sym},{api_period},,,{limit},{adj}" if adj
+                 else f"{sym},{api_period},,,{limit}")
+        urls = [f"{h}?param={param}" for h in TENCENT_KLINE_HOSTS]
+
+    last_exc: Optional[Exception] = None
+    for url in urls:
+        try:
+            data = _http_get_json(url, headers=_KLINE_HEADERS)
+        except Exception as exc:        # 501/超时/断连 → 换下一个域名
+            last_exc = exc
+            logger.warning("[astock] 腾讯 K 线域名失败，换下一个 %s @%s: %s",
+                           code, urllib.parse.urlsplit(url).netloc, exc)
             continue
-        bars.append(Bar(date=str(r[0]),
-                        open=to_float(r[1], 0.0) or 0.0,
-                        close=to_float(r[2], 0.0) or 0.0,
-                        high=to_float(r[3], 0.0) or 0.0,
-                        low=to_float(r[4], 0.0) or 0.0,
-                        volume_lot=to_float(r[5], 0.0) or 0.0))
-    return bars
+        node = ((data or {}).get("data") or {}).get(sym) or {}
+        if not isinstance(node, dict):
+            continue
+        keys = ([_MINUTE_PERIODS[period]] if minute
+                else [adj_key, plain_key, api_period, "day"])
+        bars = _parse_tencent_rows(node, keys)
+        if bars:
+            return bars
+    if last_exc is not None:
+        raise last_exc
+    return []
+
+
+# ---------------------------------------------------------------- 雪球 K 线
+#: 雪球需要先访问首页拿 xq_a_token cookie，否则 400。cookie 进程内复用。
+_XQ_COOKIE: Dict[str, Any] = {"jar": None, "ts": 0.0}
+_XQ_LOCK = threading.Lock()
+_XQ_COOKIE_TTL = 1800.0
+
+#: 雪球 period 取值（分钟线写作 1m/5m/…，日周月为 day/week/month）
+_XQ_PERIOD = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+              "60m": "60m", "day": "day", "week": "week", "month": "month"}
+#: 雪球 type：before 前复权 / after 后复权 / bfq 不复权
+_XQ_TYPE = {"qfq": "before", "hfq": "after", "none": "bfq"}
+
+
+
+def _xq_opener() -> Any:
+    """取（或刷新）带 xq_a_token 的 opener。cookie 过期会自动重建。"""
+    import http.cookiejar
+    now = time.monotonic()
+    with _XQ_LOCK:
+        if (_XQ_COOKIE["jar"] is not None
+                and now - _XQ_COOKIE["ts"] < _XQ_COOKIE_TTL):
+            return _XQ_COOKIE["jar"]
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj))
+        try:
+            req = urllib.request.Request(
+                "https://xueqiu.com/",
+                headers=dict(_HEADERS, Referer="https://xueqiu.com/"))
+            with opener.open(req, timeout=_TIMEOUT) as resp:
+                resp.read()
+        except Exception as exc:
+            raise DataError(f"雪球 cookie 获取失败：{exc}") from exc
+        _XQ_COOKIE["jar"] = opener
+        _XQ_COOKIE["ts"] = now
+        return opener
+
+
+def _xq_symbol(code: str, venue: str) -> str:
+    prefix = {"sh": "SH", "sz": "SZ", "bj": "BJ"}.get(venue, "SH")
+    return f"{prefix}{code}"
+
+
+def _fetch_klines_xueqiu(code: str, venue: str, period: str, limit: int,
+                         adjust: str) -> List[Bar]:
+    """雪球 K 线（异地备源）。
+
+    返回列：timestamp, volume, open, high, low, close, chg, percent,
+    turnoverrate, amount, ...（**是 open/high/low/close 顺序**，与腾讯的
+    open/close/high/low 不同，别抄错）。volume 单位是**股**，本层统一用「手」，
+    故除以 100；amount 单位是元（雪球给的浮点科学计数串）。
+
+    count 传负数表示「取到 begin 之前的 N 根」，这是雪球的分页语义。
+    """
+    xq_period = _XQ_PERIOD.get(period)
+    if not xq_period:
+        return []
+    xq_type = _XQ_TYPE.get((adjust or "qfq").lower(), "before")
+    sym = _xq_symbol(code, venue)
+    begin_ms = int(time.time() * 1000)
+    params = urllib.parse.urlencode({
+        "symbol": sym, "begin": begin_ms, "period": xq_period,
+        "type": xq_type, "count": -max(1, int(limit)),
+        "indicator": "kline",
+    })
+    opener = _xq_opener()
+    req = urllib.request.Request(
+        f"{XQ_KLINE}?{params}",
+        headers=dict(_HEADERS, Referer=f"https://xueqiu.com/S/{sym}"))
+    try:
+        with opener.open(req, timeout=_TIMEOUT) as resp:
+            raw = resp.read()
+            raw = _decompress(raw, resp.headers.get("Content-Encoding"))
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except Exception as exc:
+        raise DataError(f"雪球 K 线请求失败：{exc}") from exc
+    if payload.get("error_code"):
+        # token 失效：清掉缓存，下次重建
+        _XQ_COOKIE["jar"] = None
+        raise DataError(f"雪球返回错误 {payload.get('error_code')}: "
+                        f"{payload.get('error_description')}")
+    item = ((payload.get("data") or {}).get("item")) or []
+    out: List[Bar] = []
+    for r in item:
+        if not isinstance(r, (list, tuple)) or len(r) < 6:
+            continue
+        ts, vol, op_, hi, lo, cl = r[0], r[1], r[2], r[3], r[4], r[5]
+        try:
+            dt = time.strftime("%Y-%m-%d %H:%M:%S",
+                               time.localtime(int(ts) / 1000))
+        except (ValueError, OSError, TypeError):
+            continue
+        date = dt[:10] if xq_period in ("day", "week", "month") else dt[:16]
+        amt = to_float(r[9], None) if len(r) > 9 else None
+        out.append(Bar(
+            date=date,
+            open=to_float(op_, 0.0) or 0.0,
+            close=to_float(cl, 0.0) or 0.0,
+            high=to_float(hi, 0.0) or 0.0,
+            low=to_float(lo, 0.0) or 0.0,
+            # 雪球给「股」，本层统一「手」；与腾讯对齐取整（腾讯给整手，
+            # 不 round 的话同一根 K 线换源后量能会差 0.5 手，看起来像数据漂移）
+            # 用 int(x+0.5) 而非 round()：round 是银行家舍入，1150268.5 会
+            # 变 1150268 而腾讯给 1150269，同一根 K 线换源后量能不一致
+            volume_lot=float(int((to_float(vol, 0.0) or 0.0) / 100.0 + 0.5)),
+            amount=amt,
+        ))
+    return out
 
 
 def fetch_minute_bars(raw_code: str, period: str = "5m", limit: int = 120,
