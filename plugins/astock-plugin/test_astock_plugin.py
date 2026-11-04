@@ -6048,3 +6048,69 @@ class TestReadOnlyToolsCoverage(unittest.TestCase):
                      "astock_archive", "astock_act", "astock_backtest", "astock_pick"):
             with self.subTest(tool=name):
                 self.assertNotIn(name, ro, f"{name} 有写副作用，不该算只读")
+
+
+class TestCapitalEventCoverage(unittest.TestCase):
+    """资本运作类事件的词表覆盖（离线）。
+
+    回归背景（2026-11-04 实测）：词表最初只有 回购/增持/分红/股东会 等，
+    漏了**重组/划转/定增/保荐**这些。后果是这类事件被判 `unknown` 而不是 `na`。
+
+    为什么 `unknown` 在这里是**错的**（它看起来更保守，实际更糟）：
+      · `unknown` = "我没查到报表" → 默认动作只观察
+      · `na`      = "这事件本就不适用门槛②" → 不据此否决，看门槛③④
+    把本公司控制权变更、定增保荐这类事件判成 unknown，
+    等于把一条**本不适用于门槛②的通道也堵死了**——门槛② 又被滥用成万能否决器。
+
+    真实漏判：风范股份「河北产融集团间接持有 30.08%」→ 曾报 unknown。
+    """
+
+    def _mix(self):
+        import astock_business as biz
+        return biz.BusinessMix(
+            code="601700", name="风范股份", report_date="2026-06-30",
+            by_product=[biz.Segment(item="角钢塔", ratio_pct=40.62),
+                        biz.Segment(item="钢管塔", ratio_pct=16.41)],
+        )
+
+    def test_restructuring_is_na(self):
+        """控制权/股权变动 → na（不涉及业务占比）。"""
+        import astock_business as biz
+        for text in ("河北产融集团将间接持有公司30.08%权益",
+                     "关于控股股东股权无偿划转的公告",
+                     "实际控制人拟发生变更",
+                     "重大资产重组进展公告"):
+            with self.subTest(event=text):
+                res = biz.judge(self._mix(), event_text=text)
+                self.assertEqual(res.result, biz.NA,
+                                 f"{text} 应判 na，实际 {res.result}")
+
+    def test_financing_is_na(self):
+        """定增/保荐/可转债 → na（不改变现有业务结构）。"""
+        import astock_business as biz
+        for text in ("招商证券为其定增A股出具上市保荐书",
+                     "关于向特定对象发行股票申请获受理的公告",
+                     "公开发行可转换公司债券预案"):
+            with self.subTest(event=text):
+                res = biz.judge(self._mix(), event_text=text)
+                self.assertEqual(res.result, biz.NA,
+                                 f"{text} 应判 na，实际 {res.result}")
+
+    def test_na_does_not_veto(self):
+        """na 的语义是"不适用"，passed 必须是 None（不参与否决）。"""
+        import astock_business as biz
+        res = biz.judge(self._mix(), event_text="河北产融集团间接持有30.08%")
+        self.assertEqual(res.result, biz.NA)
+        self.assertIsNone(res.passed)
+
+    def test_real_business_keyword_still_judged(self):
+        """带真实业务词的事件仍要走判定，不能被资本运作词表吞掉。"""
+        import astock_business as biz
+        mix = biz.BusinessMix(
+            code="002532", name="天山铝业", report_date="2026-06-30",
+            by_product=[biz.Segment(item="原铝板块", ratio_pct=68.7)])
+        # 事件里同时有"回购"和"原铝"——显式 keywords 优先
+        res = biz.judge(mix, event_text="回购股份 同时原铝扩产",
+                        keywords=("原铝",))
+        self.assertEqual(res.result, biz.PASS)
+        self.assertAlmostEqual(res.ratio_pct, 68.7)
