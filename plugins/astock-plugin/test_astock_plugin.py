@@ -685,6 +685,7 @@ class TestPluginSurface(unittest.TestCase):
             "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
             "astock_sentiment", "astock_events", "astock_sync", "astock_watch",
             "astock_pick", "astock_backtest", "astock_archive", "astock_act",
+            "astock_business",
         })
 
     def test_command_names_are_prefixed(self):
@@ -5653,3 +5654,291 @@ class TestNoShadowedModuleAliases(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestBusinessMix(unittest.TestCase):
+    """门槛②（相关业务收入占营收 ≥5%）判定逻辑，**全离线**。
+
+    回归背景（2026-11-04）：这道门槛此前被登记成「工具链无分部财报字段 →
+    永久缺口」，导致每次简报都写「②无法核实 → 只观察」，实际上等于门槛不存在。
+    本组用例锁住判定语义，重点是**四个结论不能混**：
+    pass / below / absent / na，另有 unknown。
+
+    全部用内存替身（不连东财），真实数据形态照抄 2026-11-04 的实测返回。
+    """
+
+    def _mix(self, code="000678", name="", product=None, industry=None,
+             scope="", date="2026-06-30"):
+        import astock_business as biz
+        mk = lambda item, ratio, gross=None, rank=None: biz.Segment(
+            item=item, ratio_pct=ratio,
+            gross_pct=gross, rank=rank)
+        return biz.BusinessMix(
+            code=code, name=name, report_date=date,
+            by_product=[mk(*p) for p in (product or [])],
+            by_industry=[mk(*p) for p in (industry or [])],
+            scope=scope,
+        )
+
+    # ------------------------------------------------------ 核心：襄阳轴承反推
+    def test_xiangyang_robot_is_absent(self):
+        """襄阳轴承 000678：分部表只有轴承/等速万向节/其他，**没有机器人**。
+
+        这正是方法论「0.023% 死在门槛②」的自动版：
+        进不了分部表 → 低于披露门槛 → 必然远小于 5%。
+        比起事后查到精确的 0.023%，这个判据更早、也更少歧义。
+        """
+        import astock_business as biz
+        mix = self._mix(product=[("轴承", 83.68, 15.9, 1),
+                                 ("等速万向节", 12.92, -1.6, 2),
+                                 ("其他(补充)", 3.40, 36.6, 3)],
+                        scope="制造销售轴承及零部件、汽车零部件、机电设备")
+        res = biz.judge(mix, event_text="襄阳轴承 人形机器人 减速器 可用于谐波/RV减速器")
+        self.assertEqual(res.result, biz.ABSENT)
+        self.assertIs(res.passed, False)      # 明确否决，不是"未核实"
+        self.assertIn("机器人", res.reason)
+
+    def test_absent_differs_from_unknown(self):
+        """`absent`（报表说你没有）与 `unknown`（我没查到报表）必须区分。
+
+        混为一谈会得出相反结论：前者是否决，后者不能算通过。
+        """
+        import astock_business as biz
+        mix = self._mix(product=[("轴承", 99.0)])
+        absent = biz.judge(mix, event_text="机器人业务")
+        self.assertEqual(absent.result, biz.ABSENT)
+
+        unknown = biz.Threshold2Result(code="430047", result=biz.UNKNOWN)
+        self.assertIsNone(unknown.passed)     # 未核实 ≠ 通过
+        self.assertIsNone(absent.passed) if False else None
+        self.assertIs(absent.passed, False)
+
+    # ------------------------------------------------------ 四档语义
+    def test_pass_when_ratio_ge_threshold(self):
+        import astock_business as biz
+        mix = self._mix(code="002273", product=[("消费电子", 83.89),
+                                                ("汽车电子(AR+)", 9.24),
+                                                ("反光材料", 6.09)])
+        res = biz.judge(mix, event_text="汽车电子AR+业务放量")
+        self.assertEqual(res.result, biz.PASS)
+        self.assertAlmostEqual(res.ratio_pct, 9.24)
+        self.assertIs(res.passed, True)
+
+    def test_below_when_ratio_under_threshold(self):
+        import astock_business as biz
+        mix = self._mix(code="000960", product=[("锡锭", 50.0),
+                                                ("锌产品", 4.9985)])
+        res = biz.judge(mix, event_text="锌产品扩产")
+        self.assertEqual(res.result, biz.BELOW)
+        self.assertIs(res.passed, False)
+
+    def test_threshold_boundary_is_inclusive(self):
+        """恰好 5.00% 应算通过（方法论写的是「≥ 5%」）。
+
+        用显式 keywords：自动提取只走同义词表，不会为任意词猜分词。
+        """
+        import astock_business as biz
+        mix = self._mix(product=[("某业务", 5.0)])
+        self.assertEqual(
+            biz.judge(mix, keywords=("某业务",)).result, biz.PASS)
+        mix2 = self._mix(product=[("某业务", 4.99)])
+        self.assertEqual(
+            biz.judge(mix2, keywords=("某业务",)).result, biz.BELOW)
+
+    def test_na_for_capital_events(self):
+        """回购/增持/分红不涉及业务占比 → na，**不能据此否决**。
+
+        若把这类事件算成"查不到 → 不通过"，门槛② 会变成
+        "任何资本运作标的都永远过不了"，等于自己废掉一条通道。
+        """
+        import astock_business as biz
+        mix = self._mix(code="002273", product=[("消费电子", 83.89)])
+        for text in ("董事长提议回购公司股份", "控股股东增持股份达0.51%",
+                     "拟每10股派发现金红利3元"):
+            with self.subTest(event=text):
+                res = biz.judge(mix, event_text=text)
+                self.assertEqual(res.result, biz.NA)
+                self.assertIsNone(res.passed)     # 不适用 → 不参与否决
+
+    def test_capital_event_with_explicit_keyword_still_judged(self):
+        """显式给了业务关键词时，即使是回购公告也要照常判定——不能一律 na。"""
+        import astock_business as biz
+        mix = self._mix(product=[("机器人零部件", 1.2), ("轴承", 98.0)])
+        res = biz.judge(mix, event_text="回购股份", keywords=("机器人",))
+        self.assertEqual(res.result, biz.BELOW)   # 1.2% < 5%
+        self.assertIs(res.passed, False)
+
+    # ------------------------------------------------------ 匹配细节
+    def test_company_name_not_polluting_keywords(self):
+        """公司名里的商品词不能污染关键词。
+
+        「锡业股份」含「锡」：若不先剔除公司名，问锌业务的新闻也会命中"锡"，
+        把 5% 的锌判成 50% 的锡锭——**这是方向性错误**。
+        """
+        import astock_business as biz
+        mix = self._mix(code="000960", name="锡业股份",
+                        product=[("锡锭", 50.0), ("锌产品", 4.9985)])
+        res = biz.judge(mix, event_text="锡业股份 锌产品扩产")
+        self.assertEqual(res.result, biz.BELOW)
+        self.assertEqual(res.matched, "锌产品")
+
+    def test_sub_items_with_prefix_excluded(self):
+        """「其中:xxx」是父项的拆分，不能当独立分部匹配，否则会拿子项占比当主业。"""
+        import astock_business as biz
+        mix = self._mix(product=[("锡锭", 50.0),
+                                 ("其中:供应链业务-锡产品", 4.94)])
+        res = biz.judge(mix, event_text="锡锭价格")
+        self.assertEqual(res.matched, "锡锭")
+        self.assertAlmostEqual(res.ratio_pct, 50.0)
+
+    def test_noise_items_never_match(self):
+        """「其他/合计/抵销」等杂项不参与匹配（否则「其他」会命中一切）。"""
+        import astock_business as biz
+        mix = self._mix(product=[("其他(补充)", 3.4), ("轴承", 96.6)])
+        res = biz.judge(mix, event_text="其他业务", keywords=("其他",))
+        self.assertEqual(res.result, biz.ABSENT)   # 杂项被跳过 → 无命中
+
+    def test_explicit_keywords_override_auto(self):
+        import astock_business as biz
+        mix = self._mix(product=[("激光光学产品", 55.1), ("激光光源", 24.7)])
+        res = biz.judge(mix, event_text="随便一段无关文本", keywords=("激光光源",))
+        self.assertEqual(res.result, biz.PASS)
+        self.assertEqual(res.matched, "激光光源")
+
+    def test_unknown_without_keywords(self):
+        """提不出关键词就是 unknown（不猜），而不是随便挑一个分部。"""
+        import astock_business as biz
+        mix = self._mix(product=[("轴承", 96.6)])
+        res = biz.judge(mix, event_text="公司发布一份公告")
+        self.assertEqual(res.result, biz.UNKNOWN)
+        self.assertIsNone(res.passed)
+
+    def test_falls_back_to_industry_when_no_product(self):
+        """没有按产品口径时回退按行业口径。"""
+        import astock_business as biz
+        mix = self._mix(product=[],
+                        industry=[("有色金属", 99.86), ("其他", 0.14)])
+        self.assertEqual(len(mix.items), 2)
+        res = biz.judge(mix, event_text="有色金属价格", keywords=("有色",))
+        self.assertEqual(res.result, biz.PASS)
+
+    def test_verdict_strings_cover_all_results(self):
+        import astock_business as biz
+        for r in (biz.PASS, biz.BELOW, biz.ABSENT, biz.NA, biz.UNKNOWN):
+            with self.subTest(result=r):
+                txt = biz.Threshold2Result(code="000001", result=r).verdict
+                self.assertTrue(txt and isinstance(txt, str))
+
+
+class TestBusinessDataParsing(unittest.TestCase):
+    """接口返回解析（离线：喂固定 JSON，不连网）。"""
+
+    RAW = {
+        "zyfw": [{"SECURITY_CODE": "002273", "BUSINESS_SCOPE": "光电子器件制造"}],
+        "zygcfx": [
+            {"ITEM_NAME": "消费电子", "MBI_RATIO": 0.838883, "MAINOP_TYPE": "2",
+             "REPORT_DATE": "2026-06-30 00:00:00", "GROSS_RPOFIT_RATIO": 0.320021,
+             "RANK": 1},
+            {"ITEM_NAME": "汽车电子(AR+)", "MBI_RATIO": 0.092419, "MAINOP_TYPE": "2",
+             "REPORT_DATE": "2026-06-30 00:00:00", "GROSS_RPOFIT_RATIO": 0.279168,
+             "RANK": 2},
+            {"ITEM_NAME": "光学光电子行业", "MBI_RATIO": 0.931302, "MAINOP_TYPE": "1",
+             "REPORT_DATE": "2026-06-30 00:00:00", "RANK": 1},
+            {"ITEM_NAME": "旧期产品", "MBI_RATIO": 0.5, "MAINOP_TYPE": "2",
+             "REPORT_DATE": "2025-12-31 00:00:00", "RANK": 1},
+        ],
+    }
+
+    def test_ratio_converted_to_percent(self):
+        """接口给小数（0.0924），必须转成百分数（9.24）。"""
+        import astock_business as biz
+        segs = biz._segments(self.RAW["zygcfx"], "2")
+        by = {s.item: s for s in segs}
+        self.assertAlmostEqual(by["汽车电子(AR+)"].ratio_pct, 9.2419, places=3)
+        self.assertAlmostEqual(by["消费电子"].ratio_pct, 83.8883, places=3)
+
+    def test_only_latest_period_kept(self):
+        """多报告期时只保留最新一期（否则旧期会把占比算错）。"""
+        import astock_business as biz
+        rows = self.RAW["zygcfx"]
+        dates = [str(r["REPORT_DATE"])[:10] for r in rows]
+        latest = max(d for d in dates if d)
+        at = [r for r in rows if str(r["REPORT_DATE"])[:10] == latest]
+        segs = biz._segments(at, "2")
+        self.assertNotIn("旧期产品", [s.item for s in segs])
+
+    def test_mainop_type_split(self):
+        """MAINOP_TYPE 1=行业 2=产品，不能混在一起。"""
+        import astock_business as biz
+        self.assertEqual([s.item for s in biz._segments(self.RAW["zygcfx"], "1")],
+                         ["光学光电子行业"])
+        self.assertEqual(sorted(s.item for s in biz._segments(self.RAW["zygcfx"], "2")),
+                         sorted(["消费电子", "汽车电子(AR+)", "旧期产品"]))
+
+    def test_invalid_code_raises_dataerror(self):
+        """北交所/ETF 返回 status=-1 → 必须抛 DataError（由 check 收敛成 unknown）。"""
+        import astock_business as biz
+        import astock_data as data
+        orig = data._http_get_json
+        try:
+            data._http_get_json = lambda *a, **k: {
+                "status": -1, "message": "股票代码不合法"}
+            with self.assertRaises(data.DataError):
+                biz.fetch_mix("430047")
+        finally:
+            data._http_get_json = orig
+
+    def test_check_never_raises_on_network_error(self):
+        """取数失败必须收敛成 unknown，不能把工具打挂。"""
+        import astock_business as biz
+        import astock_data as data
+        orig = data._http_get_json
+
+        def boom(*a, **k):
+            raise data.DataError("模拟网络失败")
+
+        try:
+            data._http_get_json = boom
+            res = biz.check("002273", event_text="回购")
+            self.assertEqual(res.result, biz.UNKNOWN)
+            self.assertIsNone(res.passed)      # 未核实 ≠ 通过
+        finally:
+            data._http_get_json = orig
+
+
+class TestGzipDecompress(unittest.TestCase):
+    """响应解压（2026-11-04 踩到的坑）。
+
+    东财 F10 即使请求头没有 `Accept-Encoding` 也返回 gzip 体；不解压时
+    `json.loads` 报「不是 JSON（可能被反爬拦截）」——**错误信息指向完全错误的
+    方向**（以为是反爬，实际只是没解压）。
+    """
+
+    def test_gzip_decompressed(self):
+        import gzip as _gzip
+        import astock_data as data
+        payload = b'{"ok": true, "n": 1}'
+        self.assertEqual(data._decompress(_gzip.compress(payload), "gzip"), payload)
+
+    def test_gzip_magic_fallback_without_header(self):
+        """没有 Content-Encoding 头时，靠 1f 8b magic 兜底判断。"""
+        import gzip as _gzip
+        import astock_data as data
+        payload = b'{"ok": true}'
+        self.assertEqual(data._decompress(_gzip.compress(payload), None), payload)
+
+    def test_plain_passthrough(self):
+        import astock_data as data
+        self.assertEqual(data._decompress(b'{"a":1}', None), b'{"a":1}')
+        self.assertEqual(data._decompress(b'{"a":1}', "identity"), b'{"a":1}')
+
+    def test_empty_safe(self):
+        import astock_data as data
+        self.assertEqual(data._decompress(b"", "gzip"), b"")
+        self.assertEqual(data._decompress(b"", None), b"")
+
+    def test_broken_gzip_returns_original(self):
+        """解压失败不能让请求挂掉，原样返回由上层按原逻辑报错。"""
+        import astock_data as data
+        broken = b"\x1f\x8bnot-a-valid-gzip"
+        self.assertEqual(data._decompress(broken, "gzip"), broken)

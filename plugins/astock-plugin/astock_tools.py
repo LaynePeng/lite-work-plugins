@@ -315,6 +315,45 @@ def build_tools() -> List[ToolDefinition]:
             },
         ),
         ToolDefinition(
+            name="astock_business",
+            description=(
+                "**主营构成 / 门槛②判定**：直接读东财 F10 分部收入构成，算出"
+                "「相关业务收入占营收几成」，用来判定《选股方法论》第②道硬门槛"
+                "（相关业务收入占营收 ≥5%）。此前这道门槛因「工具链无分部财报字段」"
+                "被登记为永久缺口，导致所有标的都只能写「②无法核实→只观察」，本工具补上。"
+                "结论有四档必须分清：**pass** 达标 / **below** 有该业务但占比不足 / "
+                "**absent** 分部表里根本没有这块业务（分部披露有重要性门槛，"
+                "没有＝远低于5%，这是**否定证据不是数据缺失**）/ "
+                "**na** 事件属回购/增持等资本运作，不涉及业务占比，门槛② 本就不适用"
+                "（不能据此否决）。另有 **unknown** ＝ 数据取不到（北交所/ETF），"
+                "**不等于通过**。报告期按中报/年报披露，不是实时。"
+                "查多只请传 codes。"),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "code": code_prop,
+                    "codes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "批量核门槛②（持仓/候选池体检），最多 20 只",
+                    },
+                    "event": {
+                        "type": "string",
+                        "description": ("事件原文（如公告标题）。用于识别「哪块业务受益」"
+                                        "以及判断是不是回购/增持这类不涉及业务占比的事件。"
+                                        "不传则只给分部构成，不做门槛判定"),
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": ("手动指定业务关键词（优先级最高，可传字符串逗号分隔）。"
+                                        "自动匹配不准时用它，如 [\"机器人\",\"减速器\"]"),
+                    },
+                },
+                "required": [],
+            },
+        ),
+        ToolDefinition(
             name="astock_events",
             description=(
                 "**事件驱动筛股**：全市场快讯流 → 个股硬事件（回购/增持/中标/"

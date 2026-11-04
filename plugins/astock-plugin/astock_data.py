@@ -19,11 +19,13 @@
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import threading
 import time
 import urllib.error
+import zlib
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -174,6 +176,44 @@ class DataError(RuntimeError):
     """取数失败（网络 / 接口变更）。消息面向 Agent，说明原因与可行动作。"""
 
 
+def _decompress(raw: bytes, content_encoding: Optional[str]) -> bytes:
+    """按 Content-Encoding 解压响应体。
+
+    **为什么必须有这一步**（2026-11-04 实测踩到）：
+    东财 F10 系接口（emweb.securities.eastmoney.com）即使请求头里没有
+    `Accept-Encoding`，也会返回 **gzip 压缩体**。不解压的话拿到的是
+    `b'\\x1f\\x8b...'` 二进制，`json.loads` 直接抛
+    「接口返回的不是 JSON（可能被反爬拦截）」——**错误信息完全指向了错误的
+    方向**（以为是反爬，实际只是没解压），排查花了不少时间。
+
+    除 gzip 外一并处理 deflate（标准库 zlib 即可，无需第三方包）。
+    未知编码原样返回，让上层按原逻辑报错，不吞掉异常。
+    """
+    if not raw or not content_encoding:
+        # 没有头信息时用 magic 兜底判断：gzip 固定以 1f 8b 开头
+        if len(raw) > 2 and raw[0] == 0x1F and raw[1] == 0x8B:
+            try:
+                return gzip.decompress(raw)
+            except OSError:
+                return raw
+        return raw
+
+    enc = content_encoding.lower().strip()
+    try:
+        if "gzip" in enc:
+            return gzip.decompress(raw)
+        if "deflate" in enc:
+            try:
+                return zlib.decompress(raw)
+            except zlib.error:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+        # 不处理 br：brotli 是第三方包，本插件坚持零依赖（AGENTS.md 硬约束），
+        # 且东财/腾讯/新浪实测都只回 gzip 或 identity，不会有 br。
+    except Exception as exc:       # 解压失败不该让整个请求挂掉
+        logger.warning("[astock] 解压失败(%s)：%s，按原文返回", content_encoding, exc)
+    return raw
+
+
 def _http_get(url: str, headers: Optional[Dict[str, str]] = None,
               encoding: str = "utf-8", retries: int = 2,
               backoff: float = 0.6) -> str:
@@ -192,6 +232,7 @@ def _http_get(url: str, headers: Optional[Dict[str, str]] = None,
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 raw = resp.read()
+                raw = _decompress(raw, resp.headers.get("Content-Encoding"))
             try:
                 return raw.decode(encoding, "replace")
             except (LookupError, UnicodeDecodeError):

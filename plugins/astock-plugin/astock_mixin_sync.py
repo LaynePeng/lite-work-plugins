@@ -14,6 +14,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List
 
+import astock_business as business
 import astock_data as data
 import astock_market as mkt
 import astock_receipt as receipt
@@ -219,3 +220,124 @@ class SyncToolsMixin:
                     f"{k}={v}" for k, v in collected["errors"].items())]
             return "\n".join(out)
         return senti_tool.render(rep, collected["items"], collected["extras"])
+
+    # -------------------------------------------------- 主营构成（门槛②）
+    async def _tool_business(self, args: Dict[str, Any]) -> str:
+        """主营构成 + 门槛②（相关业务收入占营收 ≥5%）自动判定。
+
+        这是「选股方法论第②道门槛」的落地：此前工具链没有分部财报字段，
+        这道门槛被登记成永久缺口，导致所有标的都只能写「②无法核实 → 只观察」。
+        现在直接读东财 F10 主营构成，把占比算出来。
+
+        **四种结论必须分清**（见 astock_business 的模块注释）：
+        pass / below / absent / na，另有 unknown。
+        尤其 `absent`（分部表里没这块业务）是**否定证据**，不是数据缺失——
+        分部披露有重要性门槛，进不了表就意味着远低于 5%。
+        """
+        code_raw = str(args.get("code") or "").strip()
+        if not code_raw:
+            return ("[Error] 需要 code（如 002273）。这是按标的查分部收入构成的工具，"
+                    "用于判定选股方法论第②道门槛「相关业务收入占营收 ≥5%」。"
+                    "想批量核对持仓可传 codes 数组。")
+
+        event_text = str(args.get("event") or "").strip()
+        keywords = args.get("keywords") or []
+        if isinstance(keywords, str):
+            keywords = [k.strip() for k in keywords.replace("，", ",").split(",") if k.strip()]
+
+        # 批量模式：一次核多只（持仓/候选池体检用）
+        codes_raw = args.get("codes") or []
+        if codes_raw:
+            if isinstance(codes_raw, str):
+                codes_raw = [c.strip() for c in codes_raw.replace("，", ",").split(",") if c.strip()]
+            return await self._business_batch(list(codes_raw), event_text, keywords)
+
+        code, _ = mkt.normalize_code(code_raw)
+        name = ""
+        try:
+            q = await self._fetch_quotes([code])
+            if q:
+                name = q[0].name
+        except Exception:
+            name = ""
+
+        res = await asyncio.to_thread(
+            business.check, code, event_text, name, tuple(keywords))
+
+        lines = [f"## 主营构成 · 门槛②判定：{name or code}（{code}）", ""]
+        lines.append(f"**结论：{res.verdict}**")
+        lines.append("")
+        if res.reason:
+            lines.append(f"> {res.reason}")
+            lines.append("")
+        if res.report_date:
+            lines.append(f"报告期：**{res.report_date}**（分部数据按中报/年报披露，不是实时）")
+            lines.append("")
+
+        if res.candidates:
+            lines.append("| 分部 | 收入占比 | 毛利率 |")
+            lines.append("|---|---|---|")
+            for seg in res.candidates[:8]:
+                g = f"{seg.gross_pct:.1f}%" if seg.gross_pct is not None else "-"
+                lines.append(f"| {seg.item} | **{seg.ratio_pct:.2f}%** | {g} |")
+            lines.append("")
+
+        # 判定说明：把"为什么是这个结论"讲清，避免把 absent 读成"没查到"
+        note = {
+            business.PASS: "占比达标，该业务变好会进报表。",
+            business.BELOW: "有这块业务但占比不足 5%，即使翻倍对报表影响也在四舍五入范围。",
+            business.ABSENT: ("**分部表里没有这块业务**——分部披露有重要性门槛，"
+                              "进不了表意味着占比远低于 5%。这是**否定证据**，不是数据缺失。"),
+            business.NA: ("事件属资本运作（回购/增持/分红），不涉及某块业务收入占比。"
+                          "**门槛② 不适用**，不能据此否决——应以门槛③资金、门槛④止损为准。"),
+            business.UNKNOWN: ("数据取不到（北交所/ETF/接口异常）。"
+                               "**这不等于通过**，只是一条未核实的门槛。"),
+        }.get(res.result, "")
+        if note:
+            lines.append(f"**怎么读这个结论**：{note}")
+            lines.append("")
+
+        if res.keywords:
+            lines.append(f"匹配关键词：{'、'.join(res.keywords)}")
+            lines.append("")
+
+        lines.append("> 数据源：东财 F10 主营构成。只做数据归集与门槛判定，不构成买入建议。")
+        return "\n".join(lines)
+
+    async def _business_batch(self, codes: List[str], event_text: str,
+                              keywords: Sequence[str]) -> str:
+        """批量核门槛②（持仓/候选池体检）。"""
+        rows: List[str] = []
+        stats = {business.PASS: 0, business.BELOW: 0, business.ABSENT: 0,
+                 business.NA: 0, business.UNKNOWN: 0}
+        for raw in codes[:20]:
+            try:
+                code, _ = mkt.normalize_code(raw)
+            except Exception:
+                continue
+            name = ""
+            try:
+                q = await self._fetch_quotes([code])
+                if q:
+                    name = q[0].name
+            except Exception:
+                name = ""
+            res = await asyncio.to_thread(
+                business.check, code, event_text, name, tuple(keywords))
+            stats[res.result] = stats.get(res.result, 0) + 1
+            detail = (f"{res.matched} {res.ratio_pct:.1f}%" if res.ratio_pct is not None
+                      else (res.reason[:34] + ("…" if len(res.reason) > 34 else "")))
+            rows.append(f"| {name or code}（{code}）| {res.verdict} | {detail} |")
+
+        total = sum(stats.values())
+        lines = [f"## 门槛②批量体检（{total} 只）", ""]
+        lines.append(f"**过 {stats[business.PASS]} 只 · 不过 {stats[business.BELOW] + stats[business.ABSENT]} 只"
+                     f" · 不适用 {stats[business.NA]} 只 · 未核实 {stats[business.UNKNOWN]} 只**")
+        lines.append("")
+        lines.append("| 标的 | 结论 | 命中分部/原因 |")
+        lines.append("|---|---|---|")
+        lines += rows
+        lines.append("")
+        lines.append("> 「不适用」= 事件属回购/增持等资本运作，门槛② 本就不涉及业务占比；"
+                     "「未核实」= 数据取不到（北交所/ETF），**不等于通过**。")
+        return "\n".join(lines)

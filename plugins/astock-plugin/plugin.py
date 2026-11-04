@@ -918,7 +918,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.6.1"
+    version = "2.7.0"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
@@ -1526,6 +1526,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             "astock_archive": self._tool_archive,
             "astock_act": self._tool_act,
             "astock_watch": self._tool_watch,
+            "astock_business": self._tool_business,
         }
         handler = handlers.get(name)
         if handler is None:
