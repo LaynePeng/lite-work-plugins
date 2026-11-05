@@ -158,7 +158,44 @@ class SyncToolsMixin:
                          + (f"，警告 {warn_n} 笔" if warn_n else "")
                          + (f"，失败 {err_n} 笔" if err_n else "") + "。")
             lines.append("对应计划已标记为已执行；台账成本价与 T+1 可卖已同步更新。")
+            # 资金校准提示：回单同步此前**完全没有**这条，一次导 5 笔就 5 笔
+            # 都不扣现金且一句提醒都没有——比单笔 astock_record 更危险。
+            # 汇总本次所有成功笔的净资金变动后统一提示一次。
+            lines += ["", self._sync_cash_hint(results)]
         return "\n".join(lines)
+
+    def _sync_cash_hint(self, results: List[Dict[str, Any]]) -> str:
+        """汇总本次同步的净资金变动，给出资金校准提示（无成功笔则空串）。"""
+        deltas = []
+        for r in results:
+            rec = r.get("recorded")
+            if not rec or r.get("status") == "error":
+                continue
+            d = rec.get("cash_delta")
+            if d is not None:
+                deltas.append(float(d))
+        if not deltas:
+            return ""
+        total = round(sum(deltas), 2)
+        try:
+            ledger = self._get_ledger()
+            cur = ledger.get_cash()
+            balance = float(cur.get("balance") or 0.0)
+            updated = str(cur.get("updated_at") or "")
+        except Exception:                   # noqa: BLE001 - 提示失败不该阻断同步结果
+            logger.debug("[astock] 读取资金余额失败，跳过校准提示", exc_info=True)
+            return ""
+        ref = round(balance + total, 2)
+        when = f"上次校准于 {updated}" if updated else "尚未校准过"
+        tail = (f"（{len(deltas)} 笔合计）" if len(deltas) > 1 else "")
+        return "\n".join([
+            f"⚠️ 可用资金未自动扣减 —— 本次净资金变动 {total:+,.2f} 元{tail}。",
+            f"   账面可用资金 {balance:,.2f} 元（{when}），"
+            f"若此后再无出入金，真实可用应为 {ref:,.2f} 元。",
+            "   请核对券商 App 后校准："
+            "`astock_portfolio action=set_cash cash=<真实余额>`",
+            "   （插件看不到你的银行转账/出入金，所以不会自动改余额。）",
+        ])
 
     # -------------------------------------------------- 舆情
     async def _tool_sentiment(self, args: Dict[str, Any]) -> str:

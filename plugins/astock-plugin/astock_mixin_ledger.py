@@ -25,6 +25,46 @@ from astock_common import _f, _table
 logger = logging.getLogger("litework.astock.mixin")
 
 
+def cash_hint_text(ledger: Ledger, cash_delta: float,
+                   ledger_after: Any = None) -> str:
+    """录成交后的「可用资金未自动扣减」提示（带可执行的具体金额）。
+
+    为什么需要带数字：`set_cash()` 是用户手工录入（银行转账/出入金对插件
+    不可见），所以**每笔成交都不会自动扣现金**。此前只有一句泛泛的
+    「需要时用 set_cash 手动校准」——用户看完仍不知道该填多少，实际后果是
+    账面现金虚高：真实事故里一笔 6,770 元买入后 3 分钟，用户手工把 cash
+    设成了**买入前**的余额，虚高 6,779 元，直接让后续 astock_hint /
+    astock_act 的股数估算多算一手。
+
+    这里只**建议**、绝不自动扣：插件看不见这段时间里有没有转账，自动扣同
+    样会算错。给「若此后再无出入金，应为 X」这个参考值，是让用户一眼能判断
+    对不对，而不是替他决定。
+
+    :param ledger: 台账（读当前账面余额与上次校准时间）
+    :param cash_delta: 本次资金变动（买入为负，卖出为正，已含费用）
+    :param ledger_after: 预留：要展示的「变动后参考值」直接由账面 + delta 算，
+        传 None 即可（保留参数便于将来接入多笔汇总）。
+    """
+    try:
+        cur = ledger.get_cash()
+        balance = float(cur.get("balance") or 0.0)
+        updated = str(cur.get("updated_at") or "")
+    except Exception:                       # noqa: BLE001 - 提示失败不该阻断录单
+        logger.debug("[astock] 读取资金余额失败，用简化提示", exc_info=True)
+        return ("提示：台账里的可用资金不会自动扣减（出入金不可见），"
+                "请用 astock_portfolio action=set_cash 按券商实际余额校准。")
+    ref = round(balance + float(cash_delta or 0.0), 2)
+    when = f"上次校准于 {updated}" if updated else "尚未校准过"
+    return "\n".join([
+        f"⚠️ 可用资金未自动扣减 —— 本次资金变动 {cash_delta:+,.2f} 元。",
+        f"   账面可用资金 {balance:,.2f} 元（{when}），"
+        f"若此后再无出入金，真实可用应为 {ref:,.2f} 元。",
+        "   请核对券商 App 后校准："
+        "`astock_portfolio action=set_cash cash=<真实余额>`",
+        "   （插件看不到你的银行转账/出入金，所以不会自动改余额。）",
+    ])
+
+
 class LedgerToolsMixin:
     """台账类工具：录成交（含 dry-run 校验）+ 持仓总览（含聊天看板）。（由 AstockPlugin 继承，mixin 单独不可用）。"""
 
@@ -149,8 +189,7 @@ class LedgerToolsMixin:
                      ["已实现盈亏", f"{r['realized_pnl']:+,.2f} 元"
                       if r.get("realized_pnl") is not None else "—"],
                  ])]
-        lines += ["", "提示：台账里的可用资金不会自动扣减（出入金不可见），"
-                      "需要时用 astock_portfolio action=set_cash 手动校准。"]
+        lines += ["", cash_hint_text(self._get_ledger(), r.get("cash_delta") or 0.0)]
         return "\n".join(lines)
 
     async def _tool_portfolio(self, args: Dict[str, Any]) -> str:

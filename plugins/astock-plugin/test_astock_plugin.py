@@ -5860,6 +5860,147 @@ class TestKlineMultiSource(unittest.TestCase):
             self.assertIn(name, msg, f"报错未点名 {name}：{msg}")
 
 
+class TestCashNotAutoDeductedHint(unittest.TestCase):
+    """录成交后必须提示「可用资金未自动扣减」，且**带可执行的具体金额**。
+
+    设计前提（刻意的）：`set_cash()` 是用户手工录入，银行转账/出入金对插件
+    不可见，所以 record_trade 不碰 cash 表。风险是账面现金虚高——真实事故：
+    一笔 6,770 元买入后 3 分钟，用户手工把 cash 设成了买入前的余额，
+    虚高 6,779 元，直接让后续 astock_hint / astock_act 的股数估算多算一手。
+
+    旧提示只有一句泛泛的「需要时用 set_cash 手动校准」，不给数字，用户看完
+    仍不知道该填多少；`astock_sync` 更是**完全没有**这条提示。本组用例锁住：
+    两条路径都要提示、都要带金额、且都**不能自动改余额**。
+    """
+
+    def setUp(self):
+        import tempfile as _tf
+        self.tmp = _tf.mkdtemp(prefix="lw-cashhint-")
+        self.path = os.path.join(self.tmp, "ledger.sqlite")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ledger(self, cash=10000.0):
+        import astock_ledger as _L
+        led = _L.Ledger(self.path, _L.fee_config(None) if hasattr(_L, "fee_config")
+                        else getattr(_L, "DEFAULT_FEE", None))
+        led.set_cash(cash)
+        return led
+
+    def test_hint_contains_amounts_and_reference(self):
+        """提示必须含：本次变动、账面余额、推算参考值、set_cash 指令。"""
+        from astock_mixin_ledger import cash_hint_text
+        led = self._ledger(10000.0)
+
+        text = cash_hint_text(led, -2453.02)
+
+        self.assertIn("-2,453.02", text, "缺本次资金变动")
+        self.assertIn("10,000.00", text, "缺账面余额")
+        self.assertIn("7,546.98", text, "缺推算参考值（10000 - 2453.02）")
+        self.assertIn("action=set_cash", text, "缺可执行指令")
+        self.assertIn("不会自动改余额", text, "必须说清不会自动改")
+
+    def test_hint_sell_is_positive_delta(self):
+        """卖出资金流入为正，参考值应高于账面余额。"""
+        from astock_mixin_ledger import cash_hint_text
+        led = self._ledger(1000.0)
+        text = cash_hint_text(led, 3_734.09)
+        self.assertIn("+3,734.09", text)
+        self.assertIn("4,734.09", text)
+
+    def test_hint_never_writes_cash(self):
+        """提示只是提示——绝不能顺手把余额改掉（这是刻意的设计边界）。"""
+        from astock_mixin_ledger import cash_hint_text
+        led = self._ledger(10000.0)
+        before = led.get_cash()["balance"]
+
+        cash_hint_text(led, -2453.02)
+
+        self.assertEqual(led.get_cash()["balance"], before,
+                         "提示函数不得修改可用资金")
+
+    def test_record_trade_does_not_touch_cash(self):
+        """record_trade 本身仍不改 cash（刻意的设计，锁住不回归）。"""
+        led = self._ledger(10000.0)
+        led.record_trade(code="002532", side="buy", price=12.24, shares=200,
+                         name="天山铝业")
+        self.assertEqual(led.get_cash()["balance"], 10000.0,
+                         "record_trade 不该自动扣现金（插件看不到出入金）")
+
+    def test_hint_degrades_when_cash_unreadable(self):
+        """读不到余额时要退化成简化提示，不能抛错阻断录单。"""
+        from astock_mixin_ledger import cash_hint_text
+
+        class BrokenLedger:
+            def get_cash(self):
+                raise RuntimeError("db gone")
+
+        text = cash_hint_text(BrokenLedger(), -100.0)
+        self.assertIn("不会自动扣减", text)
+        self.assertIn("action=set_cash", text)
+
+
+class TestSyncCashHint(unittest.TestCase):
+    """astock_sync 落账后也必须提示资金校准（此前完全没有）。"""
+
+    def _mixin(self, cash=10000.0):
+        import astock_ledger as _L
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="lw-synchint-")
+        led = _L.Ledger(os.path.join(tmp, "l.sqlite"), None)
+        led.set_cash(cash)
+
+        class M(astock.SyncToolsMixin):      # _sync_cash_hint 在 SyncToolsMixin
+            def _get_ledger(self_inner):
+                return led
+
+        return M(), tmp
+
+    def test_sync_hint_sums_multiple_trades(self):
+        """多笔应汇总成一条，且标注笔数。"""
+        import shutil
+        mixin, tmp = self._mixin(10000.0)
+        try:
+            results = [
+                {"status": "ok", "recorded": {"cash_delta": -2453.02}},
+                {"status": "ok", "recorded": {"cash_delta": -6775.00}},
+                {"status": "warn", "recorded": {"cash_delta": 3734.09}},
+            ]
+            text = mixin._sync_cash_hint(results)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIn("-5,493.93", text, "三笔应合计 -2453.02-6775+3734.09")
+        self.assertIn("3 笔合计", text)
+        self.assertIn("4,506.07", text, "参考值 10000 - 5493.93")
+        self.assertIn("action=set_cash", text)
+
+    def test_sync_hint_empty_when_no_success(self):
+        """全部失败时不提示（避免噪音）。"""
+        import shutil
+        mixin, tmp = self._mixin()
+        try:
+            self.assertEqual(
+                mixin._sync_cash_hint([{"status": "error", "message": "x"}]), "")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sync_hint_skips_error_rows_with_recorded(self):
+        """带 recorded 但状态为 error 的笔不计入（避免算进未落账的钱）。"""
+        import shutil
+        mixin, tmp = self._mixin(1000.0)
+        try:
+            text = mixin._sync_cash_hint([
+                {"status": "ok", "recorded": {"cash_delta": -100.0}},
+                {"status": "error", "recorded": {"cash_delta": -999.0}},
+            ])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIn("-100.00", text)
+        self.assertNotIn("999", text)
+
+
 class TestNoShadowedModuleAliases(unittest.TestCase):
     """函数内局部赋值不得遮蔽同名的模块级别名（静态 AST 扫描）。
 
