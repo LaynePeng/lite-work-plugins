@@ -5701,11 +5701,15 @@ class TestHotReload(unittest.TestCase):
         用例连带失败）。所以 `_purge_sibling_modules` 接受 modules/here
         参数，这里传一个假表 + 假目录。
         """
-        here = "/fake/plugin/dir"
+        # ⚠️ 假路径必须过 `os.path.abspath`：生产代码是拿 abspath 后的
+        # dirname 做相等比较的。手写 POSIX 字面量在 Linux 上恰好相等，
+        # 在 Windows 上 `/fake/plugin/dir` 会被 abspath 成
+        # `C:\\fake\\plugin\\dir`，与字面量 _here 永不相等 → 本用例假阴性失败。
+        here = os.path.abspath("/fake/plugin/dir")
         fake_sib = types.ModuleType("astock_fake_sibling")
         fake_sib.__file__ = os.path.join(here, "astock_fake_sibling.py")
         fake_other = types.ModuleType("astock_fake_elsewhere")
-        fake_other.__file__ = "/tmp/elsewhere/astock_fake_elsewhere.py"
+        fake_other.__file__ = os.path.abspath("/tmp/elsewhere/astock_fake_elsewhere.py")
         fake_entry = types.ModuleType("litework_plugin_astock")
         fake_entry.__file__ = os.path.join(here, "plugin.py")
         mods = {"astock_fake_sibling": fake_sib,
@@ -5726,11 +5730,13 @@ class TestHotReload(unittest.TestCase):
     def test_purge_keeps_host_modules(self):
         """宿主模块、标准库都不在清理范围（假表上验证）。"""
         import sys
-        here = "/fake/plugin/dir"
+        # 同 test_purge_drops_sibling_modules：假路径必须与生产代码同为
+        # abspath 口径，否则 Windows 上路径分隔符不同会假阴性失败。
+        here = os.path.abspath("/fake/plugin/dir")
         fake = types.ModuleType("astock_fake")
         fake.__file__ = os.path.join(here, "astock_fake.py")
         host = types.ModuleType("litework")
-        host.__file__ = "/somewhere/litework/__init__.py"
+        host.__file__ = os.path.abspath("/somewhere/litework/__init__.py")
         mods = {"astock_fake": fake, "litework": host, "sys": sys}
 
         dropped = astock._purge_sibling_modules(mods, here)
