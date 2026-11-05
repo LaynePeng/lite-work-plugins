@@ -157,6 +157,11 @@ except ImportError:  # 旧宿主降级
 # 自己能做的就是在入口处清掉**属于本插件目录**的模块名，让下面的 import
 # 重新执行。只清"文件位于本目录内"的模块，不误伤第三方依赖与宿主模块。
 #
+# **lite-work >= 2.1.3 已从宿主侧修好**（内容哈希判变更 → 删旧 .pyc + 清
+# 兄弟模块）。所以下面那次自清现在按能力探测开关：新宿主跳过，旧宿主保留。
+# 另注意第 ② 层字节码缓存：CPython 判 .pyc 新鲜只看 mtime（秒级）+ 大小，
+# 覆盖安装若等长且同秒写盘会执行旧字节码——那层插件清不掉，只能宿主修。
+#
 # 注意：清 sys.modules 只影响**后续 import**，本进程里已存在的旧类实例
 # （旧插件对象）不受影响——那本来就该由宿主丢弃重建，二者配合才完整。
 def _purge_sibling_modules(modules: Optional[Dict[str, Any]] = None,
@@ -192,7 +197,45 @@ def _purge_sibling_modules(modules: Optional[Dict[str, Any]] = None,
     return dropped
 
 
-_purged = _purge_sibling_modules()
+def _host_purges_siblings() -> bool:
+    """宿主是否已自行处理「兄弟模块不重载」（lite-work >= 2.1.3）。
+
+    新宿主在 `plugin_loader._load_module` 里按**源文件内容哈希**判断变更，
+    变了才删旧 .pyc 并移出本插件目录的 sys.modules 条目——本文件下面那次
+    自清因此变成纯粹浪费：实测源码没变也每次重新 import 全部 35 个模块，
+    单插件把 load_plugins 从 1~2ms 拖到 13~17ms，且宿主每个入口
+    （工具装配/权限换算/插件列表）都各自触发一次。
+
+    但**旧宿主必须继续自清**——那是它们的唯一防线（否则升级后行为不变，
+    只能重启 Core）。所以这里按能力探测开关，两个信号任一命中即认为
+    宿主会处理；任何异常都退回保守分支（自己清），宁可多花 15ms 也不能
+    让旧宿主上的升级失效。
+    """
+    try:
+        from litework.tools import plugin_loader as _pl
+        if hasattr(_pl, "_purge_plugin_modules"):
+            return True          # 能力探测：比版本号更可靠（可被打补丁/回移）
+    except Exception:            # noqa: BLE001 - 探测失败 = 保守处理
+        return False
+    try:
+        from litework import __version__ as _v
+    except Exception:            # noqa: BLE001
+        return False
+    parts = []
+    for seg in str(_v).split("-")[0].split(".")[:3]:
+        if not seg.isdigit():
+            return False         # 无法解析 → 保守
+        parts.append(int(seg))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts) >= (2, 1, 3)
+
+
+if _host_purges_siblings():
+    # 新宿主自行处理，跳过自清（省掉每次全量重新 import）
+    _purged = []
+else:
+    _purged = _purge_sibling_modules()
 if _purged:
     logger_early = logging.getLogger("litework.plugins.astock")
     logger_early.debug("[astock] 热重载：已清理 %d 个旧子模块", len(_purged))
@@ -313,8 +356,60 @@ class _SimpleApp:
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config if isinstance(config, dict) else {}
 
-    def save_config(self, _updates: Dict[str, Any]) -> None:
-        """占位：盯梢路径不写配置（不申请宿主未授权的能力）。"""
+    def save_config(self, updates: Dict[str, Any]) -> None:
+        """写配置：**就地更新 config** 并尽力落盘（动作按钮依赖它）。
+
+        此前这里是空占位（"盯梢路径不写配置"）。但 `on_config_changed` 在
+        实例未 install 时会拿本类兜底，而 `settings_action`（盯盘开关按钮）
+        随后就经 `_save_plugin_config` 走到这里——空实现等于**点了没反应**：
+        返回"写入成功"但配置没变，重启后开关又弹回原值（真实缺陷）。
+
+        落盘策略与宿主 `_write_config_merged` 一致：读磁盘现有内容再把本
+        命名空间合并进去（内存优先），避免整块替换抹掉其他插件配置。
+        写盘失败不影响内存生效，但会记 debug——调用方按"已生效"继续。
+        """
+        if not isinstance(updates, dict):
+            return
+        for k, v in updates.items():
+            if v is None:
+                continue
+            if k == PLUGIN_NAME and isinstance(v, dict):
+                cur = self.config.get(PLUGIN_NAME)
+                merged = dict(cur) if isinstance(cur, dict) else {}
+                merged.update(v)
+                self.config[PLUGIN_NAME] = merged
+            else:
+                self.config[k] = v
+        self._flush_to_disk()
+
+    def _flush_to_disk(self) -> None:
+        """把内存 config 合并进 config.json（尽力而为，失败只记 debug）。
+
+        注意局部变量**不能叫 `data`**：本模块有顶层别名 `import astock_data
+        as data`，同名局部赋值会让整个函数把它当局部变量（UnboundLocalError）。
+        仓库的 TestNoShadowedModuleAliases 静态检查正是为此存在。
+        """
+        try:
+            import json as _json
+            cfg_dir = (os.environ.get("LITEWORK_CONFIG_DIR")
+                       or os.path.join(os.path.expanduser("~"), ".lite-work"))
+            path = os.path.join(cfg_dir, "config.json")
+            disk_cfg: Dict[str, Any] = {}
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = _json.load(f)
+                if isinstance(loaded, dict):
+                    disk_cfg = loaded
+            except (OSError, ValueError):
+                disk_cfg = {}
+            disk_cfg.update(self.config)      # 内存优先，磁盘多出来的键保留
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(disk_cfg, f, ensure_ascii=False, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except Exception:                     # noqa: BLE001 - 落盘失败不阻断内存生效
+            logger.debug("[astock] 兜底配置落盘失败", exc_info=True)
 
 
 class AStockWatch(WatchSource):
@@ -918,7 +1013,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.8.0"
+    version = "2.8.1"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
@@ -1235,9 +1330,13 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         由 settings_action 的 watch_toggle 与 astock_watch start/stop 维护；
         探针每次探测都现读 config，无需重建。
         """
-        # 宿主传全量 config：以它为准则能覆盖「实例尚未绑定 app」的场景
-        if self._app is None and isinstance(config, dict):
-            self._app = _SimpleApp(config)
+        # 宿主传全量 config：以它为准则能覆盖「实例尚未绑定 app」的场景。
+        # 必须**每次都换新**（与 email-plugin 同一坑）：首次保存造出的兜底
+        # 快照不会自己跟着 config 更新，第二次保存后仍读到上一版配置，
+        # 表现为「改完配置没生效」，且重试也无效。真实宿主 app 对象不动。
+        if self._app is None or isinstance(self._app, _SimpleApp):
+            if isinstance(config, dict):
+                self._app = _SimpleApp(config)
         self._apply_runtime_config()
 
     def install(self, kernel) -> None:
@@ -1695,6 +1794,13 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         Markdown 与 lite-tree 两种**只读**渲染，卡片/Markdown 都点不了；
         插件唯一能提供的可点击控件就是这里的 `type: "action"` 按钮。
         """
+        # 动作按钮走的是**未 install** 的实例（宿主 `plugin_settings_action`
+        # 只 `plugin_by_name` 取实例，不经过内核装配），`_app` 常为 None。
+        # 不兜底就会一路报到 `_save_plugin_config` 的"宿主未提供 save_config"，
+        # 用户点了「暂停盯盘」只看到一句报错（真实缺陷）。这里用宿主传进来的
+        # **全量 config** 造兜底 app，其 save_config 会就地更新并落盘。
+        if self._app is None and isinstance(config, dict):
+            self._app = _SimpleApp(config)
         own = (config or {}).get(PLUGIN_NAME) if isinstance(config, dict) else {}
         own = own if isinstance(own, dict) else {}
         if key == "email_test_send":
@@ -1908,15 +2014,63 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         return {"ok": sent, "message": ("测试邮件" + detail) if sent else detail}
 
     def _save_plugin_config(self, updates: Dict[str, Any]) -> str:
+        """写插件配置：**读出当前整块再合并**，绝不整块替换。
+
+        为什么必须合并（真实事故，用户数据被抹）：宿主 `save_config` 对插件
+        命名空间是**整块替换**语义（`self.config[k] = v`），不做浅合并。
+        本方法此前直接 `save_config({PLUGIN_NAME: {"watch_enabled": want}})`
+        ——只提交一个键，于是 `astock-plugin` 下其余 20+ 项设置（佣金/印花税/
+        止损止盈/缓存 TTL/台账路径/邮件通知…）**全部被抹掉**，用户表现为
+        「升级/点了盯盘开关后配置被重置」。
+
+        实测证据：本机两份事故备份里 `astock-plugin` 都只剩
+        `{"watch_enabled": true}`，其他 25 个键消失。
+
+        合并基准取**内存 config 优先、磁盘兜底**：内存是最新事实源，但实例
+        未绑定 app 或内存缺该命名空间时磁盘才是真值。
+        """
         app = self._app
         if app is None or not hasattr(app, "save_config"):
             return "宿主未提供 save_config"
+        merged = self._current_plugin_cfg()
+        merged.update(updates)
         try:
-            app.save_config({PLUGIN_NAME: dict(updates)})
+            app.save_config({PLUGIN_NAME: merged})
             return ""
         except Exception as exc:            # 权限/校验失败都要可读
             logger.warning("[astock] 写配置失败: %s", exc)
             return f"{type(exc).__name__}: {exc}"
+
+    def _current_plugin_cfg(self) -> Dict[str, Any]:
+        """取本插件配置命名空间的当前整块（内存优先，磁盘兜底）。
+
+        内存里已有该命名空间就用它——那是宿主与设置页都在用的同一份对象，
+        最新且含未落盘的键；否则读 config.json（插件实例未绑定宿主 app 的
+        渲染/动作路径）。都取不到时返回空 dict。
+        """
+        own = None
+        try:
+            cfg = getattr(self._app, "config", None)
+            if isinstance(cfg, dict):
+                own = cfg.get(PLUGIN_NAME)
+        except Exception:                   # noqa: BLE001 - 读不到就走磁盘
+            own = None
+        if isinstance(own, dict) and own:
+            return dict(own)
+        # 磁盘兜底：与 astock_notify 同一条路径推法（LITEWORK_CONFIG_DIR 优先）
+        try:
+            import json as _json
+            cfg_dir = (os.environ.get("LITEWORK_CONFIG_DIR")
+                       or os.path.join(os.path.expanduser("~"), ".lite-work"))
+            with open(os.path.join(cfg_dir, "config.json"), "r",
+                      encoding="utf-8") as f:
+                disk = _json.load(f)
+            disk_own = disk.get(PLUGIN_NAME) if isinstance(disk, dict) else None
+            if isinstance(disk_own, dict):
+                return dict(disk_own)
+        except Exception:                   # noqa: BLE001 - 读盘失败 = 空合并基准
+            logger.debug("[astock] 读磁盘配置失败，按空基准合并", exc_info=True)
+        return dict(own) if isinstance(own, dict) else {}
 
 
 

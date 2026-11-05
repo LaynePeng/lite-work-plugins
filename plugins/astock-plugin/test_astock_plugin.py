@@ -5501,6 +5501,252 @@ class TestHotReload(unittest.TestCase):
         self.assertIn("litework", mods)
         self.assertIn("sys", mods)
 
+    def test_host_purge_detection_by_attribute(self):
+        """宿主暴露 _purge_plugin_modules 时判定为「宿主会处理」。"""
+        import sys as _sys
+        import types as _types
+
+        fake_pl = _types.ModuleType("litework.tools.plugin_loader")
+        fake_pl._purge_plugin_modules = lambda d: []
+        fake_tools = _types.ModuleType("litework.tools")
+        fake_tools.plugin_loader = fake_pl
+        saved = {k: _sys.modules.get(k) for k in
+                 ("litework.tools", "litework.tools.plugin_loader")}
+        _sys.modules["litework.tools"] = fake_tools
+        _sys.modules["litework.tools.plugin_loader"] = fake_pl
+        try:
+            self.assertTrue(astock._host_purges_siblings())
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    _sys.modules.pop(k, None)
+                else:
+                    _sys.modules[k] = v
+
+    def test_host_purge_detection_falls_back_on_old_host(self):
+        """旧宿主（无该函数、版本 < 2.1.3）→ 必须继续自清。"""
+        import sys as _sys
+        import types as _types
+
+        fake_pl = _types.ModuleType("litework.tools.plugin_loader")  # 无 _purge_plugin_modules
+        fake_tools = _types.ModuleType("litework.tools")
+        fake_tools.plugin_loader = fake_pl
+        fake_lw = _types.ModuleType("litework")
+        fake_lw.__version__ = "2.0.7"
+        saved = {k: _sys.modules.get(k) for k in
+                 ("litework", "litework.tools", "litework.tools.plugin_loader")}
+        _sys.modules["litework"] = fake_lw
+        _sys.modules["litework.tools"] = fake_tools
+        _sys.modules["litework.tools.plugin_loader"] = fake_pl
+        try:
+            self.assertFalse(astock._host_purges_siblings(),
+                             "旧宿主上跳过自清会让升级失效，必须保守返回 False")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    _sys.modules.pop(k, None)
+                else:
+                    _sys.modules[k] = v
+
+    def test_host_purge_detection_by_version(self):
+        """无能力探测信号时，版本 >= 2.1.3 也判为宿主会处理。"""
+        import sys as _sys
+        import types as _types
+
+        fake_pl = _types.ModuleType("litework.tools.plugin_loader")
+        fake_tools = _types.ModuleType("litework.tools")
+        fake_tools.plugin_loader = fake_pl
+        fake_lw = _types.ModuleType("litework")
+        fake_lw.__version__ = "2.1.3"
+        saved = {k: _sys.modules.get(k) for k in
+                 ("litework", "litework.tools", "litework.tools.plugin_loader")}
+        _sys.modules["litework"] = fake_lw
+        _sys.modules["litework.tools"] = fake_tools
+        _sys.modules["litework.tools.plugin_loader"] = fake_pl
+        try:
+            self.assertTrue(astock._host_purges_siblings())
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    _sys.modules.pop(k, None)
+                else:
+                    _sys.modules[k] = v
+
+
+
+class TestPluginConfigWriteKeepsSiblings(unittest.TestCase):
+    """写单个配置项**不能**抹掉同命名空间的其他项（真实事故回归）。
+
+    事故：用户点「启动/暂停盯盘」或插件升级后，`astock-plugin` 下除
+    `watch_enabled` 之外的 20+ 项设置（佣金/印花税/止损止盈/缓存 TTL/
+    台账路径/邮件通知…）全部消失，表现为「配置被重置」。本机事故备份里
+    该命名空间只剩 `{"watch_enabled": true}`。
+
+    根因：宿主 `AgentApp.save_config` 对**插件命名空间是整块替换**
+    （`self.config[k] = v`，不是浅合并），而 `_save_plugin_config` 此前
+    只提交 `{"watch_enabled": want}` 一个键。
+
+    ⚠️ 这里刻意用「整块替换」的假宿主：仓库里既有 `_HostStub.save_config`
+    是**浅合并**语义，正因为它比真宿主宽容，这个 bug 才一直没被测出来。
+    """
+
+    def _plugin_with_host(self, initial):
+        """构造插件 + 模拟真实宿主（save_config 整块替换命名空间）。"""
+        plugin = astock.AstockPlugin()
+
+        class Host:
+            workspace = "/tmp"
+
+            def __init__(self):
+                self.config = {"astock-plugin": dict(initial)}
+                self.other = {"llm": {"model": "x"}}   # 其他命名空间不能被碰
+                self.config.update(self.other)
+
+            def save_config(self, upd):
+                # 与 AgentApp.save_config 一致：整块替换，不做命名空间内合并
+                self.config.update({k: v for k, v in upd.items() if v is not None})
+
+        host = Host()
+        plugin._app = host
+        return plugin, host
+
+    def test_single_key_write_preserves_other_keys(self):
+        """只写 watch_enabled，其余键必须原样保留——本用例钉死该事故。"""
+        initial = {
+            "watch_enabled": True,
+            "ledger_path": "/my/ledger.sqlite",
+            "commission_rate": 0.00025,
+            "min_commission": 5,
+            "stop_loss_pct": 8,
+            "take_profit_pct": 15,
+            "email_notify_enabled": True,
+            "email_to": "me@x.com",
+            "quote_cache_ttl": 3,
+            "kline_cache_ttl": 60,
+        }
+        plugin, host = self._plugin_with_host(initial)
+
+        err = plugin._save_plugin_config({"watch_enabled": False})
+
+        self.assertEqual(err, "")
+        after = host.config["astock-plugin"]
+        self.assertIs(after["watch_enabled"], False)
+        for k, v in initial.items():
+            if k == "watch_enabled":
+                continue
+            self.assertEqual(after.get(k), v, f"配置项 {k} 被抹掉了")
+        self.assertEqual(len(after), len(initial), f"键数变了：{after}")
+
+    def test_write_does_not_touch_other_namespaces(self):
+        """只改本插件命名空间，别的插件的配置不能受影响。"""
+        plugin, host = self._plugin_with_host({"watch_enabled": True})
+        plugin._save_plugin_config({"watch_enabled": False})
+        self.assertEqual(host.config["llm"], {"model": "x"})
+
+    def test_write_falls_back_to_disk_when_memory_missing(self):
+        """实例内存里没有该命名空间时，合并基准取磁盘 config.json。
+
+        插件动作路径（settings_action）拿到的 app 可能没装插件配置；
+        此时若按空基准合并，同样会把用户的配置抹掉。
+        """
+        import json as _json
+        tmp = tempfile.mkdtemp(prefix="lw-astock-cfg-")
+        orig_env = os.environ.get("LITEWORK_CONFIG_DIR")
+        os.environ["LITEWORK_CONFIG_DIR"] = tmp
+        disk_cfg = {"watch_enabled": True, "ledger_path": "/d/l.sqlite",
+                    "email_to": "d@x.com"}
+        with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+            _json.dump({"astock-plugin": disk_cfg}, f)
+        try:
+            plugin = astock.AstockPlugin()
+
+            class Host:      # 内存里没有 astock-plugin 命名空间
+                workspace = "/tmp"
+                config = {}
+
+                def save_config(self, upd):
+                    self.config.update(upd)
+
+            host = Host()
+            plugin._app = host
+            plugin._save_plugin_config({"watch_enabled": False})
+            after = host.config["astock-plugin"]
+        finally:
+            if orig_env is None:
+                os.environ.pop("LITEWORK_CONFIG_DIR", None)
+            else:
+                os.environ["LITEWORK_CONFIG_DIR"] = orig_env
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        self.assertIs(after["watch_enabled"], False)
+        self.assertEqual(after.get("ledger_path"), "/d/l.sqlite")
+        self.assertEqual(after.get("email_to"), "d@x.com")
+
+
+    def test_simple_app_save_config_persists(self):
+        """`_SimpleApp.save_config` 必须真的写：动作按钮靠它生效。
+
+        此前是空占位（"盯梢路径不写配置"），而 `settings_action` 在实例未
+        install 时会用它兜底——于是点「暂停盯盘」返回成功、配置却没变，
+        重启后开关弹回原值。
+        """
+        import json as _json
+        tmp = tempfile.mkdtemp(prefix="lw-astock-simple-")
+        orig_env = os.environ.get("LITEWORK_CONFIG_DIR")
+        os.environ["LITEWORK_CONFIG_DIR"] = tmp
+        cfg = {"astock-plugin": {"watch_enabled": True, "email_to": "a@x.com"},
+               "llm": {"model": "keep-me"}}
+        with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+            _json.dump(cfg, f)
+        try:
+            app = astock._SimpleApp({"astock-plugin": dict(cfg["astock-plugin"])})
+            app.save_config({"astock-plugin": {"watch_enabled": False}})
+            self.assertIs(app.config["astock-plugin"]["watch_enabled"], False)
+            self.assertEqual(app.config["astock-plugin"]["email_to"], "a@x.com")
+            disk = _json.load(open(os.path.join(tmp, "config.json"), encoding="utf-8"))
+            self.assertIs(disk["astock-plugin"]["watch_enabled"], False)
+            self.assertEqual(disk["astock-plugin"].get("email_to"), "a@x.com",
+                             "整块替换会抹掉兄弟键")
+            self.assertEqual(disk.get("llm"), {"model": "keep-me"},
+                             "其他插件命名空间不能被碰")
+        finally:
+            if orig_env is None:
+                os.environ.pop("LITEWORK_CONFIG_DIR", None)
+            else:
+                os.environ["LITEWORK_CONFIG_DIR"] = orig_env
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_settings_action_works_without_install(self):
+        """动作按钮走未 install 的实例（`_app` 为 None）也必须能写配置。
+
+        宿主 `plugin_settings_action` 只 `plugin_by_name` 取实例、不经内核装配，
+        不兜底就会报"宿主未提供 save_config"——用户只看到一句报错。
+        """
+        import json as _json
+        tmp = tempfile.mkdtemp(prefix="lw-astock-act-")
+        orig_env = os.environ.get("LITEWORK_CONFIG_DIR")
+        os.environ["LITEWORK_CONFIG_DIR"] = tmp
+        cfg = {"astock-plugin": {"watch_enabled": True, "stop_loss_pct": 8}}
+        with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+            _json.dump(cfg, f)
+        try:
+            plugin = astock.AstockPlugin()
+            self.assertIsNone(plugin._app)      # 未 install
+            res = plugin.settings_action("watch_toggle", cfg)
+            self.assertTrue(res.get("ok"), res.get("message"))
+            self.assertIs(res.get("watch_enabled"), False)
+            disk = _json.load(open(os.path.join(tmp, "config.json"), encoding="utf-8"))
+            self.assertIs(disk["astock-plugin"]["watch_enabled"], False)
+            self.assertEqual(disk["astock-plugin"].get("stop_loss_pct"), 8)
+        finally:
+            if orig_env is None:
+                os.environ.pop("LITEWORK_CONFIG_DIR", None)
+            else:
+                os.environ["LITEWORK_CONFIG_DIR"] = orig_env
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestMixinModuleImports(unittest.TestCase):
