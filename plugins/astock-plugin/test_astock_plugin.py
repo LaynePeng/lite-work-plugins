@@ -1234,6 +1234,57 @@ class TestWatchScopeVisibility(unittest.TestCase):
         self.assertEqual([r["code"] for r in self._rules_now()], ["002532"],
                          "rules 整体替换生效，add_rules 被忽略")
 
+    # ---- 阈值：写得进、看得见、真的生效（v2.8.3）----
+    #
+    # 三件事原本都是断的：
+    # ① probe 不读计划里的阈值（只读设置页）→ 改了没反应；
+    # ② status 把阈值键报成「未识别键 → 探针不会读」→ 让人以为配置坏了；
+    # ③ 工具侧根本没有写入口 → 想改也只能进 GUI。
+    # 修好 ① 之后必须同时补 ③，否则"能生效但改不了"依然是个死胡同。
+
+    def test_set_rules_writes_threshold(self):
+        self._seed({})
+        out = self._call({"action": "set_rules", "stop_loss_pct": 3})
+        cfg = self.app.schedule_store.all()[0].probe_config
+        self.assertEqual(float(cfg["stop_loss_pct"]), 3.0)
+        self.assertIn("阈值已写入计划", out)
+        self.assertIn("止损 -%", out)
+
+    def test_set_rules_threshold_does_not_clear_rules(self):
+        """写阈值不能把已有价位规则冲掉（整体覆盖是最典型的误操作）。"""
+        self._seed({"rules": self.RULES})
+        self._call({"action": "set_rules", "take_profit_pct": 12})
+        cfg = self.app.schedule_store.all()[0].probe_config
+        self.assertEqual(len(cfg["rules"]), len(self.RULES))
+        self.assertEqual(float(cfg["take_profit_pct"]), 12.0)
+
+    def test_plan_shows_threshold_layers(self):
+        """`action=plan` 必须摊开三层：谁会生效、设置页的值被谁压过。"""
+        self.app.config["astock-plugin"]["stop_loss_pct"] = 8
+        self._seed({"stop_loss_pct": 3})
+        out = self._call({"action": "plan"})
+        self.assertIn("阈值（计划覆盖 > 设置页 > 默认）", out)
+        self.assertIn("计划覆盖", out)
+        self.assertIn("设置页 8 被压过", out)
+
+    def test_status_warns_about_shadowed_setting(self):
+        """status 也要给出这条警告——「设置页改了没反应」是第一类报障。"""
+        self.app.config["astock-plugin"]["stop_loss_pct"] = 8
+        self._seed({"stop_loss_pct": 3})
+        out = self._call({"action": "status"})
+        self.assertIn("阈值（计划覆盖 > 设置页 > 默认）", out)
+        self.assertIn("被压过", out)
+        self.assertNotIn("未识别键", out)
+
+    def test_status_does_not_call_thresholds_unreadable(self):
+        """六个阈值键写进计划后，status 不得再说「探针不会读」。"""
+        self._seed({"stop_loss_pct": 3, "take_profit_pct": 12,
+                    "trailing_pct": 8, "drop_alert_pct": 4,
+                    "rise_alert_pct": 6, "volume_ratio_alert": 2.5})
+        out = self._call({"action": "status"})
+        self.assertNotIn("未识别键", out)
+        self.assertNotIn("探针不会读", out)
+
 
 class TestWatchPlanApp(unittest.TestCase):
     """`_WatchPlanApp` 测试替身自身的契约（防止替身与真实宿主漂移）。"""
@@ -1632,6 +1683,93 @@ class TestPlanStore(unittest.TestCase):
     def test_bad_side_rejected(self):
         with self.assertRaises(Exception):
             self.ledger.save_plan({"code": "600000", "side": "short"})
+
+
+class TestProbeThresholdOverride(unittest.TestCase):
+    """探针阈值必须**两处都认**（v2.8.3 修的静默失效）。
+
+    真实缺陷：`probe()` 装配 HintsConfig 时只读 `own`（插件设置页），
+    从不读 `cfg`（计划 probe_config）。于是：
+    ① 计划编辑器里改止损/止盈/回撤/异动/量比这 6 个阈值 → **完全不生效，
+       且没有任何报错**（最坏的一类失败：以为配了纪律，其实没生效）；
+    ② `astock_watch status` 每次还刷一句「未识别键…探针不会读」，
+       让人以为配置坏了（实际生效的是设置页的值）。
+
+    根因是同一段函数里两套取值语义：`pick()` 是「cfg 优先、own 兜底」，
+    而 hcfg 那段循环只写了 `own.get(...)`。这一组测试把两层都钉住。
+    """
+
+    def setUp(self):
+        import tempfile, datetime as dt
+        self.tmp = tempfile.mkdtemp(prefix="astock-thr-")
+        self.path = os.path.join(self.tmp, "l.sqlite")
+        lg = ledger_mod(self.path)
+        yday = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        # 成本 10.0、现价 9.5 → 浮亏 -5%：落在「默认 8% 不报 / 收紧到 3% 报」之间
+        lg.record_trade("600000", "buy", 10.0, 1000, trade_date=yday, name="浦发银行")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ctx(self, extra=None):
+        cfg = {"ledger_path": self.path, "watch_enabled": True,
+               "watch_only_trading_hours": False}
+        if extra:
+            cfg.update(extra)
+        return types.SimpleNamespace(
+            config={"astock-plugin": cfg}, workspace=self.tmp)
+
+    def _run(self, plan_cfg=None, own_extra=None, chg=0.0):
+        import asyncio
+        from unittest.mock import patch
+        import astock_data as d
+        from astock_data import Quote
+        q = Quote(code="600000", venue="sh", name="浦发银行", price=9.5,
+                  prev_close=9.5, open=9.5, change_pct=chg,
+                  limit_up=10.45, limit_down=8.55)
+
+        with patch.object(d, "fetch_quotes", lambda items, use_cache=True: [q]):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    astock.AStockWatch().probe(plan_cfg or {}, self._ctx(own_extra)))
+            finally:
+                loop.close()
+
+    def test_plan_threshold_takes_effect(self):
+        """计划里 stop_loss_pct=3 → 浮亏 -5% 必须报止损（现状不会报）。"""
+        default = self._run()
+        self.assertNotIn("stop_loss", default.snapshot, "默认 8% 不该触发")
+        tightened = self._run({"stop_loss_pct": 3})
+        self.assertIn("stop_loss", tightened.snapshot,
+                      "计划里的止损阈值必须生效（早先只读设置页 → 静默失效）")
+
+    def test_plan_threshold_overrides_settings_page(self):
+        """两层都有值时**计划优先**，与 pick() 的语义一致。"""
+        res = self._run({"stop_loss_pct": 3}, own_extra={"stop_loss_pct": 8})
+        self.assertIn("stop_loss", res.snapshot)
+
+    def test_settings_page_still_works_as_fallback(self):
+        """计划没写该键时，设置页的值照旧生效（别把兜底修没了）。"""
+        res = self._run({}, own_extra={"stop_loss_pct": 3})
+        self.assertIn("stop_loss", res.snapshot)
+
+    def test_looser_plan_threshold_also_respected(self):
+        """计划把阈值放宽（8 → 20）也要生效——不能只测"变严"。"""
+        res = self._run({"stop_loss_pct": 20}, own_extra={"stop_loss_pct": 3})
+        self.assertNotIn("stop_loss", res.snapshot)
+
+    def test_event_threshold_from_plan(self):
+        """异动阈值（drop_alert_pct）同样要能由计划覆盖。
+
+        当日 -0.21%：默认 5% 不该报，计划调到 0.1% 后必须报。
+        """
+        loose = self._run({"drop_alert_pct": 0.1}, own_extra={"drop_alert_pct": 5},
+                          chg=-0.21)
+        self.assertIn("event", loose.snapshot)
+        strict = self._run({}, own_extra={"drop_alert_pct": 5}, chg=-0.21)
+        self.assertNotIn("event", strict.snapshot)
 
 
 class TestWatchOptimizations(unittest.TestCase):
@@ -3468,6 +3606,45 @@ class TestBoardRender(unittest.TestCase):
         spec = self._build()
         self.assertEqual([c["name"] for c in spec["columns"]],
                          ["需处理", "持有中", "无需关注"])
+
+    def test_head_distinguishes_holding_return_from_daily_change(self):
+        """首行两个百分比必须**各有标签**，且口径不同（v2.8.3 修）。
+
+        真实误判：天山铝业 cost 11.97、现价 12.19 → 首行显示 +1.84%（相对
+        成本的持仓收益率），而当日实际是 -0.57%。文案却声称首行是「涨跌幅」，
+        于是用户看到的方向与行情相反——已发生多次，一度被误判为行情源问题。
+
+        现在口径为：`持仓 +x%（相对成本）`＋`今日 ±y%（相对昨收）`。
+        """
+        data = {
+            "positions": [{"code": "002532", "name": "天山铝业", "shares": 1000,
+                           "cost_price": 11.97, "available_today": 1000}],
+            "quotes": {"002532": {"price": 12.19, "change_pct": -0.57,
+                                  "prev_close": 12.26}},
+            "total_market_value": 12190.0, "cash": 20000.0,
+            "float_pnl": 220.0, "today_pnl": -70.0,
+        }
+        spec = self._build(data)
+        descs = "\n".join(c["desc"] or "" for col in spec["columns"]
+                          for c in col["cards"])
+        self.assertIn("持仓 +1.84%", descs)          # 相对成本
+        self.assertIn("今日 -0.57%", descs)          # 相对昨收，与行情一致
+        # 绝不能再出现"无标签的裸百分比"——那正是被误读成涨跌幅的形态
+        self.assertNotIn("12.19　+1.84%", descs)
+
+    def test_head_daily_change_dash_when_quote_missing(self):
+        """行情没带 change_pct 时如实显示占位符，不拿成本收益率顶替。"""
+        data = {
+            "positions": [{"code": "600000", "name": "浦发银行", "shares": 100,
+                           "cost_price": 8.0, "available_today": 100}],
+            "quotes": {"600000": {"price": 9.0}},
+            "total_market_value": 900.0, "cash": 0.0,
+            "float_pnl": 100.0, "today_pnl": 0.0,
+        }
+        descs = "\n".join(c["desc"] or "" for col in self._build(data)["columns"]
+                          for c in col["cards"])
+        self.assertIn("今日 -", descs)
+        self.assertIn("持仓 +12.50%", descs)
 
 
 

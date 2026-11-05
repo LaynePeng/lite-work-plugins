@@ -493,10 +493,32 @@ class TestProbeConfigSummary(unittest.TestCase):
         self.assertIn("当天去重 关", text)
 
     def test_summary_flags_unknown_keys(self):
-        """写了探针不读的键 = 静默不生效，必须点出来。"""
-        text = plan.summarize_probe_config({"stop_loss_pct": 8})
+        """写了探针不读的键 = 静默不生效，必须点出来。
+
+        用**真正的未知键**举例（v2.8.3）：早先这里拿 `stop_loss_pct` 当反例，
+        而它其实**会被探针读取**（`probe()` 走 `pick()`，计划优先）——
+        测试因此锁住了一个错误的契约：配置生效、`status` 却说无效。
+        """
+        text = plan.summarize_probe_config({"foo_bar_pct": 8})
         self.assertIn("未识别键", text)
-        self.assertIn("stop_loss_pct", text)
+        self.assertIn("foo_bar_pct", text)
+
+    def test_threshold_keys_are_recognized(self):
+        """六个阈值键必须被认作「可生效」，且摘要里点名覆盖值（v2.8.3）。
+
+        回归背景：探针两处消费 probe_config——`pick()` 决定取值来源，
+        `PROBE_KEYS_READ` 决定 status 会不会报「未识别键」。两处清单不一致时
+        就出现「实际生效但被判为无效」，用户只能靠猜。
+        """
+        keys = ("stop_loss_pct", "take_profit_pct", "trailing_pct",
+                "drop_alert_pct", "rise_alert_pct", "volume_ratio_alert")
+        for k in keys:
+            self.assertIn(k, plan.PROBE_KEYS_READ, f"{k} 应被视为可读键")
+        text = plan.summarize_probe_config({k: 3 for k in keys})
+        self.assertNotIn("未识别键", text)
+        self.assertIn("阈值覆盖", text)
+        self.assertIn("止损 -% 3", text)
+        self.assertIn("放量量比 3", text)
 
     def test_summary_empty_config(self):
         self.assertEqual(plan.summarize_probe_config({}), "")

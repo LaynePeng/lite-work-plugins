@@ -170,6 +170,12 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
         shares = int(p.get("shares") or 0)
         cost = float(p.get("cost_price") or 0)
         pnl = (price - cost) * shares
+        # `pct` 是**相对成本的持仓收益率**，不是当日涨跌幅——两者经常反号
+        # （成本上方浮盈、当日却在跌）。早先首行只写 `_pct(pct)` 且文案声称
+        # 是「涨跌幅」，于是天山铝业 cost 11.97/现价 12.19 显示 +1.84%，
+        # 实际当日 -0.57%：涨跌方向与行情相反，用户多次误判。
+        # 现在两个数都写、各自带标签：持仓收益率（相对成本）＋ 今日涨跌幅
+        # （相对昨收，q.change_pct）。标签是必须的——单看数字没人能分辨口径。
         pct = pct_change(price, cost)
         hs = hint_builder(p, q, hints_cfg, total_market_value=total_mv,
                           total_equity=total_equity)
@@ -178,7 +184,8 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
             hs.append(t1)
         hs = [h for h in hs if h.kind in ACTION_KINDS]
 
-        head = (f"{_f(price)}　{_pct(pct)}　｜　{shares} 股 · 成本 "
+        head = (f"{_f(price)}　持仓 {_pct(pct)}　｜　今日 {_pct(q.get('change_pct'))}"
+                f"　｜　{shares} 股 · 成本 "
                 f"{_f(cost, 3)} · 浮盈 {_f(pnl)} · 可卖 "
                 f"{int(p.get('available_today') or 0)}")
         if hs:
@@ -193,7 +200,7 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
             buckets[COLUMN_URGENT].append(card)
         else:
             # tag 只有一个位置：放"仓位占比"（组合层面最有用的风险指标）。
-            # 收益率已在 desc 首行，重复写会浪费 tag
+            # 收益率已经在 desc 首行（带「持仓/今日」标签），重复写会浪费 tag
             # （踩过：tag 写成 "占仓 3.18" 其实是收益率 3.18%，语义完全错）。
             weight = (shares * price / total_equity * 100) if total_equity > 0 else None
             buckets[COLUMN_HOLDING].append({

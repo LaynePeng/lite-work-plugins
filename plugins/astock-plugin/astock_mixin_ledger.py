@@ -254,7 +254,8 @@ class LedgerToolsMixin:
         # 看板是"扫一眼"的视图，明细数字仍需可核对 → 附一行口径说明
         lines.append(
             f"共 {len(data_['positions'])} 只持仓、"
-            f"{len(watch)} 只自选；卡片首行＝现价/涨跌幅，次行为"
-            f"股数·成本·浮盈·今日可卖，箭头后为该做什么。"
+            f"{len(watch)} 只自选；卡片首行＝现价｜持仓收益率（相对成本）"
+            f"｜今日涨跌幅（相对昨收）｜股数·成本·浮盈·今日可卖，"
+            f"箭头后为该做什么。"
             f"完整数值用 `astock_portfolio action=trades` 或右栏「持仓」面板核对。")
         return "\n".join(lines)

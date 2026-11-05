@@ -563,7 +563,10 @@ def build_tools() -> List[ToolDefinition]:
                 "**plan 看盯盘规则**（probe_config 里的价位规则/代码范围/信号类型/级别，"
                 "带原始 JSON）；\n"
                 "**set_rules 改盯盘规则**（rules 整体替换 | add_rules 追加 | "
-                "remove_rules 按代码删除；也可同时给 codes/kinds/min_level/once_per_day）；"
+                "remove_rules 按代码删除；也可同时给 codes/kinds/min_level/once_per_day，"
+                "以及阈值键 stop_loss_pct/take_profit_pct/trailing_pct/"
+                "drop_alert_pct/rise_alert_pct/volume_ratio_alert——"
+                "**这些阈值键写在计划里会优先生效**，压过设置页的值）；"
                 "同一代码同时传 remove_rules 与 add_rules ＝ **替换**（删除旧规则、保留新规则），"
                 "返回值会写「已替换」而不是「已写入」；改完建议用 action=plan 回读核对；\n"
                 "**start 启动盯盘**（开启定时探测，非交易时段自动跳过不耗 token）；"
@@ -627,6 +630,31 @@ def build_tools() -> List[ToolDefinition]:
                     "once_per_day": {
                         "type": "boolean",
                         "description": "action=set_rules 时顺带设价位规则当天只报一次",
+                    },
+                    # 阈值键（v2.8.3）：探针**确实会读**计划里的这些键
+                    # （cfg 优先、设置页兜底）。此前它们既不可写、又被 status
+                    # 误报成「未识别键」——修好后必须让模型能改，否则用户想调
+                    # 止损线仍只能进 GUI。
+                    "stop_loss_pct": {
+                        "type": "number",
+                        "description": ("止损阈值（%）。浮亏达到该比例报止损。"
+                                        "写入计划后**优先于设置页**；"
+                                        "比设置页更严格时才推荐写（如临时调到 3 做纪律）"),
+                    },
+                    "take_profit_pct": {
+                        "type": "number", "description": "止盈阈值（%），同上",
+                    },
+                    "trailing_pct": {
+                        "type": "number", "description": "移动止盈回撤阈值（%）",
+                    },
+                    "drop_alert_pct": {
+                        "type": "number", "description": "当日跌幅异动阈值（%）",
+                    },
+                    "rise_alert_pct": {
+                        "type": "number", "description": "当日涨幅异动阈值（%）",
+                    },
+                    "volume_ratio_alert": {
+                        "type": "number", "description": "放量提示的量比阈值",
                     },
                 },
                 "required": [],

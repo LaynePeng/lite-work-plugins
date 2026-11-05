@@ -103,6 +103,13 @@ class WatchToolsMixin:
         # 设置页 schema 里也没有这些键），于是精确价位规则成了只有 GUI 能看
         # 的东西——模型想核对或修改都无从下手。
         _append_watch_scope(lines, diag)
+        # 阈值三层视图也塞进 status：「设置页改了止损线没反应」是第一类报障，
+        # 而答案（被计划里的旧副本压过）只有摊开三层才看得见。
+        _thr = self._threshold_view_lines(diag.get("probe_config") or {})
+        if _thr:
+            lines.append("")
+            lines.append("### 阈值（计划覆盖 > 设置页 > 默认）")
+            lines.extend(_thr)
         if plan_note:
             lines.append("")
             lines.append(f"**计划**：{plan_note}")
@@ -197,6 +204,14 @@ class WatchToolsMixin:
         once_on = True if once in (None, "") else plan_ctl._truthy(once)
         lines.append(f"- 当天去重：{'开' if once_on else '关'}")
         lines.append("")
+        # 阈值：**必须显示"计划覆盖 vs 设置页 vs 默认"三层**（v2.8.3）。
+        # 阈值键在计划里也能写（探针 cfg 优先、own 兜底），用户改了计划里的
+        # 止损线之后，没有任何地方能确认它到底赢没赢——这是本页要回答的问题。
+        thr_lines = self._threshold_view_lines(cfg)
+        if thr_lines:
+            lines.append("### 阈值（计划覆盖 > 设置页 > 默认）")
+            lines.extend(thr_lines)
+            lines.append("")
         rules = plan_ctl.describe_rules(cfg, limit=50)
         if rules:
             lines.append(f"### 价位规则（{len(rules)} 条）")
@@ -235,9 +250,23 @@ class WatchToolsMixin:
           症状是该代码规则整条消失、而返回值仍显示"共 N 条"（2026-11-03 真实事故）。
         """
         replace, add, remove = _rules_from_args(args)
-        if replace in (None, "") and not add and not remove:
+        # 阈值键（v2.8.3）：**必须也能从工具侧写**。此前这些键「探针不读」
+        # 所以没提供写入口；修好读取点（probe 走 pick()）之后若不补写入口，
+        # 用户想调止损线仍只能进 GUI——而这几个键恰恰是最常调的。
+        thr_extra: Dict[str, Any] = {}
+        thr_set: List[str] = []
+        for key in plan_ctl._THRESHOLD_KEYS:
+            if args.get(key) in (None, ""):
+                continue
+            thr_extra[key] = args[key]
+            thr_set.append(plan_ctl._THRESHOLD_LABELS.get(key, key))
+        # 守卫必须把阈值算进来：否则「只调阈值」会被当成"什么都没传"直接拒掉，
+        # 而它是一条完全合法的用法。
+        if replace in (None, "") and not add and not remove and not thr_extra:
             return ("[Error] 需要 rules（整体替换）/ add_rules（追加）/ "
-                    "remove_rules（按代码删除）三者之一")
+                    "remove_rules（按代码删除）三者之一，"
+                    "或至少一个阈值键（如 stop_loss_pct）")
+
         # `rules=[]` 是**合法的清空操作**（换成只按百分比阈值盯），
         # 不能与"什么都没传"混为一谈——否则用户想撤掉全部精确价位时无路可走。
         clearing = isinstance(replace, (list, tuple)) and len(replace) == 0
@@ -294,6 +323,7 @@ class WatchToolsMixin:
         for key in ("codes", "kinds", "min_level", "once_per_day"):
             if args.get(key) not in (None, ""):
                 extra[key] = args[key]
+        extra.update(thr_extra)      # 阈值已在前面解析过（含校验守卫），此处只为合并
         if not new_rules and not extra and not clearing:
             return "[Error] 规则为空且没有其它配置项，未做任何修改"
 
@@ -341,6 +371,10 @@ class WatchToolsMixin:
             lines.append(f"⚠️ 本次同时给了 `rules`，已按**整体替换**处理，"
                          f"{skipped} **未生效**（两者互斥，只能选一种写法）。")
             lines.append("")
+        if thr_set and not no_change:
+            lines.append(f"🔧 阈值已写入计划（计划值优先于设置页）：{'、'.join(thr_set)}"
+                         f"　核对用 `action=plan` 的「阈值」表。")
+            lines.append("")
         refreshed = plan_ctl.summarize_probe_config(dict(payload))
         if refreshed:
             lines.append(f"**概览**：{refreshed}")
@@ -356,8 +390,65 @@ class WatchToolsMixin:
         lines.append(f"（{res.get('message')}）")
         return "\n".join(lines)
 
+    def _threshold_view_lines(self, cfg: Dict[str, Any]) -> List[str]:
+        """阈值三层生效视图（计划覆盖 > 设置页 > 默认）。
+
+        为什么值得单独一块：阈值键（止损/止盈/回撤/异动/量比…）在
+        **两处**都能写，而探针是 `cfg` 优先、`own` 兜底。这个语义以前
+        只写在源码注释里，用户看到的却是"改了没反应"——因为改设置页时
+        计划里的旧副本在赢，改计划时探针压根不读（v2.8.3 前的真实现状）。
+        现在把"哪个值生效、它来自哪一层"直接摊开，并给出一句同步动作。
+        """
+        rows: List[List[str]] = []
+        overridden: List[str] = []
+        for key in plan_ctl._THRESHOLD_KEYS:
+            plan_val = cfg.get(key)
+            own_val = _cfg(self._app, key, None)
+            plan_set = plan_val not in (None, "")
+            own_set = own_val not in (None, "")
+            if not plan_set and not own_set:
+                continue          # 两处都没写＝用默认值，不占版面
+            label = plan_ctl._THRESHOLD_LABELS.get(key, key)
+            if plan_set:
+                src = "计划覆盖"
+                if own_set and str(own_val) != str(plan_val):
+                    src += f"（设置页 {own_val} 被压过）"
+                    overridden.append(label)
+            else:
+                src = "设置页"
+            rows.append([label, str(plan_val if plan_set else own_val), src])
+        if not rows:
+            return []
+        out = _table(["阈值", "生效值", "来源"], rows).split("\n")
+        if overridden:
+            out.append("")
+            out.append(f"> ⚠️ {'、'.join(overridden)} 由**计划**覆盖设置页。"
+                       "想让设置页的值生效：再点一次「启动盯盘」同步，"
+                       "或删掉计划里的这些键"
+                       "（`schedule_upsert merge_probe_config` 不适合删键，"
+                       "用计划编辑器清空即可）。")
+        return out
+
     def _probe_cfg(self) -> Dict[str, Any]:
-        """把设置页里与探针相关的阈值带进计划（计划侧优先，设置页兜底）。"""
+        """「启动盯盘」时把设置页的探针相关配置**镜像**进计划（计划侧优先）。
+
+        语义（v2.8.3 起必须理解，否则会踩反向坑）：
+        探针取值是 **计划优先、设置页兜底**（`probe.pick()`）。因此这里抄进
+        计划的那份值，就是"计划的当前值"——它会在计划层压过设置页。
+
+        为什么仍然保留镜像：
+        - 让计划编辑器里能直接看到这些阈值（否则只能去设置页猜"生效的是哪个"）；
+        - 「启动盯盘」顺带成了"把设置页推到计划"的显式同步动作——设置页改了
+          没反应时，点一下就能对齐，这是一条用户已经熟悉的路径。
+
+        镜像带来的**唯一**隐患：改了设置页但没再点「启动盯盘」时，计划里的旧
+        副本会赢（症状仍是"设置页改了没生效"）。这类静默不一致现在会被
+        `astock_watch status` 的「阈值」表逐行点名（设置页 X 被压过），
+        `action=plan` 也给出三层生效视图——可见即可修，不再是黑盒。
+
+        历史：v2.8.3 之前探针**从不读**计划里的这些键（只读设置页），所以镜像
+        一直是死配置，还让 `status` 把它们误报成「未识别键，探针不会读」。
+        """
         keys = ("stop_loss_pct", "take_profit_pct", "trailing_pct",
                 "drop_alert_pct", "rise_alert_pct", "volume_ratio_alert",
                 "min_level")
@@ -460,9 +551,12 @@ def _append_watch_scope(lines: list, diag: Dict[str, Any]) -> None:
         lines.extend(f"- {s}" for s in scope)
 
     lines.append("")
-    lines.append("> 这些内容**只存在于计划的 `probe_config`**（设置页 schema 里没有），"
-                 "改动走 `astock_watch action=set_rules` 或右栏「盯梢」页的计划编辑器；"
-                 "通用通道是 `schedule_upsert merge_probe_config={...}`。")
+    lines.append("> `codes` / `kinds` / `min_level` / `rules` 只存在于计划的 "
+                 "`probe_config`（设置页 schema 里没有），改动走 "
+                 "`astock_watch action=set_rules` 或右栏「盯梢」页的计划编辑器；"
+                 "通用通道是 `schedule_upsert merge_probe_config={...}`。"
+                 "阈值类键（止损/止盈/回撤/异动…）两处都能写，"
+                 "**计划里的值优先**，完整三层视图见 `action=plan`。")
 
 
 def _rules_from_args(args: Dict[str, Any]) -> tuple:

@@ -36,6 +36,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+# 只为拿「哪些阈值键可被计划覆盖」这一份事实源（纯算术模块，零第三方依赖）。
+# 在模块顶层导入而不是延迟导入：两边清单必须一致，"导入失败就退回旧清单"
+# 会悄悄把这个 BUG 请回来。
+from astock_hints import PLAN_OVERRIDE_KEYS
+
 logger = logging.getLogger("litework.astock.plan")
 
 #: 本插件的盯梢源标识（`AStockWatch.source_kind`）。计划里的 `source` 字段。
@@ -400,7 +405,39 @@ def diagnose(app: Any, now_watching: bool, only_hours: bool,
 #: probe_config 里**由插件读取**的键（顺序即展示顺序）。
 #: 与 `AStockWatch.config_schema` / `probe.pick()` 保持一致——这里多一个键会
 #: 让人以为配了就生效（实际探针不读），少一个键则是"配了却看不见"。
-PROBE_KEYS_READ = ("codes", "kinds", "min_level", "rules", "once_per_day")
+#:
+#: v2.8.3：阈值类键（stop_loss_pct / take_profit_pct / trailing_pct /
+#: drop_alert_pct / rise_alert_pct / volume_ratio_alert、加仓减仓档位、
+#: 仓位上限、开关）**确实会被探针读取**（`probe()` 里走 `pick()`，计划优先、
+#: 设置页兜底）。早先这里只登记了 5 个键，于是那 6 个阈值永远被判为
+#: 「未识别键，探针不会读」——**配置生效、文案却说无效**，比不生效更误导人。
+#: 现在阈值清单直接取 `hints.PLAN_OVERRIDE_KEYS`（= HintsConfig 全部字段），
+#: 与实际读取点共用同一份事实源，不再靠两处手工同步。
+PROBE_KEYS_READ = ("codes", "kinds", "min_level", "rules", "once_per_day",
+                   *PLAN_OVERRIDE_KEYS)
+
+#: 摘要里要单独点名的阈值键（用户最常改的那几个；其余字段仍被探针读取，
+#: 只是不在摘要里逐条列，避免一段话长到读不下去）。顺序＝展示顺序。
+_THRESHOLD_KEYS = ("stop_loss_pct", "take_profit_pct", "trailing_pct",
+                   "drop_alert_pct", "rise_alert_pct", "volume_ratio_alert",
+                   "position_cap_pct", "add_step_pct", "reduce_step_pct")
+
+#: 阈值键 → 中文短名（摘要里只显示人关心的那半句话，不显示字段名）。
+_THRESHOLD_LABELS = {
+    "stop_loss_pct": "止损 -%",
+    "take_profit_pct": "止盈 +%",
+    "trailing_pct": "回撤止盈 %",
+    "drop_alert_pct": "大跌异动 -%",
+    "rise_alert_pct": "大涨异动 +%",
+    "volume_ratio_alert": "放量量比",
+    "position_cap_pct": "单票上限 %",
+    "add_step_pct": "加仓档距 %",
+    "reduce_step_pct": "减仓档距 %",
+    "add_max_times": "加仓次数上限",
+    "reduce_max_times": "减仓次数上限",
+    "enable_add": "加仓提示",
+    "enable_reduce": "减仓提示",
+}
 
 
 def _plan_probe_config(sched: Any) -> Dict[str, Any]:
@@ -452,6 +489,15 @@ def summarize_probe_config(cfg: Dict[str, Any]) -> str:
     once = cfg.get("once_per_day")
     if once not in (None, ""):
         parts.append("当天去重 " + ("开" if _truthy(once) else "关"))
+
+    # 阈值覆盖（v2.8.3）：这些键此前被判为"未识别"，实际**确实生效**
+    # （probe 里 cfg 优先、设置页兜底）。既然看得见配置，就要能看见
+    # 「这条计划把哪个阈值改了多少」——否则用户在计划编辑器里改了止损线，
+    # 没有任何地方能确认它到底生效在哪一层。
+    thr = [f"{_THRESHOLD_LABELS.get(k, k)} {cfg[k]}"
+           for k in _THRESHOLD_KEYS if cfg.get(k) not in (None, "")]
+    if thr:
+        parts.append("阈值覆盖 " + "、".join(thr))
 
     known = set(PROBE_KEYS_READ)
     unknown = [k for k in cfg if k not in known]

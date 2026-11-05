@@ -572,7 +572,16 @@ class AStockWatch(WatchSource):
 
         hcfg = hints.HintsConfig()
         for key in hcfg.__dataclass_fields__:
-            raw = own.get(key, getattr(hcfg, key))
+            # **必须走 pick()，不能只读 own**（v2.8.3 修的真实缺陷）：
+            # 阈值类键（stop_loss_pct / take_profit_pct / trailing_pct /
+            # drop_alert_pct / rise_alert_pct / volume_ratio_alert …）同样允许
+            # 单条计划覆盖。早先这里写的是 `own.get(key, …)`，于是
+            # ① 计划编辑器里改了这 6 个阈值 → **完全不生效且无任何报错**；
+            # ② `astock_watch status` 还会把它们列进「未识别键…探针不会读」，
+            #    让人以为配置坏了（实际生效的是设置页的值）。
+            # 上面 pick() 的注释已经写明「两处都认、cfg 优先」，这里漏了贯彻——
+            # 同一段函数内两套取值语义，就是这类静默失效的温床。
+            raw = pick(key, getattr(hcfg, key))
             if isinstance(getattr(hcfg, key), bool):
                 # bool("false") == True —— 配置里存字符串时必须按语义解析，
                 # 否则用户在 config.json 里写 "enable_add": "false" 会变成开启
@@ -1013,7 +1022,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.8.2"
+    version = "2.8.3"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:

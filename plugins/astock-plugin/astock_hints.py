@@ -26,7 +26,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from astock_market import (
     BOARD_LABELS, board_of, calc_fee, FeeConfig, limit_prices, lot_size,
@@ -56,6 +56,16 @@ class HintsConfig:
 
     def as_dict(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+
+#: 可以被**计划级 `probe_config`** 覆盖的键 = 本配置的全部字段。
+#:
+#: 为什么要在数据类旁边显式声明：探针两处消费这份配置——`pick()` 决定
+#: 取值来源（cfg 优先、own 兜底），`PROBE_KEYS_READ` 决定 `astock_watch status`
+#: 会不会把某个键报成「未识别键，探针不会读」。两处若各自维护清单，就会出现
+#: 「实际生效但被判为无效」（v2.8.3 之前的真实状态：6 个阈值键明明该生效，
+#: status 却每次都说探针不读），用户只能靠猜。单一事实源放在这里。
+PLAN_OVERRIDE_KEYS: Tuple[str, ...] = tuple(HintsConfig.__dataclass_fields__)
 
 
 @dataclass
