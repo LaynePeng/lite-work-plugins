@@ -518,6 +518,30 @@ def check_rule_direction(price: float, rule_price: float, op: str
                        f"这条规则不会按预期生效，应改 op 或改价")}
 
 
+def _pick_ma(entry: Any, ma_key: str) -> Optional[float]:
+    """从 ma_map 的单个 code 条目里取出指定均线的值。
+
+    `entry` 可能是嵌套 dict（推荐）或一个扁平的数值（旧形态）。
+    扁平形态下无法判断这个值是不是目标周期，只能**照用**——调用方
+    （`_calc_rule_check`）已保证扁平形态只用于单一周期场景。
+    """
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        val = entry.get(ma_key)
+        if val is None:
+            # 键名大小写/前缀不一致时做一次归一化（ma10 / MA10 / ma_10）
+            norm = ma_key.lower().replace("_", "")
+            for k, v in entry.items():
+                if str(k).lower().replace("_", "") == norm:
+                    return v
+        return val
+    try:
+        return float(entry)
+    except (TypeError, ValueError):
+        return None
+
+
 def check_ma_drift(rule_price: float, ma_value: Optional[float],
                    threshold_pct: float = MA_DRIFT_THRESHOLD_PCT
                    ) -> Dict[str, Any]:
@@ -554,7 +578,18 @@ def check_rule_set(rules: Sequence[Dict[str, Any]],
 
     rules: [{code, price, op, label?, ma_key?}]
     quotes: {code: 现价}
-    ma_map: {code: 当日均线值}（可选，给了才做漂移检查）
+    ma_map: 当日均线值（可选，给了才做漂移检查）。两种形态都支持：
+        · 嵌套 `{code: {"ma10": 11.87, "ma20": 11.76}}`（推荐，可按 ma_key 精确取）
+        · 扁平 `{code: 11.87}`（旧形态，只能配无 ma_key 的规则）
+
+    **只有声明了 `ma_key` 的规则才做漂移检查**（v2.8.4 修）。
+    早先 `ma_key = r.get("ma_key") or code` 有两种灾难性后果：
+      ① 声明了 ma_key 的规则去 `ma_map["ma10"]` 查 → 键不存在 → **静默跳过**，
+         "均线漂移了但没提醒"；
+      ② 没声明 ma_key 的规则回退到 code 键 → 拿到**别的**均线值，
+         于是 `-8%` 硬止损、前低价被人为要求"改成均线价"。
+         照做等于把风控位换成均线价，保护直接失效。
+    固定价规则（硬止损/前低/整数关口）本就不跟随均线，必须原样保留。
 
     这是「每日收盘后规则体检」的可执行版本：方向 + 漂移两项一次跑完。
     **回读只能发现"丢了"，发现不了"写反了"——必须把价格代进去算。**
@@ -576,9 +611,11 @@ def check_rule_set(rules: Sequence[Dict[str, Any]],
         }
         if not direction["ok"]:
             row["problems"].append(direction["reason"])
-        if ma_map:
-            ma_key = r.get("ma_key") or code
-            drift = check_ma_drift(r.get("price"), ma_map.get(ma_key))
+        ma_key = str(r.get("ma_key") or "").strip()
+        if ma_map and ma_key:
+            row["ma_key"] = ma_key
+            drift = check_ma_drift(r.get("price"),
+                                   _pick_ma(ma_map.get(code), ma_key))
             row["drift_pct"] = drift["drift_pct"]
             row["suggest_price"] = drift["suggest"]
             if drift["need_update"]:

@@ -174,30 +174,38 @@ class CalcToolsMixin:
             logger.info("[astock] 规则体检取行情失败: %s", exc)
             return f"[Error] 取行情失败，无法体检（方向校验必须有现价）：{exc}"
 
-        # 均线：给需要漂移检查的标的取 qfq K 线
-        ma_map: Dict[str, Optional[float]] = {}
-        ma_key_map: Dict[str, str] = {}
+        # 均线：只为**声明了 ma_key** 的规则取数（v2.8.4）。
+        # 早先给每只标的都按"第一条带 ma_key 的规则"取一条均线，再让
+        # check_rule_set 用 `r.get("ma_key") or code` 去查——于是：
+        #   · 同标的有多条不同周期规则的，后几条拿到错误周期；
+        #   · 固定价规则（-8% 硬止损/前低）也去查 code 键，被要求"改成均线价"。
+        # 现在按 (code, ma_key) 组合精确取，且只给需要漂移检查的规则取。
+        ma_map: Dict[str, Dict[str, Optional[float]]] = {}
         want_ma = args.get("use_ma", True)
         if want_ma:
-            for code in codes:
-                # 均线基准按规则自己声明的 ma_key 走；没声明才用 ma20 兜底。
-                # **不能用 ma20 一刀切**：天山减仓线的依据是 MA10，拿 MA20 比
-                # 会误报"偏差 -1.8% 需改价"（实际 MA10 只偏 0.37%）。
-                ma_key = "ma20"
-                for r in rules:
-                    if str(r.get("code")) == code and r.get("ma_key"):
-                        ma_key = str(r["ma_key"])
-                        break
-                ma_key_map[code] = ma_key
-                n = int(str(ma_key).replace("ma", "") or 20)
-                try:
-                    bars = await asyncio.to_thread(
-                        data.fetch_klines, code, "day", max(n + 5, 70), "qfq")
-                    closes = [b.close for b in bars if b.close]
-                    ma_map[code] = fx.sma(closes, n)
-                except Exception:
-                    logger.debug("[astock] %s 均线取数失败", code, exc_info=True)
-                    ma_map[code] = None
+            need: Dict[str, set] = {}
+            for r in rules:
+                code = str(r.get("code") or "")
+                ma_key = str(r.get("ma_key") or "").strip()
+                if code and ma_key:
+                    need.setdefault(code, set()).add(ma_key)
+            for code, keys in need.items():
+                per_code: Dict[str, Optional[float]] = {}
+                for ma_key in sorted(keys):
+                    try:
+                        n = int(str(ma_key).replace("ma", "") or 20)
+                    except ValueError:
+                        n = 20
+                    try:
+                        bars = await asyncio.to_thread(
+                            data.fetch_klines, code, "day", max(n + 5, 70), "qfq")
+                        closes = [b.close for b in bars if b.close]
+                        per_code[ma_key] = fx.sma(closes, n)
+                    except Exception:
+                        logger.debug("[astock] %s %s 均线取数失败",
+                                     code, ma_key, exc_info=True)
+                        per_code[ma_key] = None
+                ma_map[code] = per_code
 
         rows = fx.check_rule_set(rules, quotes, ma_map if want_ma else None)
 
@@ -207,7 +215,7 @@ class CalcToolsMixin:
         lines.append("")
         table_rows = []
         for r in rows:
-            mk = ma_key_map.get(r["code"], "MA?") if want_ma else "-"
+            mk = str(r.get("ma_key") or "") if want_ma else ""
             table_rows.append([
                 names.get(r["code"], r["code"]),
                 f"{r['rule_price']}",
@@ -215,7 +223,7 @@ class CalcToolsMixin:
                 _f(r["price"]),
                 _pct(r["distance_pct"]),
                 "✅" if r["direction_ok"] else "❌ 方向失效",
-                mk.upper(),
+                (mk.upper() if mk else "-"),
                 _pct(r.get("drift_pct")) if r.get("drift_pct") is not None else "-",
                 (f"{r['suggest_price']}" if r.get("suggest_price") else "-"),
             ])
@@ -254,9 +262,10 @@ class CalcToolsMixin:
 
             cfg = await asyncio.to_thread(_read)
             rules, _errs = pr.parse_rules((cfg or {}).get("rules"))
-            # 自动推断均线基准：从 label 里认 "MA10/MA20/MA60" 字样。
-            # 计划里的规则大多没写 ma_key，若一律按 MA20 比会误报漂移
-            # （天山 11.55 依据 MA10，按 MA20 算偏差 -1.8%，实际只 -0.37%）。
+            # 自动推断均线基准：**仅当 label 明确写了 MAxx** 才认。
+            # 没写的一律不推断 → 视为固定价规则，不做漂移检查（v2.8.4）。
+            # 早先"没声明就按 ma20 兜底"，把 -8% 硬止损、前低价也拉去
+            # 和 MA20 比，报出"建议改为 6.76"这种会毁掉风控的建议。
             import re as _re
             for r in rules:
                 if r.get("ma_key"):

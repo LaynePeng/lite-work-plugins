@@ -385,6 +385,31 @@ class TestLedgerPosition(LedgerTestBase):
         self.assertGreater(rp["realized_pnl"], 0)
         self.assertEqual(rp["sell_count"], 1)
 
+    def test_meta_realized_pnl_accumulates(self):
+        """回归 v2.8.4：meta 里的已实现盈亏必须**累加**，不能只留最后一笔。
+
+        早先写的是 str(realized) 覆盖，与文件头 docstring 声称的"累加"不符。
+        查询侧走 trades 表 SUM，所以对外数字一直是对的——属潜伏缺陷，
+        任何读 meta 的新代码都会拿到错值。
+        """
+        self.ledger.record_trade("600000", "buy", 10.0, 2000, trade_date="2026-10-20")
+        r1 = self.ledger.record_trade("600000", "sell", 11.0, 500, trade_date="2026-10-21")
+        r2 = self.ledger.record_trade("600000", "sell", 12.0, 500, trade_date="2026-10-22")
+        import sqlite3
+        conn = sqlite3.connect(self.ledger.path)
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='realized_pnl'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "meta 里应写入 realized_pnl")
+        total_meta = float(row[0])
+        expect = round(r1["realized_pnl"] + r2["realized_pnl"], 2)
+        self.assertAlmostEqual(total_meta, expect, places=2)
+        # 与查询侧（trades 表 SUM）一致
+        self.assertAlmostEqual(
+            self.ledger.realized_pnl()["realized_pnl"], total_meta, places=2)
+
     def test_sell_without_position_rejected(self):
         with self.assertRaises(ledger_mod.__init__.__globals__["LedgerError"]):
             self.ledger.record_trade("600000", "sell", 10.0, 100)
@@ -1590,6 +1615,42 @@ class TestConditionalOrders(unittest.TestCase):
         ok, why = orders_mod.reachable_today(p, 10.0, "600000")
         self.assertFalse(ok)
         self.assertIn("今日不可达", why)
+
+    def test_limit_price_uses_prev_close_not_current(self):
+        """回归 v2.8.4：涨跌停 = **昨收** ×(1±板别%)，不是现价。
+
+        事故背景：build_buy_order/build_sell_order 把现价传给 limit_prices
+        的 prev_close 形参，于是涨停价随现价浮动。天山实测：
+        昨收 12.26 → 应为 13.49/11.03，用现价 12.19 算成 13.41/10.97。
+        """
+        o = orders_mod.build_buy_order(
+            "002532", "天山铝业", 12.19, 10000, 8, 15, prev_close=12.26)
+        self.assertAlmostEqual(o.limit_up, 13.49, places=2)
+        self.assertAlmostEqual(o.limit_down, 11.03, places=2)
+
+    def test_limit_price_ignores_current_price_when_prev_given(self):
+        """同一昨收、不同现价 → 涨跌停必须相同（不随现价漂移）。"""
+        o1 = orders_mod.build_sell_order(
+            "002532", "天山铝业", 12.00, 200, 11.97, 8, 15, prev_close=12.26)
+        o2 = orders_mod.build_sell_order(
+            "002532", "天山铝业", 12.50, 200, 11.97, 8, 15, prev_close=12.26)
+        self.assertEqual(o1.limit_up, o2.limit_up)
+        self.assertEqual(o1.limit_down, o2.limit_down)
+
+    def test_etf_limit_price_rounding(self):
+        """ETF 也走 10% 口径，且要按昨收算。"""
+        o = orders_mod.build_buy_order(
+            "510500", "中证500ETF", 6.784, 10000, 8, 15, prev_close=6.661)
+        self.assertAlmostEqual(o.limit_up, 7.33, places=2)
+        self.assertAlmostEqual(o.limit_down, 5.99, places=2)
+
+    def test_index_limit_price_none(self):
+        """回归 v2.8.4：指数涨跌停不该显示 -1.00。"""
+        import astock_data as data
+        self.assertIsNone(data._positive_or_none(-1))
+        self.assertIsNone(data._positive_or_none(0))
+        self.assertIsNone(data._positive_or_none(None))
+        self.assertEqual(data._positive_or_none(13.49), 13.49)
 
     def test_buy_order_whole_lots_and_fees(self):
         o = orders_mod.build_buy_order("600000", "浦发银行", 9.53, 50000, 8, 15)

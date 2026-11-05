@@ -357,10 +357,23 @@ class Ledger:
                 conn.execute("DELETE FROM positions WHERE code=?", (code,))
 
             if realized is not None:
+                # 累加而非覆盖（v2.8.4 修）：本表是"历史累计已实现盈亏"的快照，
+                # 早先直接写 str(realized) 只保留**最后一笔**，与文件头
+                # docstring 声称的"累加"不符。查询侧走 trades 表 SUM 所以
+                # 对外数字一直是对的，属潜伏缺陷——但任何读 meta 的新代码
+                # 都会拿到错值，必须修正。
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM meta WHERE key='realized_pnl'"
+                    ).fetchone()
+                    prev = float(row["value"]) if row else 0.0
+                except (TypeError, ValueError):
+                    prev = 0.0
+                total = round(prev + realized, 2)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('realized_pnl', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=?",
-                    (str(realized), str(realized)))
+                    (str(total), str(total)))
 
         return {
             "code": code,

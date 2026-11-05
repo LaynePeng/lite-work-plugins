@@ -4,6 +4,73 @@
 
 ---
 
+## 0. v2.8.4 修复：涨跌停基准价错 + 规则体检误报（4 处）
+
+全部属于「返回值正常、数字也像对的，但口径错了」——最难自己发现的一类。
+
+### ① 涨跌停价用现价算，法定基准是**昨收**
+
+`limit_prices(prev_close, ...)` 的形参名写着前收，但 `astock_hints.suggest_buy`、
+`astock_orders.stop_loss_price / reachable_today / build_buy_order /
+build_sell_order` 传的都是**现价**。`astock_data` 那条路径是对的（用
+`q.prev_close`），于是同一个插件里**存在两套算法**：`astock_quote` 正确、
+`astock_hint` 错误。
+
+实测偏差（2026-11-05）：
+
+| 标的 | 昨收 | 交易所口径 | 修复前 | 偏差 |
+|---|---|---|---|---|
+| 天山铝业 002532 | 12.26 | 13.49 / 11.03 | 13.41 / 10.97 | 涨停低 0.08 |
+| 中证500ETF 510500 | 6.661 | 7.33 / 5.99 | 7.46 / 6.11 | 涨停高 0.13 |
+
+**感应**：涨停价还随现价浮动——同一只股票、同一昨收，只要现价变了涨跌停就跟着变，
+这在物理上就是错的。
+
+**修法**：给 `build_buy_order` / `build_sell_order` / `stop_loss_price` /
+`reachable_today` / `suggest_buy` 都加 `prev_close` 参数，`astock_mixin_hint`
+从 `q.get("prev_close")` 透传。
+
+### ② 规则体检把「固定价」拉去和均线比，报出会毁风控的建议
+
+`check_rule_set` 里是 `ma_key = r.get("ma_key") or code`，然后
+`ma_map.get(ma_key)`——但 `ma_map` 的键是**股票代码**。后果两条：
+
+| 规则类型 | 实际发生 | 危害 |
+|---|---|---|
+| 声明了 `ma_key` | 去 `ma_map["ma10"]` 查 → 键不存在 → `drift=None` | **静默跳过**，均线漂了也不提醒 |
+| 没声明 `ma_key` | 回退到 `code` 键拿到那条均线 | 被要求"改成均线价" |
+
+第二条最危险：实测把 `11.02`（天山 -8% 硬止损）、`6.20`（中证500 前低止损）
+建议改成 `11.87` / `6.76`。**照做等于把风控位换成均线价，保护直接失效。**
+一份 16 条规则的体检报了"11 条有问题"，其中大半是这种误报。
+
+**修法**：
+- `check_rule_set` 只在规则**显式声明 `ma_key`** 时做漂移检查，固定价规则原样保留；
+- `ma_map` 支持嵌套 `{code: {"ma10": x, "ma20": y}}`，按 (code, ma_key) 精确取；
+- `_calc_rule_check` 只给声明了 ma_key 的 (code, ma_key) 组合取 K 线；
+- `_load_plan_rules` 的 label 推断保留（`跌破11.59(MA10)` 这类**能**认出），
+  但没写 MAxx 的一律不再兜底成 MA20。
+
+### ③ `meta.realized_pnl` 覆盖写而非累加（潜伏）
+
+文件头 docstring 写"卖出时累加到 `realized_pnl`"，实际 SQL 是
+`ON CONFLICT DO UPDATE SET value=str(realized)`，只保留最后一笔。
+查询侧走 `trades` 表 `SUM`，所以**对外数字一直是对的**——属潜伏缺陷，
+任何以后读 meta 的代码都会拿到错值。改成读出旧值再相加。
+
+### ④ 指数涨跌停显示 `-1.00`
+
+腾讯对指数在涨跌停字段返回 `-1`（表示不适用），插件直接透传，于是
+`astock_quote kind=index` 显示"跌停/涨停 −1.00 / −1.00"。加
+`_positive_or_none()`：非正数一律视为"无涨跌停"。
+
+### 回归测试
+
+`test_astock_formula`：固定价规则不参与漂移、声明 ma_key 必须真被检查、`_pick_ma` 双形态
+`test_astock_plugin`：涨跌停按昨收、不随现价漂移、ETF 取整、指数非正数过滤、meta 累加
+
+---
+
 ## 0. v2.8.3 修复：两处「看起来配了、其实没生效」的静默错
 
 这两处都不是崩溃，而是**返回值正常、数字也在，但语义是错的**——所以能活很久。

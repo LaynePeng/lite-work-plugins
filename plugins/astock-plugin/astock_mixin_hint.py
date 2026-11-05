@@ -133,7 +133,8 @@ class HintToolsMixin:
                     cash=snap["data"]["cash"] + 0.0,
                     cfg=cfg, existing_shares=pos_shares,
                     existing_cost=float(pos["cost_price"]) if pos else 0.0,
-                    total_market_value=total_mv, fee_cfg=ledger.fee)
+                    total_market_value=total_mv, fee_cfg=ledger.fee,
+                    prev_close=q.get("prev_close"))
                 lines.append(_table(
                     ["买入估算", "数值"], [
                         ["参考价", f"{est['price']:.2f}"],
@@ -207,12 +208,13 @@ class HintToolsMixin:
                     code, name, float(price), avail,
                     float(pos.get("cost_price") or 0),
                     cfg.stop_loss_pct, cfg.take_profit_pct, cfg.trailing_pct,
-                    fee_cfg=fee)
+                    fee_cfg=fee, prev_close=q.get("prev_close"))
             elif want_buy:
                 order = orders.build_buy_order(
                     code, name, float(price), cash, cfg.stop_loss_pct,
                     cfg.take_profit_pct, cfg.trailing_pct,
-                    cap_amount=cap_amount, fee_cfg=fee)
+                    cap_amount=cap_amount, fee_cfg=fee,
+                    prev_close=q.get("prev_close"))
             if order is None or order.shares <= 0:
                 if order is not None and order.notes:
                     out.append(order.order_block())

@@ -407,12 +407,58 @@ class TestRuleSet(unittest.TestCase):
         self.assertTrue(any("方向" in p for p in by_code["000651"]["problems"]))
 
     def test_with_ma_drift(self):
-        ma = {"002532": 11.593, "000651": 38.545, "600900": 29.408}
-        rows = fx.check_rule_set(self.rules, self.quotes, ma)
+        """声明了 ma_key 才做漂移检查（v2.8.4 语义）。"""
+        rules = [{"code": "000651", "price": 38.60, "op": "lt",
+                  "ma_key": "ma60", "label": "格力"}]
+        ma = {"000651": {"ma60": 38.545}}
+        rows = fx.check_rule_set(rules, self.quotes, ma)
         by_code = {r["code"]: r for r in rows}
         # 格力：方向错 + 38.60 vs MA60 38.545 偏 0.14%（未超阈值）
         self.assertFalse(by_code["000651"]["ok"])
         self.assertIsNotNone(by_code["000651"]["drift_pct"])
+
+    def test_fixed_price_rules_skip_ma_drift(self):
+        """回归 v2.8.4：固定价规则（-8% 硬止损/前低）绝不参与均线漂移。
+
+        事故背景：早先 `ma_key = r.get("ma_key") or code`，未声明 ma_key 的
+        规则会拿 code 键取到**别的**均线值，于是 11.02 的硬止损被建议
+        "改成 11.87"——照做就把风控位换成了均线价，保护直接失效。
+        """
+        rules = [
+            {"code": "002532", "price": 11.02, "op": "lt", "label": "-8%硬止损"},
+            {"code": "510500", "price": 6.20, "op": "lt", "label": "前低止损"},
+        ]
+        quotes = {"002532": 12.19, "510500": 6.784}
+        ma = {"002532": {"ma20": 11.7625}, "510500": {"ma20": 6.7644}}
+        rows = fx.check_rule_set(rules, quotes, ma)
+        for row in rows:
+            self.assertNotIn("drift_pct", row, "固定价规则不应有漂移结论")
+            self.assertIsNone(row.get("suggest_price"),
+                              "固定价规则不应被建议改成均线价")
+            self.assertTrue(row["ok"], "固定价规则不该因漂移被判为有问题")
+
+    def test_declared_ma_key_is_actually_checked(self):
+        """回归 v2.8.4：声明 ma_key 的规则必须**真的**被检查。
+
+        早先 ma_key 被当作 ma_map 的键去查，而 ma_map 的键是股票代码，
+        于是查不到 → drift=None → 静默跳过，"均线漂了也不提醒"。
+        """
+        rules = [{"code": "002532", "price": 11.55, "op": "lt",
+                  "ma_key": "ma10", "label": "MA10 减仓"}]
+        quotes = {"002532": 12.19}
+        ma_nested = {"002532": {"ma10": 11.871, "ma20": 11.7625}}
+        row = fx.check_rule_set(rules, quotes, ma_nested)[0]
+        self.assertIsNotNone(row.get("drift_pct"), "MA10 规则应被检查到")
+        self.assertAlmostEqual(row["drift_pct"], -2.70, places=2)
+        self.assertEqual(row["suggest_price"], 11.87)
+
+    def test_pick_ma_flat_and_nested(self):
+        """_pick_ma 兼容两种 ma_map 形态。"""
+        self.assertEqual(fx._pick_ma({"ma10": 11.87}, "ma10"), 11.87)
+        self.assertEqual(fx._pick_ma({"MA10": 11.87}, "ma10"), 11.87)
+        self.assertEqual(fx._pick_ma(9.99, "ma10"), 9.99)
+        self.assertIsNone(fx._pick_ma(None, "ma10"))
+        self.assertIsNone(fx._pick_ma({"ma20": 1.0}, "ma10"))
 
     def test_missing_quote(self):
         rows = fx.check_rule_set(

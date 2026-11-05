@@ -337,7 +337,8 @@ def suggest_buy(code: str, name: str, price: float, cash: float,
                 cfg: HintsConfig, existing_shares: int = 0,
                 existing_cost: float = 0.0,
                 total_market_value: Optional[float] = None,
-                fee_cfg: Optional[FeeConfig] = None) -> Dict[str, Any]:
+                fee_cfg: Optional[FeeConfig] = None,
+                prev_close: Optional[float] = None) -> Dict[str, Any]:
     """给"想买多少"一个可执行的建议（按单票占比上限与可用资金双重约束）。
 
     返回含 `shares` / `amount` / `fee` / `limit_up` / `limit_down` 的建议，
@@ -347,7 +348,9 @@ def suggest_buy(code: str, name: str, price: float, cash: float,
     if not price or price <= 0:
         raise ValueError("需要有效的最新价才能估算可买数量")
     board = board_of(code)
-    limit_up, limit_down, limit_pct = limit_prices(price, code, name)
+    # 涨跌停基准是**昨收**不是现价（v2.8.4 修）：此前传 price，主板下
+    # 涨停价随现价浮动，且当日涨幅越大错得越多。
+    limit_up, limit_down, limit_pct = limit_prices(prev_close or price, code, name)
 
     equity = (total_market_value or 0) + (cash or 0)
     cap_amount = equity * cfg.position_cap_pct / 100.0 if equity > 0 else 0.0

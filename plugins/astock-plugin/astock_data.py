@@ -376,7 +376,11 @@ def _parse_tencent_line(payload: str, venue: str) -> Optional[Quote]:
         amplitude=num("amplitude"),
         float_mcap=(num("float_mcap") or 0) * 1e8 or None,
         total_mcap=(num("total_mcap") or 0) * 1e8 or None,
-        limit_up=num("limit_up"), limit_down=num("limit_down"),
+        # 腾讯对**指数**在涨跌停字段返回 -1（表示"不适用"），
+        # 直接透传会让 astock_quote 显示"跌停/涨停 -1.00 / -1.00"这种
+        # 不存在的数值（v2.8.4 修）。判据：非正数一律视为"无涨跌停"。
+        limit_up=_positive_or_none(num("limit_up")),
+        limit_down=_positive_or_none(num("limit_down")),
         volume_ratio=num("volume_ratio"),
         trade_time=_fmt_tencent_time(f[_T["time"]] if len(f) > _T["time"] else ""),
         source="tencent",
@@ -392,6 +396,17 @@ def _parse_tencent_line(payload: str, venue: str) -> Optional[Quote]:
         q.limit_down = q.limit_down or down
         q.extra.setdefault("limit_pct", pct)
     return q
+
+
+def _positive_or_none(value: Optional[float]) -> Optional[float]:
+    """涨跌停价：非正数视为"无"（指数/异常源），避免把 -1 当真价格显示。"""
+    try:
+        v = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    if v is None or v <= 0:
+        return None
+    return v
 
 
 def _fmt_tencent_time(raw: str) -> str:
