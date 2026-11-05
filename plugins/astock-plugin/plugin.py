@@ -9,7 +9,7 @@
 AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账数据与邮箱配置，
 属于个人自用型插件——进内置只会增加主程序维护面与体积，没有内置的必要。
 
-工具面（17 个）
+工具面（18 个）
     astock_calc       **公式计算器**（v2.4.0：均线/指标/规则体检/算账/复权/收益回撤比）
     astock_act        **操作指示**（先卖后买 + 资金闭环；照着在券商 App 执行）
     astock_pick       **量化选股 + 买入数量**（全市场扫描→多因子池内打分→换算股数）
@@ -27,6 +27,9 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_events     事件驱动筛股（快讯硬事件→资金印证→背离）
     astock_sync       成交回单同步（粘贴回单→解析多笔→匹配计划→校价→落账）
     astock_watch      自选股增删查 + 盯盘开关
+    astock_extra      **扩展数据面**（v2.9.0：17 类——打板情绪/题材归因/人气热榜/
+                      行业排名/板块资金流/ST 名单/两融/大宗/股东户数/分红/解禁/
+                      龙虎榜/板块归属/筹码分布/事件数据/研究资料/宏观利率）
 
 模块分层（v2.0.0 起；v2.1.2 把装配层再拆细；v2.4.0 加公式库；v2.5.0 加大盘）
     ── 纯函数 / 取数层（喂数据出结果、零网络，便于离线单测）
@@ -39,10 +42,13 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_archive                      本地存档（不复权口径，累积窗口）
     astock_actions                      操作指示（先卖后买）
     astock_data                         行情层（腾讯主源 + 东财 K 线备源）
+    astock_extra_data                    **扩展取数层**（v2.9.0：打板/龙虎榜/
+                                         筹码/事件/资料/宏观，端点位参考
+                                         a-stock-data，实现为 urllib+纯 dict）
     astock_advise                       策略推荐器（三套 → 一句人话结论）
     ── 本插件专用的支撑层（v2.1.2 从本文件拆出）
     astock_common                       配置读取 / 格式化 / 表格（最底层）
-    astock_tools                        17 个工具的 schema 声明（纯静态）
+    astock_tools                        18 个工具的 schema 声明（纯静态）
     astock_panel                        右栏面板渲染（持仓两形态 + 选股对比 + 大盘卡）
     astock_rich                         聊天侧富围栏渲染（kpi + board + table，v2.2.0）
     astock_report                       组合舆情报告 + 事件推荐 + 自选体检
@@ -54,6 +60,8 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_mixin_calc                   **公式工具**（v2.4.0：取数 + 渲染，数学在 astock_formula）
     astock_mixin_sync                   回单同步 + 舆情分析
     astock_mixin_watch                  自选股 + 盯盘开关
+    astock_mixin_extra                  **扩展数据面**（v2.9.0：astock_extra 的
+                                        action 分发 + 渲染；取数在 astock_extra_data）
     astock_mixin_quant                  选股/回测/操作指示/存档
 
     拆这些是为了让本文件只留**装配与业务编排**：面板/报告/声明/工具方法
@@ -264,6 +272,7 @@ from astock_mixin_market import MarketToolsMixin
 from astock_mixin_sync import SyncToolsMixin
 from astock_mixin_quant import QuantToolsMixin
 from astock_mixin_watch import WatchToolsMixin
+from astock_mixin_extra import ExtraToolsMixin
 import astock_notify as notify
 import astock_panel as panel
 import astock_plan as plan_ctl
@@ -1018,11 +1027,12 @@ class AStockWatch(WatchSource):
 class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                    HintToolsMixin, SyncToolsMixin,
                    WatchToolsMixin, QuantToolsMixin, CalcToolsMixin,
+                   ExtraToolsMixin,
                    ToolPlugin):
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.8.4"
+    version = "2.9.0"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
@@ -1050,6 +1060,11 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         # 必须列进来：盘前简报是 read 权限档的无人值守任务，不声明就等于
         # 简报里写了"调 astock_business"，实际却调不到，门槛② 又变回"无法核实"。
         "astock_business",
+        # v2.9.0：扩展数据面（打板情绪/龙虎榜/筹码/事件/资料/宏观）全部是
+        # 只读网络 GET/POST，不写台账、不改计划、不落存档 → 归 read 域。
+        # 列进来的实际收益：盘前/盘后的无人值守简报可以直接引用打板情绪、
+        # 龙虎榜、宏观利率，不必再让用户手动问一遍。
+        "astock_extra",
     ]
 
     #: 大盘看板缓存（v2.5.0）。**放类属性而非实例属性**：插件实例可能被重建
@@ -1639,6 +1654,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             "astock_act": self._tool_act,
             "astock_watch": self._tool_watch,
             "astock_business": self._tool_business,
+            "astock_extra": self._tool_extra,
         }
         handler = handlers.get(name)
         if handler is None:

@@ -710,7 +710,7 @@ class TestPluginSurface(unittest.TestCase):
             "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
             "astock_sentiment", "astock_events", "astock_sync", "astock_watch",
             "astock_pick", "astock_backtest", "astock_archive", "astock_act",
-            "astock_business",
+            "astock_business", "astock_extra",
         })
 
     def test_command_names_are_prefixed(self):

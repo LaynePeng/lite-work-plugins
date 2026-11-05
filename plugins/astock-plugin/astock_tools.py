@@ -660,4 +660,146 @@ def build_tools() -> List[ToolDefinition]:
                 "required": [],
             },
         ),
+        ToolDefinition(
+            name="astock_extra",
+            description=(
+                "**扩展数据面**（一次调用覆盖 17 类数据，移植自 a-stock-data 的端网点位）："
+                "打板情绪、题材归因、人气热榜、行业排名、板块资金流、ST 名单、"
+                "两融、大宗交易、股东户数、分红送转、限售解禁、龙虎榜、板块归属、"
+                "筹码分布、事件数据、研究资料、宏观利率。\n"
+                "**与已有工具的分工（别选错）**：\n"
+                "· 个股资金流 → `astock_flow`；**板块**资金流 → 本工具 action=board_flow；\n"
+                "· 个股实时价/K线 → `astock_quote` / `astock_kline`；\n"
+                "· 舆情七类证据（公告/研报/新闻/热度/龙虎榜/两融/股东户数）→ "
+                "`astock_sentiment`；本工具给的是**同类数据的明细表**（含席位、金额、区间），"
+                "`astock_sentiment` 给的是**带可靠度与背离提示的归集**。\n"
+                "**各 action 的配套参数**：\n"
+                "· limit_sentiment（打板情绪：涨跌停/炸板率/连板梯队/涨停原因）date\n"
+                "· strong（同花顺题材归因）date；hot（人气热榜）period=hour/day\n"
+                "· industry（行业涨幅榜）top_n；board_flow（板块资金流）"
+                "board_type=industry/concept/region + period=today/5d/10d + top_n\n"
+                "· st（ST 名单）market/limit；concepts（个股板块归属）code\n"
+                "· margin / block_trade / holders / dividend / lockup / lhb / chips：code（必填）\n"
+                "· chips 另支持 days（窗口，默认 150）/ decay（换手衰减 1.0~2.0）/ adjust\n"
+                "· lhb 不给 code ＝ 全市场龙虎榜（配 date、min_net_wan）\n"
+                "· events（事件数据）event=forecast/survey/holder_trade/buyback/pledge/"
+                "ipo/convertible，配 code / days / limit / direction / report_date\n"
+                "· docs（研究资料）doc=announce(巨潮公告)/report(研报)/finance(财报三表)，"
+                "配 code / limit / months / report_type=fzb/lrb/llb\n"
+                "· macro（宏观利率）macro=lpr/pmi/yield/repo/calendar，"
+                "配 days / curve / kind=FR|FDR / year+month\n"
+                "**口径底线**：缺数据一律显示「-」不用 0 代替；不做涨跌预测、不给概率、"
+                "不合成情绪分；筹码分布是模型估算（按日 K 与换手率递推），"
+                "不是交易所披露的真实持仓。"),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "limit_sentiment", "strong", "hot", "industry",
+                            "board_flow", "st", "margin", "block_trade", "holders",
+                            "dividend", "lockup", "lhb", "concepts", "chips",
+                            "events", "docs", "macro",
+                        ],
+                        "description": ("要取哪一类数据。"
+                                        "打板情绪=limit_sentiment / 题材归因=strong / "
+                                        "热榜=hot / 行业排名=industry / 板块资金流=board_flow / "
+                                        "ST名单=st / 两融=margin / 大宗=block_trade / "
+                                        "股东户数=holders / 分红=dividend / 解禁=lockup / "
+                                        "龙虎榜=lhb / 板块归属=concepts / 筹码分布=chips / "
+                                        "事件数据=events / 研究资料=docs / 宏观利率=macro"),
+                    },
+                    "code": code_prop,
+                    "date": {
+                        "type": "string",
+                        "description": ("交易日。limit_sentiment/strong/hot 用 YYYYMMDD 或 "
+                                        "YYYY-MM-DD；lhb 用 YYYY-MM-DD。留空＝今天"),
+                    },
+                    "period": {
+                        "type": "string",
+                        "description": ("hot 用 hour/day；board_flow 用 "
+                                        "today/5d/10d（默认 today）"),
+                    },
+                    "board_type": {
+                        "type": "string",
+                        "enum": ["industry", "concept", "region"],
+                        "description": "board_flow：行业 / 概念 / 地域（默认 industry）",
+                    },
+                    "top_n": {"type": "integer", "description": "industry/board_flow 返回条数"},
+                    "market": {
+                        "type": "string", "enum": ["sh", "sz", "bj"],
+                        "description": "st：只看某个市场；留空＝全部",
+                    },
+                    "limit": {"type": "integer", "description": "返回条数上限"},
+                    "days": {
+                        "type": "integer",
+                        "description": ("margin/lockup/events/macro 的时间窗口（天）；"
+                                        "chips 的 K 线窗口（默认 150，最大 640）"),
+                    },
+                    "decay": {
+                        "type": "number",
+                        "description": "chips：换手衰减系数，1.0＝真实换手，1.5~2.0＝加快历史筹码消散",
+                    },
+                    "adjust": {
+                        "type": "string", "enum": ["qfq", "hfq", "none"],
+                        "description": "chips：K 线复权口径（默认 qfq，筹码成本必须复权）",
+                    },
+                    "min_net_wan": {
+                        "type": "number",
+                        "description": "lhb 全市场榜：净买入下限（万元）",
+                    },
+                    "event": {
+                        "type": "string",
+                        "enum": ["forecast", "survey", "holder_trade", "buyback",
+                                 "pledge", "ipo", "convertible"],
+                        "description": ("events：业绩预告 / 机构调研 / 股东增减持 / "
+                                        "回购 / 质押 / 新股 / 可转债"),
+                    },
+                    "direction": {
+                        "type": "string", "enum": ["增持", "减持"],
+                        "description": "events 的 holder_trade：只看增持或减持",
+                    },
+                    "report_date": {
+                        "type": "string",
+                        "description": "events 的 forecast：报告期，如 2026-09-30",
+                    },
+                    "include_delisted": {
+                        "type": "boolean",
+                        "description": "events 的 convertible：是否包含已摘牌转债",
+                    },
+                    "doc": {
+                        "type": "string",
+                        "enum": ["announce", "report", "finance"],
+                        "description": "docs：巨潮公告 / 个股研报 / 财报三表",
+                    },
+                    "report_type": {
+                        "type": "string", "enum": ["fzb", "lrb", "llb"],
+                        "description": "docs 的 finance：资产负债表 / 利润表 / 现金流量表",
+                    },
+                    "months": {
+                        "type": "integer",
+                        "description": "docs 的 report：研报回溯月数（默认 12）",
+                    },
+                    "macro": {
+                        "type": "string",
+                        "enum": ["lpr", "pmi", "yield", "repo", "calendar"],
+                        "description": ("macro：LPR / PMI / 中债收益率 / 回购定盘利率 / "
+                                        "交易日历"),
+                    },
+                    "curve": {
+                        "type": "string",
+                        "enum": ["treasury", "bank_aaa", "mtn_aaa", "all"],
+                        "description": "macro 的 yield：国债 / 商业银行 AAA / 中短票 AAA",
+                    },
+                    "kind": {
+                        "type": "string", "enum": ["FR", "FDR"],
+                        "description": "macro 的 repo：全市场 FR / 银银间 FDR",
+                    },
+                    "year": {"type": "integer", "description": "macro 的 calendar：年"},
+                    "month": {"type": "integer", "description": "macro 的 calendar：月"},
+                },
+                "required": ["action"],
+            },
+        ),
     ]
