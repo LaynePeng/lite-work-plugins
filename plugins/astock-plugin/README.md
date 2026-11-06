@@ -4,6 +4,46 @@
 
 ---
 
+## 0. v2.9.1 修复：三策略对比的推荐率永远缺失（静默失效）
+
+**症状**：对话里说「三套策略对比一下」，选股结果、得分、该用哪套的结论都正常，
+但**各策略推荐率那一栏永远空着**——没有报错、没有提示，看起来就像「还没算」。
+
+**根因**：`astock_backtest_tool.run_all()` 的策略白名单写成了
+
+```python
+keys = [k for k in (strategies or list(bt.STRATEGIES)) if k in bt.STRATEGIES]
+```
+
+而策略注册表（`momentum` / `reversal` / `quality` 三套定义）实际在
+**`astock_quant`**，`astock_backtest` 只负责「给定策略名 → 跑回测」，从不导出
+`STRATEGIES`。于是每次调用都在第一行抛 `AttributeError`，被
+`astock_mixin_quant._tool_pick_compare` 的 `except` 接住，降级成一条 INFO 日志：
+
+```
+[astock] 对比模式的推荐率回测失败（不影响选股）: module 'astock_backtest' has no attribute 'STRATEGIES'
+```
+
+选股走的是另一条链路（`quant.STRATEGIES`）所以完全正常——**这正是它活了很久
+没被发现的原因**：功能"能用"，只是缺了一块，且缺得毫无痕迹。
+
+**修法**：改读 `quant.STRATEGIES`（同文件其余 `bt.*` 用法都是真实导出的，
+不要一并改）。**并补 6 条回归用例**——真正的教训是 `run_all` 此前
+**零测试覆盖**，改错了也没人知道。
+
+### 一条容易复发的坑
+
+`astock_backtest` / `astock_backtest_tool` / `astock_quant` 三个模块都跟"回测"
+有关，但职责不同：
+
+| 模块 | 职责 | 有 `STRATEGIES` 吗 |
+|---|---|---|
+| `astock_quant` | 策略定义 + 打分因子 + 选股 | ✅ **策略表在这里** |
+| `astock_backtest` | 给定策略名，逐期重放算推荐率 | ❌ |
+| `astock_backtest_tool` | 取数 / 缓存 / 渲染接入 | ❌（要用就 `import astock_quant`） |
+
+---
+
 ## 0. v2.9.0 新增 `astock_extra` 扩展数据面（移植自 a-stock-data）
 
 **来源与授权**：端点位位与字段口径参考开源项目

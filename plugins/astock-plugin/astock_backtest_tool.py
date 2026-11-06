@@ -289,8 +289,18 @@ def run_all(*, pool_size: int = DEFAULT_POOL,
     池子固定后各策略只做打分与统计（纯 CPU）。
 
     缓存逐个策略独立判定：全命中时零网络请求。
+
+    **策略表取自 `quant.STRATEGIES`，不是 `bt.STRATEGIES`**：`astock_backtest`
+    只做「给定策略名 → 跑回测」，策略注册表（含 momentum/reversal/quality
+    三套定义）在 `astock_quant`。早先这里写成 `bt.STRATEGIES` 会抛
+    AttributeError，被上层 `except` 吞成一条 INFO 日志——表现为
+    「三策略对比时推荐率永远缺失」，选股本身正常，所以长期无人发现
+    （2026-11-06 修）。同一文件里 `bt.` 的其余用法（BacktestConfig /
+    run_backtest / grade_recommendation…）都由 `astock_backtest` 真实导出，
+    不要一并改掉。
     """
-    keys = [k for k in (strategies or list(bt.STRATEGIES)) if k in bt.STRATEGIES]
+    available = quant.STRATEGIES
+    keys = [k for k in (strategies or list(available)) if k in available]
     if not keys:
         raise ValueError("没有可用的策略")
     out: Dict[str, Dict[str, Any]] = {}

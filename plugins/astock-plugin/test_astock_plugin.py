@@ -5016,6 +5016,85 @@ class TestBacktestRendering(unittest.TestCase):
         self.assertIn("逐期明细", text)
 
 
+class TestBacktestRunAll(unittest.TestCase):
+    """`run_all` 一次取数跑多套（三策略对比的推荐率回补走这里）。
+
+    回归背景（2026-11-06）：`run_all` 里写的是 `bt.STRATEGIES`，而策略注册表
+    实际在 `astock_quant`，`astock_backtest` 并不导出它 → 每次调用都抛
+    AttributeError，被 `_tool_pick_compare` 的 `except` 吞成一条 INFO 日志。
+    用户侧表现是「三策略对比时推荐率永远缺失」，而选股正常，所以长期没被发现。
+    根因有两层：① 写错模块；② `run_all` **零测试覆盖**，错了也没人知道。
+    """
+
+    def setUp(self):
+        # 池子直接给定 + 取数打桩：回测最贵的是历史 K 线，测试绝不联网
+        self.pool = [
+            {"code": "A", "name": "涨", "bars": _bt_bars(lambda i: 1.006)},
+            {"code": "B", "name": "平", "bars": _bt_bars(lambda i: 1.0005)},
+            {"code": "C", "name": "跌", "bars": _bt_bars(lambda i: 0.999)},
+            {"code": "D", "name": "横", "bars": _bt_bars(lambda i: 1.0)},
+        ]
+        self.bench = _bt_flat_bench()
+        self.cands = [{"code": p["code"], "name": p["name"]} for p in self.pool]
+        self.cfg = backtest_mod.BacktestConfig(rebalance_days=10, top_k=1)
+
+    def _run_all(self, **kw):
+        """打桩 fetch_universe / fetch_benchmark 后调 run_all。"""
+        from unittest.mock import patch
+        with patch.object(backtest_tool, "fetch_universe",
+                          return_value=(list(self.pool), 0)), \
+                patch.object(backtest_tool, "fetch_benchmark",
+                             return_value=list(self.bench)):
+            return backtest_tool.run_all(candidates=self.cands,
+                                         pool_size=len(self.cands),
+                                         cfg=self.cfg, use_cache=False, **kw)
+
+    def test_does_not_touch_bt_strategies(self):
+        """`astock_backtest` 没有 STRATEGIES —— 谁再写 bt.STRATEGIES 立刻红。"""
+        self.assertFalse(hasattr(backtest_mod, "STRATEGIES"),
+                         "astock_backtest 不该导出 STRATEGIES；策略表在 astock_quant")
+        self.assertTrue(hasattr(quant, "STRATEGIES"))
+
+    def test_returns_all_strategies_by_default(self):
+        """不传 strategies 时按 quant.STRATEGIES 全量跑（正是原先崩掉的那条分支）。"""
+        got = self._run_all()
+        self.assertEqual(set(got), set(quant.STRATEGIES),
+                         "默认应覆盖 quant.STRATEGIES 的全部策略")
+        for key, val in got.items():
+            self.assertIn("result", val)
+            self.assertIn("recommendation", val)
+            self.assertEqual(val["pool_size"], len(self.cands))
+
+    def test_explicit_subset_is_respected(self):
+        """显式指定策略时只跑这些（_tool_pick_compare 传的就是 missing 子集）。"""
+        keys = list(quant.STRATEGIES)[:2]
+        got = self._run_all(strategies=keys)
+        self.assertEqual(set(got), set(keys))
+
+    def test_unknown_strategy_filtered_out(self):
+        """未知策略名被过滤，不因一个错名整体失败。"""
+        got = self._run_all(strategies=["momentum", "no_such_strategy"])
+        self.assertEqual(set(got), {"momentum"})
+
+    def test_all_unknown_raises(self):
+        """全是未知策略时明确报错，而不是静默返回空表。"""
+        with self.assertRaises(ValueError):
+            self._run_all(strategies=["nope"])
+
+    def test_fetch_failure_field_passed_through(self):
+        """取数失败数要透传（报告里要说明「N 只没取到」）。"""
+        from unittest.mock import patch
+        with patch.object(backtest_tool, "fetch_universe",
+                          return_value=(list(self.pool), 3)), \
+                patch.object(backtest_tool, "fetch_benchmark",
+                             return_value=list(self.bench)):
+            got = backtest_tool.run_all(candidates=self.cands,
+                                        pool_size=len(self.cands),
+                                        cfg=self.cfg, use_cache=False,
+                                        strategies=["momentum"])
+        self.assertEqual(got["momentum"]["fetch_failed"], 3)
+
+
 class TestBacktestPanelCards(unittest.TestCase):
     """右栏卡片看板（需求：像炒股软件那样）。"""
 

@@ -9,7 +9,7 @@
 AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账数据与邮箱配置，
 属于个人自用型插件——进内置只会增加主程序维护面与体积，没有内置的必要。
 
-工具面（18 个）
+工具面（19 个）
     astock_calc       **公式计算器**（v2.4.0：均线/指标/规则体检/算账/复权/收益回撤比）
     astock_act        **操作指示**（先卖后买 + 资金闭环；照着在券商 App 执行）
     astock_pick       **量化选股 + 买入数量**（全市场扫描→多因子池内打分→换算股数）
@@ -24,6 +24,7 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_portfolio  持仓总览（实时浮盈、占比、当日盈亏）＋ 资金/已实现盈亏/流水/纠错
     astock_hint       下单提示（T+1 可卖、止损止盈、加减仓档位、买卖股数估算、舆情背离）
     astock_sentiment  投资舆情分析（公告/研报/新闻/热度/龙虎榜/两融/股东户数）
+    astock_business   **主营构成 / 门槛②判定**（东财 F10 分部收入占比：pass/below/absent/na）
     astock_events     事件驱动筛股（快讯硬事件→资金印证→背离）
     astock_sync       成交回单同步（粘贴回单→解析多笔→匹配计划→校价→落账）
     astock_watch      自选股增删查 + 盯盘开关
@@ -48,7 +49,7 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_advise                       策略推荐器（三套 → 一句人话结论）
     ── 本插件专用的支撑层（v2.1.2 从本文件拆出）
     astock_common                       配置读取 / 格式化 / 表格（最底层）
-    astock_tools                        18 个工具的 schema 声明（纯静态）
+    astock_tools                        19 个工具的 schema 声明（纯静态）
     astock_panel                        右栏面板渲染（持仓两形态 + 选股对比 + 大盘卡）
     astock_rich                         聊天侧富围栏渲染（kpi + board + table，v2.2.0）
     astock_report                       组合舆情报告 + 事件推荐 + 自选体检
@@ -1032,7 +1033,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.9.0"
+    version = "2.9.1"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
