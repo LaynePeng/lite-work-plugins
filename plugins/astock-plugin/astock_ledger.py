@@ -542,6 +542,55 @@ class Ledger:
                 "cash": [dict(r) for r in conn.execute("SELECT * FROM cash").fetchall()],
             }
 
+    def trade_dedupe_keys(self) -> set:
+        """现有流水的去重键集合：(日期, 代码, 方向, 价格 3 位, 数量)。
+
+        为什么由台账层提供：导出/导入（`astock_maintenance`）与回单同步都靠
+        这个口径判断「同一笔是否已经落账」。两处各拼一次字符串迟早会漂移，
+        而漂移的后果是**重复导入静默记两遍**——成本基准被污染，界面上还看不出来。
+        """
+        with self._lock, self._db() as conn:
+            rows = conn.execute(
+                "SELECT trade_date, code, side, price, shares FROM trades"
+            ).fetchall()
+        return {
+            "|".join((
+                str(r["trade_date"] or ""),
+                str(r["code"] or ""),
+                str(r["side"] or ""),
+                str(round(float(r["price"] or 0.0), 3)),
+                str(int(r["shares"] or 0)),
+            ))
+            for r in rows
+        }
+
+    def upsert_manual_position(self, code: str, name: str, shares: int,
+                               cost_price: float, opened_at: str = "") -> Dict[str, Any]:
+        """写回一条**没有对应流水**的手工持仓（全量导入专用）。
+
+        ⚠️ 只能用于「文件里该标的没有任何流水」的情况。有流水的标的必须让
+        `record_trade` 按移动加权成本重放——直接写持仓会让持仓与流水对不上，
+        下一次卖出算出的已实现盈亏一定是错的。
+        """
+        code, _ = normalize_code(code)
+        shares = int(shares or 0)
+        if shares <= 0:
+            raise LedgerError("手工持仓股数必须大于 0")
+        cost = round(float(cost_price or 0.0), 4)
+        if cost < 0:
+            raise LedgerError("持仓成本价不能为负数")
+        opened = str(opened_at or "").strip() or _today()
+        with self._lock, self._db() as conn:
+            conn.execute(
+                "INSERT INTO positions(code, name, shares, cost_price, opened_at,"
+                " updated_at, note) VALUES (?,?,?,?,?,?, '') "
+                "ON CONFLICT(code) DO UPDATE SET name=excluded.name,"
+                " shares=excluded.shares, cost_price=excluded.cost_price,"
+                " updated_at=excluded.updated_at",
+                (code, str(name or ""), shares, cost, opened, _now()))
+        return {"code": code, "name": str(name or ""), "shares": shares,
+                "cost_price": cost, "opened_at": opened}
+
     def delete_trade(self, trade_id: int, rebuild: bool = True) -> Dict[str, Any]:
         """删除一笔录入错误的成交，并按剩余流水**重算全部持仓**。
 

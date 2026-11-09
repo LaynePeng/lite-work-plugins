@@ -27,6 +27,7 @@ lite-work-plugins/
 │   │   ├── astock_market.py #     代码规范化/板块/涨跌停/费用/交易时段（纯规则，零网络）
 │   │   ├── astock_data.py   #     行情/K线/选股/资金流（限速+缓存+主备源切换）
 │   │   ├── astock_ledger.py #     手工交易台账（SQLite：加权成本/T+1/已实现盈亏）
+│   │   ├── astock_maintenance.py # 台账导出/导入（与 dsh-astock 互通：JSON/CSV）
 │   │   ├── astock_hints.py  #     下单提示引擎（止损止盈/加减仓/买卖股数估算）
 │   │   ├── astock_quant*.py #     选股引擎（三套策略）+ 取数/缓存/渲染
 │   │   ├── astock_backtest*.py  # 回测（防未来函数）+ 推荐率分档
@@ -36,9 +37,9 @@ lite-work-plugins/
 │   │   ├── astock_plan.py        # 宿主盯梢计划的自动创建/维护/体检
 │   │   ├── astock_price_rule.py  # 精确价位规则（跌破/站上某价位+量能条件）
 │   │   ├── astock_common.py      # 配置读取 / 格式化 / 表格（最底层）
-│   │   ├── astock_tools.py       # 16 个工具的 schema 声明（纯静态）
+│   │   ├── astock_tools.py       # 20 个工具的 schema 声明（纯静态）
 │   │   ├── astock_sentiment*.py  # 舆情七类证据采集 → 归集/背离 → 渲染
-│   │   └── test_astock*.py       # 490 项离线单测（零网络、零真实台账写入）
+│   │   └── test_astock*.py       # 767 项离线单测（零网络、零真实台账写入）
 │   ├── watch-plugin/        #   盯梢 / 定时计划的**工具面**（通用，任何盯梢源可用）
 │   │   ├── plugin.py        #     schedule_sources/list/get/upsert/run/delete
 │   │   ├── test_watch_plugin.py  # 46 项离线单测（内存假 store，不碰真实计划）

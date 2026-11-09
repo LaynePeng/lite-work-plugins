@@ -9,7 +9,7 @@
 AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账数据与邮箱配置，
 属于个人自用型插件——进内置只会增加主程序维护面与体积，没有内置的必要。
 
-工具面（19 个）
+工具面（20 个）
     astock_calc       **公式计算器**（v2.4.0：均线/指标/规则体检/算账/复权/收益回撤比）
     astock_act        **操作指示**（先卖后买 + 资金闭环；照着在券商 App 执行）
     astock_pick       **量化选股 + 买入数量**（全市场扫描→多因子池内打分→换算股数）
@@ -31,6 +31,8 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_extra      **扩展数据面**（v2.9.0：17 类——打板情绪/题材归因/人气热榜/
                       行业排名/板块资金流/ST 名单/两融/大宗/股东户数/分红/解禁/
                       龙虎榜/板块归属/筹码分布/事件数据/研究资料/宏观利率）
+    astock_migrate    **数据迁移**（v2.10.0：台账 JSON/成交 CSV/自选导出，
+                      台账 JSON/成交 CSV 导入；格式与 dsh-astock 互通、可互导）
 
 模块分层（v2.0.0 起；v2.1.2 把装配层再拆细；v2.4.0 加公式库；v2.5.0 加大盘）
     ── 纯函数 / 取数层（喂数据出结果、零网络，便于离线单测）
@@ -49,7 +51,9 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     astock_advise                       策略推荐器（三套 → 一句人话结论）
     ── 本插件专用的支撑层（v2.1.2 从本文件拆出）
     astock_common                       配置读取 / 格式化 / 表格（最底层）
-    astock_tools                        19 个工具的 schema 声明（纯静态）
+    astock_tools                        20 个工具的 schema 声明（纯静态）
+    astock_maintenance                  **台账导出/导入**（v2.10.0：与 dsh-astock
+                                         同一套 JSON/CSV 格式；导入按流水回放）
     astock_panel                        右栏面板渲染（持仓两形态 + 选股对比 + 大盘卡）
     astock_rich                         聊天侧富围栏渲染（kpi + board + table，v2.2.0）
     astock_report                       组合舆情报告 + 事件推荐 + 自选体检
@@ -81,6 +85,8 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     contributes.panels 「持仓」右栏面板：Markdown 表格实时浮盈
                        + 「选股」面板（v2.1.0：一个 tab 内三策略对比，
                        一次数据采集同时算三套，价格同源可比）
+                       + 「数据」面板（v2.10.0：导出文件清单 + 导入操作指引；
+                       可点击的导出/导入按钮只能放设置页，面板协议只读）
 
 设计约束（遵循本仓库 AGENTS.md）
 - **零第三方依赖**：httpx/pandas 都不用，纯标准库（urllib/sqlite3/json/dataclasses）。
@@ -265,6 +271,7 @@ import astock_receipt as receipt                    # noqa: F401
 import astock_sentiment as senti                    # noqa: F401
 import astock_sentiment_tool as senti_tool          # noqa: F401
 import astock_market as mkt
+import astock_maintenance as maint
 import astock_market_mood as mood_mod
 from astock_mixin_calc import CalcToolsMixin
 from astock_mixin_hint import HintToolsMixin
@@ -1033,7 +1040,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.9.2"
+    version = "2.10.0"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
@@ -1053,6 +1060,9 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     #:   - astock_act      生成/改写操作指示
     #:   - astock_backtest 会自动回写行情存档
     #:   - astock_pick     会按需更新存档
+    #:   - astock_migrate  导/入台账与成交（写文件、改台账）；它刻意独立成工具，
+    #:                    不挂在只读的 astock_portfolio 上——宿主按**工具名**过滤
+    #:                    权限，挂在只读工具上的写 action 在无人值守任务里也能跑。
     read_only_tools = [
         "astock_quote", "astock_kline", "astock_events", "astock_flow",
         "astock_search", "astock_screen", "astock_calc", "astock_hint",
@@ -1076,7 +1086,8 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                    "已实现盈亏）+ 下单提示（止损止盈/加减仓档位/买卖股数估算）。"
                    "用户自己在券商下单，插件只记账与提示，不接任何委托通道。"
                    "零第三方依赖；台账默认落 ~/.lite-work/astock-data/ledger.sqlite"
-                   "（全局位置，与工作区无关）。")
+                   "（全局位置，与工作区无关）。支持台账 JSON/成交 CSV 导出导入，"
+                   "格式与 DSH 版 dsh-astock 互通。")
 
     contributes = {
         "settings": [
@@ -1251,6 +1262,40 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                      "存档**只存不复权原始价**：前复权会随分红重算整段历史，"
                      "存了会自相矛盾。注意它不会立刻变长——"
                      "今天开始存，一年后才多出一年"},
+            # ── 数据导出 / 导入（v2.10.0：与 DSH 版 dsh-astock 互通）────
+            # 设置页是宿主里唯一能放可点击控件的地方（右栏面板只读），
+            # 所以导出/导入做成一组「数据」字段，形成一页可操作的入口。
+            {"key": "data_export_kind", "type": "select",
+             "label": "数据 · 导出格式", "default": "ledger",
+             "options": ["ledger", "trades", "watchlist"],
+             "hint": "ledger＝完整台账 JSON（资金+持仓+流水+自选，推荐）；"
+                     "trades＝成交 CSV（Excel 双击可读）；watchlist＝自选 JSON。"
+                     "文件写到台账同目录的 exports/"},
+            {"key": "data_export", "type": "action",
+             "label": "数据 · 导出（按上面的格式）",
+             "hint": "生成一份文件并显示完整路径。格式与 dsh-astock 一致："
+                     "把文件内容粘贴到它的「维护 → 导入」即可"},
+            {"key": "data_export_all", "type": "action",
+             "label": "数据 · 一次导出全部（JSON + CSV + 自选）",
+             "hint": "三种格式各一份。换机器 / 备份时用这个"},
+            {"key": "data_import_path", "type": "str",
+             "label": "数据 · 导入文件路径", "default": "",
+             "hint": "支持 ~ 展开；JSON / CSV 按内容自动识别。"
+                     "**留空＝自动用 exports/ 里最近导出的文件**。"
+                     "填好后先点页面底部「保存」，再点下面的预览/确认"},
+            {"key": "data_import_scope", "type": "select",
+             "label": "数据 · 导入范围", "default": "all",
+             "options": ["all", "watch_cash", "trades"],
+             "hint": "all＝成交+资金+自选（默认）；watch_cash＝只资金+自选；"
+                     "trades＝只回放成交（资金不动）。导入 CSV 时忽略此项"},
+            {"key": "data_import_preview", "type": "action",
+             "label": "数据 · 预览差异（不落账）",
+             "hint": "先看清会新增/调整多少持仓、多少成交、资金变成多少，"
+                     "再决定是否落账"},
+            {"key": "data_import_commit", "type": "action",
+             "label": "数据 · 确认导入（落账）",
+             "hint": "重复流水自动跳过；持仓按流水回放复算；导入是合并，"
+                     "不会删除台账里已有的持仓"},
         ],
         "panels": [
             {"id": "portfolio", "title": "持仓"},
@@ -1262,6 +1307,8 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             # 保留旧的 pick-<strategy> id 入口（见 _panel_pick），
             # 已安装用户的书签/习惯不会失效。
             {"id": "pick", "title": "选股"},
+            # v2.10.0：数据导出/导入信息页（按钮在设置页，面板只读）。
+            {"id": "data", "title": "数据"},
         ],
         # 斜杠命令：宿主把它们放进输入框的 / 命令面板（快捷提示）。
         # 输入后原样透传给 Agent——靠 description 引导 Agent 调对应工具，
@@ -1300,6 +1347,10 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             {"name": "astock-watch",
              "description": "盯盘开关与状态：调 astock_watch action=status",
              "argsHint": "[start|stop]"},
+            {"name": "astock-migrate",
+             "description": "台账导出/导入：调 astock_migrate（导出完整台账 JSON/"
+                            "成交 CSV/自选；导入先预览再落账；格式与 dsh-astock 互通）",
+             "argsHint": "[export|import|import_trades，或直接给文件路径]"},
         ],
     }
 
@@ -1656,6 +1707,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             "astock_watch": self._tool_watch,
             "astock_business": self._tool_business,
             "astock_extra": self._tool_extra,
+            "astock_migrate": self._tool_migrate,
         }
         handler = handlers.get(name)
         if handler is None:
@@ -1847,6 +1899,14 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             return self._action_backtest_run(own)
         if key == "archive_run":
             return self._action_archive_run()
+        if key == "data_export":
+            return self._action_data_export_selected(own)
+        if key == "data_export_all":
+            return self._action_data_export()
+        if key == "data_import_preview":
+            return self._action_data_import(own, commit=False)
+        if key == "data_import_commit":
+            return self._action_data_import(own, commit=True)
         if key != "watch_toggle":
             return {"ok": False, "message": f"未知动作 {key}"}
 
@@ -1908,6 +1968,167 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         return {"ok": True, "message": (
             f"存档已更新：{len(result['updated'])} 只成功、"
             f"{len(result['failed'])} 只失败，写入 {result['total_saved']:,} 根 K 线")}
+
+    # -------------------------------------------------- 数据导出 / 导入（设置页）
+
+    #: 设置页「导出格式」的展示名（与 maint.export_payload 的 kind 对应）。
+    _DATA_KIND_LABELS = {"ledger": "完整台账 JSON", "trades": "成交 CSV",
+                         "watchlist": "自选 JSON"}
+
+    def _action_data_export(self) -> Dict[str, Any]:
+        """设置页「一次导出全部」按钮：JSON + CSV + 自选各一份。
+
+        为什么在设置页放按钮：面板协议只读，而"导出台账"最常走的场景是
+        **换机器前先备份**——用户未必想到要先在对话里问一句。
+        格式与 DSH 版 dsh-astock 一致，两个插件的数据可以互相导入。
+        """
+        try:
+            ledger = self._get_ledger()
+        except Exception as exc:          # noqa: BLE001 - 台账打不开要说人话
+            return {"ok": False, "message": f"读取台账失败：{exc}"}
+        done: List[str] = []
+        failed: List[str] = []
+        for kind in ("ledger", "trades", "watchlist"):
+            res = maint.write_export(ledger, kind)
+            if res.get("ok") and res.get("path"):
+                done.append(f"{self._DATA_KIND_LABELS[kind]} → {res['path']}")
+            else:
+                failed.append(f"{self._DATA_KIND_LABELS[kind]}："
+                              f"{res.get('message') or '导出失败'}")
+        if not done:
+            return {"ok": False, "message": "导出失败：" + "；".join(failed)}
+        msg = "已导出到台账同目录 exports/：\n" + "\n".join(f"- {x}" for x in done)
+        if failed:
+            msg += "\n未能导出：" + "；".join(failed)
+        msg += "\n在 dsh-astock 的「维护 → 导入」里粘贴文件内容即可互通。"
+        return {"ok": True, "message": msg}
+
+    def _action_data_export_selected(self, own: Dict[str, Any]) -> Dict[str, Any]:
+        """设置页「导出（按选定格式）」按钮。"""
+        kind = str(own.get("data_export_kind") or "ledger").strip().lower()
+        if kind not in self._DATA_KIND_LABELS:
+            kind = "ledger"
+        try:
+            ledger = self._get_ledger()
+        except Exception as exc:          # noqa: BLE001
+            return {"ok": False, "message": f"读取台账失败：{exc}"}
+        res = maint.write_export(ledger, kind)
+        if not res.get("ok") or not res.get("path"):
+            return {"ok": False,
+                    "message": f"导出失败：{res.get('message') or '未知错误'}"}
+        summary = res.get("summary") or {}
+        if kind == "ledger":
+            detail = (f"{summary.get('trades', 0)} 笔流水 / "
+                      f"{summary.get('positions', 0)} 只持仓 / "
+                      f"{summary.get('watchlist', 0)} 只自选 / "
+                      f"资金 {float(summary.get('cash') or 0.0):,.2f} 元")
+        elif kind == "trades":
+            detail = f"{summary.get('trades', 0)} 笔成交"
+        else:
+            detail = f"{summary.get('watchlist', 0)} 只自选"
+        return {"ok": True, "message": (
+            f"已导出{self._DATA_KIND_LABELS[kind]}（{detail}）\n"
+            f"文件：{res['path']}")}
+
+    def _resolve_data_import_path(self, own: Dict[str, Any]) -> Tuple[str, str]:
+        """取导入文件路径：优先设置页填的，留空则用 exports/ 里最新的文件。
+
+        为什么留空要用「最新导出」：导出后想马上验证/恢复是最常见的往返，
+        每次都要用户手抄一遍绝对路径既慢又容易抄错。
+        """
+        raw = str(own.get("data_import_path") or "").strip()
+        if raw:
+            return os.path.abspath(os.path.expanduser(raw)), ""
+        try:
+            ledger = self._get_ledger()
+            folder = maint.export_dir(ledger)
+        except Exception as exc:          # noqa: BLE001
+            return "", f"读取台账失败：{exc}"
+        if not os.path.isdir(folder):
+            return "", (f"没有指定导入文件，导出目录也还不存在：{folder}\n"
+                        f"先点上面的「导出」生成一份，或填写文件路径后保存")
+        candidates = []
+        try:
+            for name in os.listdir(folder):
+                if name.startswith("."):
+                    continue
+                path = os.path.join(folder, name)
+                if (os.path.isfile(path)
+                        and name.lower().endswith((".json", ".csv"))):
+                    candidates.append(path)
+        except OSError as exc:
+            return "", f"扫描导出目录失败：{exc}"
+        if not candidates:
+            return "", (f"导出目录里没有 .json/.csv 文件：{folder}\n"
+                        f"先点上面的「导出」，或填写文件路径后保存")
+        path = max(candidates, key=lambda p: os.path.getmtime(p))
+        return path, ""
+
+    @staticmethod
+    def _import_fail_tail(failed: List[Dict[str, Any]]) -> str:
+        if not failed:
+            return ""
+        items = []
+        for f in failed[:5]:
+            code = str(f.get("code") or "")
+            reason = str(f.get("error") or "")
+            items.append(f"{code}：{reason}" if code else reason)
+        tail = f"\n失败 {len(failed)} 笔：" + "；".join(items)
+        if len(failed) > 5:
+            tail += f" 等 {len(failed)} 笔"
+        return tail
+
+    def _action_data_import(self, own: Dict[str, Any], commit: bool) -> Dict[str, Any]:
+        """设置页导入按钮：自动识别 JSON / CSV，先预览后落账。"""
+        path, err = self._resolve_data_import_path(own)
+        if err:
+            return {"ok": False, "message": err}
+        src = maint.read_import_text("", path)
+        if not src.get("ok"):
+            return {"ok": False, "message": str(src.get("message") or "读取失败")}
+        text = str(src.get("text") or "")
+        is_json = text.lstrip()[:1] in ("{", "[")
+        scope = maint.normalize_scope(own.get("data_import_scope"))
+        try:
+            ledger = self._get_ledger()
+        except Exception as exc:          # noqa: BLE001
+            return {"ok": False, "message": f"读取台账失败：{exc}"}
+
+        if is_json:
+            if not commit:
+                res = maint.preview_ledger_import(ledger, text, scope)
+                if not res.get("ok"):
+                    errs = res.get("errors") or []
+                    tail = ("；" + "；".join(str(e) for e in errs[:3]) if errs else "")
+                    return {"ok": False,
+                            "message": f"{res.get('message') or '解析失败'}{tail}"}
+                warnings = res.get("errors") or []
+                msg = (f"预览 · {scope}\n{res.get('message') or ''}\n"
+                       f"文件：{path}")
+                if warnings:
+                    msg += "\n提示：" + "；".join(str(w) for w in warnings[:3])
+                return {"ok": True, "message": msg}
+            res = maint.import_ledger(ledger, text, scope)
+            if not res.get("ok"):
+                errs = res.get("errors") or []
+                tail = ("；" + "；".join(str(e) for e in errs[:3]) if errs else "")
+                return {"ok": False,
+                        "message": f"{res.get('message') or '导入失败'}{tail}"}
+            applied = res.get("applied") or {}
+            msg = f"{res.get('message') or ''}\n文件：{path}"
+            msg += self._import_fail_tail(applied.get("failed") or [])
+            return {"ok": True, "message": msg}
+
+        res = maint.import_trades(ledger, text, commit=commit)
+        if not res.get("ok"):
+            errs = res.get("errors") or []
+            tail = ("；" + "；".join(str(e) for e in errs[:3]) if errs else "")
+            return {"ok": False,
+                    "message": f"{res.get('message') or '导入失败'}{tail}"}
+        msg = f"{res.get('message') or ''}\n文件：{path}"
+        if commit:
+            msg += self._import_fail_tail(res.get("failed") or [])
+        return {"ok": True, "message": msg}
 
     def _action_backtest_run(self, own: Dict[str, Any]) -> Dict[str, Any]:
         """设置页「立即回测（出推荐率）」按钮。

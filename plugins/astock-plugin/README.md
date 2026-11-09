@@ -4,6 +4,103 @@
 
 ---
 
+## 0. v2.10.0 新能力：台账导出 / 导入（与 dsh-astock 互通）
+
+**一句话**：数据不再只活在 `ledger.sqlite` 里。导出的文件与 DSH 版 A 股助手
+[dsh-astock](https://github.com/LaynePeng/dsh-astock) 的格式**逐字一致**，
+两边的导出文件可以直接被对方导入。
+
+### 导出：三种可读文件
+
+| 文件 | 内容 | 典型用途 |
+|---|---|---|
+| `astock-ledger-*.json` | 完整快照：资金 + 持仓 + 全部流水 + 自选 | 换机器 / 重装 / 灾备 / 导入 dsh-astock |
+| `astock-trades-*.csv` | 成交流水，中文表头 + BOM + CRLF | 双击用 Excel 打开、给 dsh-astock 导入成交 |
+| `astock-watchlist-*.json` | 自选股纯 JSON | 换机器时不用重配自选 |
+
+用法：
+
+- **设置页「数据 ·」操作区**（右栏「数据」tab 只读，按钮在设置页）：
+  选「导出格式」→ 点「导出（按上面的格式）」；或直接点
+  「一次导出全部（JSON + CSV + 自选）」。
+- **右栏「数据」tab**：看导出目录里已有的文件（名称/大小/时间）和导入操作
+  指引；文件详情与按钮入口都在这里能定位到。
+- **对话里**：说「导出台账」→ 插件调 `astock_migrate action=export`，
+  默认导出完整 JSON；要 CSV 用 `kind=trades`，要自选用 `kind=watchlist`。
+- **文件位置**：都落在**台账同目录的 `exports/`**
+  （默认 `~/.lite-work/astock-data/exports/`），返回结果里给出完整路径。
+
+### 设置页怎么导入
+
+设置页的「数据 ·」区域同样是可操作的，流程四步：
+
+```text
+① 在「导入文件路径」填文件路径（支持 ~；留空＝用 exports/ 里最新的导出文件）
+② 点页面底部的「保存」（动作按钮只读已保存的配置）
+③ 点「预览差异（不落账）」看清加减多少持仓/成交、资金变成多少
+④ 点「确认导入（落账）」才真正写台账
+```
+
+JSON / CSV 按内容自动识别，不用手动选类型；json 的导入范围由
+「导入范围」下拉框决定（all / watch_cash / trades）。
+
+### 对话里怎么导入（`astock_migrate`）
+
+面板与设置页之外，对话里也能直接导入；工具参数 `dry_run` 默认 true，
+所以不写 `dry_run=false` 就**只预览、不落账**：
+
+```text
+# 台账 JSON（完整恢复或合并）
+astock_migrate action=import path=~/Downloads/astock-ledger-20261109-112233.json
+# 确认预览后落账
+astock_migrate action=import path=<同一文件> dry_run=false
+
+# 成交 CSV（补录流水）
+astock_migrate action=import_trades path=~/Downloads/astock-trades-20261109-112233.csv
+# 确认后落账
+astock_migrate action=import_trades path=<同一文件> dry_run=false
+```
+
+也可以把文件内容直接粘进 `text` 参数（JSON 较长时建议用 `path`）。
+
+`action=import` 的三种范围（与 dsh-astock 同义）：
+
+| scope | 恢复什么 | 什么时候用 |
+|---|---|---|
+| `all`（默认） | 成交 + 资金 + 自选，持仓由成交回放得出 | 换机器 / 从备份恢复整个账户 |
+| `watch_cash` | 只恢复资金与自选（不动流水与持仓） | 只想校准资金、补自选 |
+| `trades` | 只回放成交，资金保持不动 | 补录历史流水 |
+
+### 四条必须知道的口径
+
+1. **持仓以流水回放为准。** 文件里的 `positions` 只在「该标的没有任何流水」时
+   按手工持仓写回；有流水的标的由 `record_trade` 逐笔重算移动加权成本。
+   直接覆盖持仓会让持仓与流水对不上——界面看不出错，但下一次卖出算的已实现
+   盈亏一定是错的。
+2. **重复流水自动跳过。** 去重键 = 日期 + 代码 + 方向 + 价格（保留 3 位）+
+   数量，同一份文件导入两次不会记两遍。
+3. **资金不随成交自动扣减。** 插件看不见你的银行转账/出入金；只有
+   `all` / `watch_cash` 会按文件里的资金覆盖，`trades` 完全不动资金。
+   导入后请核对券商余额，必要时用 `astock_portfolio action=set_cash` 校准。
+4. **导入是合并，不是快照覆盖。** 台账里已有、而文件里没有的持仓**不会
+   被删除**（预览里标为「保留」）。拿旧备份合并不会清空账户；真要清掉
+   某只，请用 `astock_record` 卖出或按流水重算。自选同理只增不减。
+
+### 和 dsh-astock 的互通边界
+
+- 完整 JSON 的格式标记是 `dsh-astock-ledger/1`，字段为
+  `cash / positions / trades / watchlist`；CSV 是同一套中文表头与换行；
+  自选是 `dsh-astock-watchlist/1`。**本插件会把 dsh-astock 的导出文件当原生格式读**，
+  不需要手工改字段。
+- 两边默认的台账目录本来就不同（本插件 `~/.lite-work/astock-data/`，
+  DSH 版 `~/.dsh/astock-data/`），但**不需要搬目录、也不需要改台账路径**：
+  统一用导出/导入搬数据即可。
+- dsh-astock 的「维护 → 导入」是粘贴文本，所以从本插件导出后，用编辑器打开
+  那份 JSON/CSV、复制全文再粘过去即可；它的导出文件则用本插件的
+  `data_import_path` 或对话里的 `astock_migrate action=import path=...` 读回。
+
+---
+
 ## 0. v2.9.2 修复：分红类公告被判「未核实」，门槛② 变成万能否决器
 
 **症状**：把一份纯分红公告的标题传给 `astock_business`（如
@@ -1345,6 +1442,7 @@ astock_calc mode=rule_check rules=[...]  # 或显式传规则
 | `astock_record` | 录入已成交买卖 | "我买了 200 股…" |
 | `astock_sync` | 成交回单批量同步 | "把这段成交同步进台账" |
 | `astock_portfolio` | 台账总览 / 流水 / 设资金 / 纠错 | "看持仓 / 我的成交记录" |
+| `astock_migrate` | **数据迁移：导出/导入（与 dsh-astock 互通）** | "导出台账" / "导入这个台账文件" |
 | `astock_events` | 事件驱动筛股 | "今天有哪些回购公告" |
 | `astock_watch` | 自选股 + 盯盘开关 + **盯盘规则读写** | "加自选 / 启动盯盘 / 现在在盯什么 / 把止损改成 35" |
 | `astock_extra` | **扩展数据面**（17 类：打板/龙虎榜/筹码/事件/资料/宏观） | "今天打板情绪如何" / "看下龙虎榜" / "筹码分布" / "PMI 多少" |

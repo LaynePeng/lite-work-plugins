@@ -6,6 +6,7 @@
 import ast
 import glob
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -170,6 +171,7 @@ quant_tool = astock.quant_tool        # 扫描/缓存/渲染接入层
 backtest_mod = astock.backtest        # 回测引擎（v1.9.0）
 backtest_tool = astock.backtest_tool  # 回测取数/缓存/卡片接入层
 archive_mod = astock.archive_mod      # 本地历史行情存档（v2.0.0）
+maintenance = astock.maint            # 台账导出/导入（v2.10.0，与 dsh-astock 互通）
 astock_actions = astock.actions       # 操作指示（先卖后买）（v2.0.0）
 
 
@@ -518,6 +520,384 @@ class TestLedgerCashAndWatch(LedgerTestBase):
         self.assertEqual(self.ledger.realized_pnl()["realized_pnl"], 0.0)
 
 
+# ---------------------------------------------------------------- 台账导出/导入
+
+
+class MaintenanceTestBase(LedgerTestBase):
+    def _new_ledger(self, name="other.sqlite"):
+        return ledger_mod(os.path.join(self.tmp, name))
+
+    def _export_text(self, ledger):
+        return maintenance.export_payload(ledger, "ledger.json")["content"]
+
+    def _source(self, cash=12345.67, code="600000", price=10.0, shares=1000):
+        src = self._new_ledger("source.sqlite")
+        src.set_cash(cash)
+        src.record_trade(code, "buy", price, shares,
+                         trade_date="2026-01-05", name="浦发银行")
+        src.add_watch("000001", "平安银行", "观察")
+        return src
+
+
+class TestMaintenanceExport(MaintenanceTestBase):
+    def test_ledger_json_matches_dsh_format(self):
+        src = self._source()
+        res = maintenance.export_payload(src, "ledger.json")
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["filename"].startswith("astock-ledger-"))
+        payload = json.loads(res["content"])
+        # 格式标记与字段名是互通契约：dsh-astock 的 parseLedgerJson 认这一组
+        self.assertEqual(payload["format"], "dsh-astock-ledger/1")
+        self.assertEqual(set(payload),
+                         {"format", "exportedAt", "cash", "positions",
+                          "trades", "watchlist"})
+        self.assertAlmostEqual(payload["cash"], 12345.67, places=2)
+        self.assertEqual(payload["trades"][0]["code"], "600000")
+        self.assertEqual(payload["trades"][0]["side"], "buy")
+        self.assertEqual(payload["trades"][0]["shares"], 1000)
+        # fee_detail 在 JSON 里必须是对象（dsh-astock 的 normalizeRows 同口径）
+        self.assertIsInstance(payload["trades"][0]["fee_detail"], dict)
+        self.assertEqual(payload["watchlist"][0]["code"], "000001")
+
+    def test_trades_csv_has_bom_and_chinese_header(self):
+        src = self._source()
+        res = maintenance.export_payload(src, "trades.csv")
+        text = res["content"]
+        self.assertTrue(text.startswith("\ufeff"), "CSV 必须带 BOM（Excel 不乱码）")
+        header = text.lstrip("\ufeff").split("\r\n", 1)[0]
+        self.assertEqual(header, "成交日期,代码,名称,方向,成交价,数量,"
+                                 "成交金额,费用,已实现盈亏,备注")
+        self.assertIn("买入", text)
+        self.assertTrue(text.endswith("\r\n"))
+
+    def test_watchlist_json_format(self):
+        src = self._source()
+        res = maintenance.export_payload(src, "watchlist")
+        payload = json.loads(res["content"])
+        self.assertEqual(payload["format"], "dsh-astock-watchlist/1")
+        self.assertEqual(payload["watchlist"][0]["note"], "观察")
+
+    def test_write_export_creates_file_next_to_ledger(self):
+        src = self._source()
+        res = maintenance.write_export(src, "ledger")
+        self.assertTrue(res["ok"])
+        self.assertTrue(os.path.isfile(res["path"]))
+        self.assertEqual(os.path.dirname(res["path"]),
+                         os.path.join(self.tmp, "exports"))
+
+
+class TestMaintenanceImport(MaintenanceTestBase):
+    def test_preview_then_import_roundtrip(self):
+        text = self._export_text(self._source())
+        preview = maintenance.preview_ledger_import(self.ledger, text, "all")
+        self.assertTrue(preview["ok"])
+        self.assertEqual(len(preview["positions"]["add"]), 1)
+        self.assertEqual(preview["trades"]["new"], 1)
+        self.assertEqual(len(preview["watchlist"]["add"]), 1)
+
+        res = maintenance.import_ledger(self.ledger, text, "all")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["applied"]["trades"], 1)
+        self.assertEqual(res["applied"]["watch"], 1)
+        pos = self.pos("600000")
+        self.assertEqual(pos["shares"], 1000)
+        self.assertAlmostEqual(self.ledger.get_cash()["balance"], 12345.67)
+        self.assertEqual([w["code"] for w in self.ledger.list_watch()], ["000001"])
+
+    def test_reimport_is_idempotent(self):
+        text = self._export_text(self._source())
+        maintenance.import_ledger(self.ledger, text, "all")
+        again = maintenance.import_ledger(self.ledger, text, "all")
+        self.assertEqual(again["applied"]["trades"], 0)
+        self.assertEqual(again["applied"]["skipped"], 1)
+        self.assertEqual(self.pos("600000")["shares"], 1000)
+
+    def test_watch_cash_scope_does_not_touch_trades_or_positions(self):
+        text = self._export_text(self._source())
+        self.ledger.record_trade("000001", "buy", 12.0, 200,
+                                 trade_date="2026-01-06")
+        res = maintenance.import_ledger(self.ledger, text, "watch_cash")
+        self.assertEqual(res["applied"]["trades"], 0)
+        self.assertEqual(res["applied"]["positions"], 0)
+        self.assertEqual(self.pos("000001")["shares"], 200)
+        self.assertAlmostEqual(self.ledger.get_cash()["balance"], 12345.67)
+        self.assertEqual([w["code"] for w in self.ledger.list_watch()], ["000001"])
+
+    def test_trades_scope_keeps_cash_and_watch(self):
+        text = self._export_text(self._source())
+        self.ledger.set_cash(777.0)
+        res = maintenance.import_ledger(self.ledger, text, "trades")
+        self.assertEqual(res["applied"]["trades"], 1)
+        self.assertEqual(self.ledger.get_cash()["balance"], 777.0)
+        self.assertEqual(self.ledger.list_watch(), [])
+
+    def test_import_is_merge_and_keeps_extra_positions(self):
+        """导入是合并而非快照覆盖：文件里没有的持仓必须保留，预览也要如实说。"""
+        self.ledger.record_trade("000001", "buy", 12.0, 200,
+                                 trade_date="2026-01-06")
+        text = self._export_text(self._source())
+        preview = maintenance.preview_ledger_import(self.ledger, text, "all")
+        self.assertEqual([k["code"] for k in preview["positions"]["keep"]],
+                         ["000001"])
+        self.assertIn("保留 1", preview["message"])
+        res = maintenance.import_ledger(self.ledger, text, "all")
+        self.assertEqual(self.pos("000001")["shares"], 200)
+        self.assertEqual(self.pos("600000")["shares"], 1000)
+
+    def test_manual_position_without_trades_is_written_back(self):
+        payload = {
+            "format": maintenance.EXPORT_FORMAT,
+            "exportedAt": "2026-01-01 00:00:00",
+            "cash": None,
+            "trades": [],
+            "watchlist": [],
+            "positions": [{"code": "600519", "name": "贵州茅台", "shares": 100,
+                           "cost_price": 1500.0, "opened_at": "2025-01-02"}],
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+        preview = maintenance.preview_ledger_import(self.ledger, text, "all")
+        self.assertEqual(preview["positions"]["add"][0]["code"], "600519")
+        res = maintenance.import_ledger(self.ledger, text, "all")
+        self.assertEqual(res["applied"]["positions"], 1)
+        self.assertEqual(self.pos("600519")["shares"], 100)
+        self.assertEqual(self.ledger.get_cash()["balance"], 0.0)
+
+    def test_watchlist_only_file_does_not_touch_cash(self):
+        """纯自选 JSON 没有 cash 字段：预览必须显示"不变"，落账不能改成 0。"""
+        self.ledger.set_cash(888.0)
+        payload = {"format": maintenance.WATCHLIST_FORMAT,
+                   "exportedAt": "2026-01-01 00:00:00",
+                   "watchlist": [{"code": "600519", "name": "贵州茅台"}]}
+        text = json.dumps(payload, ensure_ascii=False)
+        preview = maintenance.preview_ledger_import(self.ledger, text, "all")
+        self.assertEqual(preview["cash"]["after"], 888.0)
+        self.assertIn("文件里没有资金", preview["message"])
+        maintenance.import_ledger(self.ledger, text, "all")
+        self.assertEqual(self.ledger.get_cash()["balance"], 888.0)
+        self.assertEqual([w["code"] for w in self.ledger.list_watch()], ["600519"])
+
+    def test_bad_json_has_readable_reason(self):
+        res = maintenance.preview_ledger_import(self.ledger, "{坏", "all")
+        self.assertFalse(res["ok"])
+        self.assertIn("不是合法 JSON", res["message"])
+
+    def test_impossible_trade_fails_per_row_not_whole_batch(self):
+        payload = {
+            "format": maintenance.EXPORT_FORMAT, "exportedAt": "",
+            "cash": None, "positions": [], "watchlist": [],
+            "trades": [
+                {"trade_date": "2999-01-01", "code": "600000", "side": "buy",
+                 "price": 10.0, "shares": 100},
+                {"trade_date": "2026-01-05", "code": "600000", "side": "buy",
+                 "price": 10.0, "shares": 100},
+            ],
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+        res = maintenance.import_ledger(self.ledger, text, "all")
+        self.assertEqual(res["applied"]["trades"], 1)
+        self.assertEqual(len(res["applied"]["failed"]), 1)
+
+
+class TestMaintenanceTradesCsv(MaintenanceTestBase):
+    def test_csv_roundtrip_and_dedupe(self):
+        src = self._source()
+        csv_text = maintenance.export_payload(src, "trades.csv")["content"]
+        parsed = maintenance.parse_trade_rows(csv_text)
+        self.assertEqual(parsed["errors"], [])
+        self.assertEqual(len(parsed["rows"]), 1)
+        self.assertEqual(parsed["rows"][0]["side"], "buy")
+
+        preview = maintenance.preview_trade_rows(self.ledger, parsed["rows"])
+        self.assertEqual(preview["summary"]["ok"], 1)
+        res = maintenance.import_trades(self.ledger, csv_text, commit=True)
+        self.assertEqual(res["summary"]["applied"], 1)
+        again = maintenance.import_trades(self.ledger, csv_text, commit=True)
+        self.assertEqual(again["summary"]["applied"], 0)
+        self.assertEqual(again["summary"]["skipped"], 1)
+        self.assertEqual(self.pos("600000")["shares"], 1000)
+
+    def test_missing_required_header_reports_it(self):
+        parsed = maintenance.parse_trade_rows("名称,价格\n浦发银行,10.0")
+        self.assertEqual(parsed["rows"], [])
+        self.assertIn("表头缺少", parsed["errors"][0])
+
+    def test_bad_side_row_is_error(self):
+        parsed = maintenance.parse_trade_rows(
+            "成交日期,代码,方向,成交价,数量\n2026-01-05,600000,做多,10.0,1000")
+        self.assertEqual(parsed["rows"], [])
+        self.assertIn("方向", parsed["errors"][0])
+
+    def test_accepts_tsv_and_eight_digit_date(self):
+        parsed = maintenance.parse_trade_rows(
+            "日期\t股票代码\t买卖方向\t成交价\t成交数量\n"
+            "20260105\t600000\t买入\t10.0\t1000")
+        self.assertEqual(len(parsed["rows"]), 1)
+        self.assertEqual(parsed["rows"][0]["trade_date"], "2026-01-05")
+
+
+class TestMaintenanceToolSurface(MaintenanceTestBase):
+    def _plugin(self, path=None):
+        pl = astock.AstockPlugin()
+
+        class _App:
+            workspace = self.tmp
+            config = {"astock-plugin": {
+                "ledger_path": path or self.path}}
+
+            def save_config(self, updates):  # pragma: no cover - 本次用例不写配置
+                self.config.update(updates)
+
+        pl._app = _App()
+        return pl
+
+    def _run(self, pl, args):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(pl.execute("astock_migrate", args))
+        finally:
+            loop.close()
+
+    def test_export_action_writes_file_and_reports_path(self):
+        self.ledger.record_trade("600000", "buy", 10.0, 1000,
+                                 trade_date="2026-01-05", name="浦发银行")
+        out = self._run(self._plugin(), {"action": "export", "kind": "ledger"})
+        self.assertIn("已导出台账 JSON", out)
+        self.assertIn("astock-ledger-", out)
+        path = out.split("文件：`", 1)[1].split("`", 1)[0]
+        self.assertTrue(os.path.isfile(path))
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        self.assertEqual(payload["format"], "dsh-astock-ledger/1")
+
+    def test_import_action_previews_then_commits(self):
+        text = self._export_text(self._source())
+        imp_path = os.path.join(self.tmp, "import.json")
+        with open(imp_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        pl = self._plugin()
+        preview = self._run(pl, {"action": "import", "path": imp_path})
+        self.assertIn("台账导入预览", preview)
+        self.assertIn("新增", preview)
+        commit = self._run(pl, {"action": "import", "path": imp_path,
+                                "dry_run": False})
+        self.assertIn("导入完成", commit)
+        self.assertEqual(self.pos("600000")["shares"], 1000)
+
+    def test_import_trades_action_previews_and_commits(self):
+        src = self._source()
+        csv_text = maintenance.export_payload(src, "trades.csv")["content"]
+        imp_path = os.path.join(self.tmp, "trades.csv")
+        with open(imp_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(csv_text)
+        pl = self._plugin()
+        preview = self._run(pl, {"action": "import_trades", "path": imp_path})
+        self.assertIn("成交导入预览", preview)
+        commit = self._run(pl, {"action": "import_trades", "path": imp_path,
+                                "dry_run": False})
+        self.assertIn("成交已导入", commit)
+        self.assertEqual(self.pos("600000")["shares"], 1000)
+
+    def test_settings_action_exports_selected_kind(self):
+        """设置页「数据 · 导出」按选定格式只生成一份文件。"""
+        self.ledger.record_trade("600000", "buy", 10.0, 1000,
+                                 trade_date="2026-01-05")
+        pl = astock.AstockPlugin()
+        res = pl.settings_action("data_export", {"astock-plugin": {
+            "ledger_path": self.path, "data_export_kind": "trades"}})
+        self.assertTrue(res["ok"], res)
+        self.assertIn("成交 CSV", res["message"])
+        path = res["message"].split("文件：", 1)[1].split("\n", 1)[0].strip()
+        self.assertTrue(os.path.isfile(path), path)
+        with open(path, encoding="utf-8") as fh:
+            self.assertTrue(fh.read().startswith("\ufeff"))
+
+    def test_settings_action_import_json_preview_then_commit(self):
+        """设置页导入：JSON 自动识别，预览不落账，确认后才写台账。"""
+        src = self._source()
+        imp = os.path.join(self.tmp, "dsh-export.json")
+        with open(imp, "w", encoding="utf-8") as fh:
+            fh.write(self._export_text(src))
+        cfg = {"astock-plugin": {"ledger_path": self.path,
+                                 "data_import_path": imp,
+                                 "data_import_scope": "all"}}
+        pl = astock.AstockPlugin()
+        preview = pl.settings_action("data_import_preview", cfg)
+        self.assertTrue(preview["ok"], preview)
+        self.assertIn("预览", preview["message"])
+        self.assertIn("成交新增", preview["message"])
+        self.assertEqual(self.pos("600000"), None, "预览不能落账")
+        commit = pl.settings_action("data_import_commit", cfg)
+        self.assertTrue(commit["ok"], commit)
+        self.assertIn("导入完成", commit["message"])
+        self.assertEqual(self.pos("600000")["shares"], 1000)
+        self.assertEqual(self.ledger.get_cash()["balance"], 12345.67)
+
+    def test_settings_action_import_csv_auto_detect(self):
+        """设置页导入：CSV 自动走成交导入（不是报 JSON 解析失败）。"""
+        src = self._source()
+        imp = os.path.join(self.tmp, "dsh-export.csv")
+        with open(imp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(maintenance.export_payload(src, "trades.csv")["content"])
+        cfg = {"astock-plugin": {"ledger_path": self.path,
+                                 "data_import_path": imp}}
+        pl = astock.AstockPlugin()
+        preview = pl.settings_action("data_import_preview", cfg)
+        self.assertTrue(preview["ok"], preview)
+        self.assertIn("预览", preview["message"])
+        commit = pl.settings_action("data_import_commit", cfg)
+        self.assertTrue(commit["ok"], commit)
+        self.assertEqual(self.pos("600000")["shares"], 1000)
+
+    def test_settings_action_import_without_path_uses_latest_export(self):
+        """路径留空时用 exports/ 里最新的导出文件，避免手抄路径。"""
+        self.ledger.record_trade("600000", "buy", 10.0, 1000,
+                                 trade_date="2026-01-05")
+        pl = astock.AstockPlugin()
+        cfg = {"astock-plugin": {"ledger_path": self.path,
+                                 "data_export_kind": "ledger"}}
+        exported = pl.settings_action("data_export", cfg)
+        self.assertTrue(exported["ok"], exported)
+        preview = pl.settings_action("data_import_preview", cfg)
+        self.assertTrue(preview["ok"], preview)
+        self.assertIn("文件：", preview["message"])
+        self.assertIn("重复 1", preview["message"])   # 同一份台账，落账时会跳过
+
+    def test_data_panel_lists_exports_and_points_to_settings(self):
+        """右栏「数据」tab：看得见导出目录与文件，并指向设置页的操作入口。"""
+        self.ledger.record_trade("600000", "buy", 10.0, 1000,
+                                 trade_date="2026-01-05")
+        maintenance.write_export(self.ledger, "ledger")
+        out = self._plugin().panel_content("data", {})
+        self.assertIn("数据导出 / 导入", out)
+        self.assertIn("exports", out)
+        self.assertIn("astock-ledger-", out)
+        self.assertIn("设置页", out)
+        self.assertIn("预览差异", out)
+
+    def test_settings_action_import_missing_file_reports_path(self):
+        cfg = {"astock-plugin": {
+            "ledger_path": self.path,
+            "data_import_path": os.path.join(self.tmp, "nope.json")}}
+        res = astock.AstockPlugin().settings_action("data_import_preview", cfg)
+        self.assertFalse(res["ok"])
+        self.assertIn("找不到文件", res["message"])
+
+    def test_settings_action_exports_three_files(self):
+        self.ledger.record_trade("600000", "buy", 10.0, 1000,
+                                 trade_date="2026-01-05", name="浦发银行")
+        self.ledger.add_watch("000001", "平安银行")
+        # 设置页动作在宿主里走的是**未 install** 的实例，只把 config 传进来。
+        # 这里照样不预设 _app，覆盖 _SimpleApp 兜底路径。
+        pl = astock.AstockPlugin()
+        res = pl.settings_action(
+            "data_export_all", {"astock-plugin": {"ledger_path": self.path}})
+        self.assertTrue(res["ok"], res)
+        files = os.listdir(os.path.join(self.tmp, "exports"))
+        self.assertEqual(len(files), 3, files)
+        self.assertTrue(any(f.endswith(".json") for f in files))
+
+
 # ---------------------------------------------------------------- 提示引擎
 
 
@@ -710,7 +1090,7 @@ class TestPluginSurface(unittest.TestCase):
             "astock_flow", "astock_record", "astock_portfolio", "astock_hint",
             "astock_sentiment", "astock_events", "astock_sync", "astock_watch",
             "astock_pick", "astock_backtest", "astock_archive", "astock_act",
-            "astock_business", "astock_extra",
+            "astock_business", "astock_extra", "astock_migrate",
         })
 
     def test_command_names_are_prefixed(self):
@@ -4480,11 +4860,12 @@ class TestScanAll(unittest.TestCase):
 
 
 class TestQuantPanelTabs(unittest.TestCase):
-    """右栏面板：v2.1.0 起是「持仓 / 选股」两个 tab，选股 tab 内做三策略对比。
+    """右栏面板：v2.10.0 起是「持仓 / 选股 / 数据」三个 tab，选股 tab 内三策略对比。
 
     历史：此前是「持仓 / 动量 / 回归 / 价值」四个 tab。三 tab 的硬伤是
     面板只读、不能触发扫描，而设置页按钮一次只跑一套策略 → 另两个 tab
     永远是「尚未生成」。合并后少了两次 tab 切换，还能直接看出三套分歧。
+    v2.10.0 加「数据」tab：展示导出目录与文件，并指向设置页的导出/导入按钮。
     """
 
     def setUp(self):
@@ -4494,8 +4875,8 @@ class TestQuantPanelTabs(unittest.TestCase):
 
     def test_two_panels_only(self):
         ids = [p["id"] for p in self.plugin.contributes["panels"]]
-        self.assertEqual(ids, ["portfolio", "pick"],
-                         "tab 应收敛为「持仓 / 选股」两个")
+        self.assertEqual(ids, ["portfolio", "pick", "data"],
+                         "tab 应为「持仓 / 选股 / 数据」三个")
 
     def test_panel_ids_unique_and_titled(self):
         panels = self.plugin.contributes["panels"]
@@ -6835,7 +7216,8 @@ class TestReadOnlyToolsCoverage(unittest.TestCase):
         """有写副作用的工具**不能**进只读清单（否则无人值守任务能改台账/计划）。"""
         ro = set(astock.AstockPlugin.read_only_tools)
         for name in ("astock_record", "astock_sync", "astock_watch",
-                     "astock_archive", "astock_act", "astock_backtest", "astock_pick"):
+                     "astock_archive", "astock_act", "astock_backtest",
+                     "astock_pick", "astock_migrate"):
             with self.subTest(tool=name):
                 self.assertNotIn(name, ro, f"{name} 有写副作用，不该算只读")
 

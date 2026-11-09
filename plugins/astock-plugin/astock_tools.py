@@ -1,4 +1,4 @@
-"""工具声明（19 个工具的 schema）：纯静态数据，不含任何逻辑。
+"""工具声明（20 个工具的 schema）：纯静态数据，不含任何逻辑。
 
 ────────────────────────────────────────────────────────────────────────
 为什么单独成文件
@@ -240,6 +240,50 @@ def build_tools() -> List[ToolDefinition]:
                     "limit": {"type": "number", "description": "action=trades 返回条数，默认 30"},
                 },
                 "required": [],
+            },
+        ),
+        ToolDefinition(
+            name="astock_migrate",
+            description=(
+                "**数据迁移（导出 / 导入）**：台账不再只活在 SQLite 里，"
+                "而且与 DSH 版 A 股助手 dsh-astock 的格式互通，"
+                "两边的导出文件可以直接被对方导入。\n"
+                "action=export：导出到台账同目录 exports/。"
+                "kind=ledger 完整台账 JSON（资金+持仓+流水+自选）/ "
+                "kind=trades 成交 CSV（中文表头+BOM，Excel 不乱码）/ "
+                "kind=watchlist 自选 JSON。\n"
+                "action=import：导入台账 JSON（text 或 path）。"
+                "dry_run 默认 true 只预览差异；scope=all 全量 / "
+                "watch_cash 只恢复资金与自选 / trades 只回放成交（资金不动）。\n"
+                "action=import_trades：导入成交 CSV（dry_run 默认 true，"
+                "重复行按日期/代码/方向/价格/数量自动跳过）。\n"
+                "导入时持仓一律按流水回放复算（避免持仓与流水对不上），"
+                "资金不随成交自动扣减。"),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["export", "import", "import_trades"],
+                               "description": "export 导出 / import 导入台账 JSON / import_trades 导入成交 CSV"},
+                    "kind": {"type": "string",
+                             "enum": ["ledger", "trades", "watchlist"],
+                             "description": ("action=export 的种类：ledger 完整台账 JSON（默认）、"
+                                             "trades 成交 CSV、watchlist 自选 JSON")},
+                    "text": {"type": "string",
+                             "description": ("action=import / import_trades 的原文；"
+                                             "JSON 较长时建议改用 path 传文件路径")},
+                    "path": {"type": "string",
+                             "description": ("action=import / import_trades 的文件路径"
+                                             "（支持 ~ 展开）；与 text 二选一，text 优先")},
+                    "scope": {"type": "string",
+                              "enum": ["all", "watch_cash", "trades"],
+                              "description": ("action=import 的范围：all 成交+资金+自选（默认）、"
+                                              "watch_cash 只资金+自选、trades 只回放成交")},
+                    "dry_run": {"type": "boolean",
+                                "description": ("action=import / import_trades 是否只预览不落账，"
+                                                "默认 true；确认后用 false 落账")},
+                },
+                "required": ["action"],
             },
         ),
         ToolDefinition(
