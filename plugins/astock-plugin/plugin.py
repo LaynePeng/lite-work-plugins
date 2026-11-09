@@ -1033,7 +1033,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.9.1"
+    version = "2.9.2"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:

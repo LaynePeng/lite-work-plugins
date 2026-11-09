@@ -6886,6 +6886,39 @@ class TestCapitalEventCoverage(unittest.TestCase):
                 self.assertEqual(res.result, biz.NA,
                                  f"{text} 应判 na，实际 {res.result}")
 
+    def test_profit_distribution_is_na(self):
+        """利润分配/权益分派 → na（2026-11-09 补，此前误判 unknown）。
+
+        真实漏判：天山铝业 2026-11-13 临时股东会议案 1
+        《2026年半年度利润分配预案》被判 unknown。
+
+        为什么这个 bug 危险：`unknown` 的默认动作是「只观察」，
+        而它常被当成「门槛② 没过」。于是一条纯分红公告就否决了本不该否决的标的
+        ——门槛② 从放行器变成万能否决器。
+
+        注意 A 股公告标题的用词习惯：主流写法是「利润分配」「权益分派」，
+        而非「分红」「派息」。词表只收后者就是漏判根源。
+        """
+        import astock_business as biz
+        for text in ("2026年半年度利润分配预案",
+                     "2025年度权益分派实施公告",
+                     "2025年年度利润分配方案",
+                     "关于2026年半年度利润分配的公告",
+                     "关于2026年第三季度权益分派实施的公告"):
+            with self.subTest(event=text):
+                res = biz.judge(self._mix(), event_text=text)
+                self.assertEqual(res.result, biz.NA,
+                                 f"{text} 应判 na，实际 {res.result}")
+
+    def test_dividend_synonyms_covered(self):
+        """分红类同义表述已被词表覆盖（离线，不依赖判定逻辑）。"""
+        import astock_business as biz
+        for text in ("利润分配", "权益分派", "派发现金红利", "送红股",
+                     "转增", "分红", "派息"):
+            with self.subTest(word=text):
+                self.assertIn(text, biz._CAPITAL_EVENT_WORDS,
+                              f"「{text}」应收进资本运作词表")
+
     def test_na_does_not_veto(self):
         """na 的语义是"不适用"，passed 必须是 None（不参与否决）。"""
         import astock_business as biz
