@@ -85,8 +85,6 @@ AGENTS.md 第 4 条）。原因：它依赖用户自己的券商习惯、台账�
     contributes.panels 「持仓」右栏面板：Markdown 表格实时浮盈
                        + 「选股」面板（v2.1.0：一个 tab 内三策略对比，
                        一次数据采集同时算三套，价格同源可比）
-                       + 「数据」面板（v2.10.0：导出文件清单 + 导入操作指引；
-                       可点击的导出/导入按钮只能放设置页，面板协议只读）
 
 设计约束（遵循本仓库 AGENTS.md）
 - **零第三方依赖**：httpx/pandas 都不用，纯标准库（urllib/sqlite3/json/dataclasses）。
@@ -1040,7 +1038,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.10.0"
+    version = "2.10.1"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
@@ -1263,8 +1261,8 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                      "存了会自相矛盾。注意它不会立刻变长——"
                      "今天开始存，一年后才多出一年"},
             # ── 数据导出 / 导入（v2.10.0：与 DSH 版 dsh-astock 互通）────
-            # 设置页是宿主里唯一能放可点击控件的地方（右栏面板只读），
-            # 所以导出/导入做成一组「数据」字段，形成一页可操作的入口。
+            # 导出/导入全部在设置页完成：宿主右栏面板只读、点不了，
+            # 而配置区支持 type:"action" 按钮，所以这里做成一组「数据 ·」字段。
             {"key": "data_export_kind", "type": "select",
              "label": "数据 · 导出格式", "default": "ledger",
              "options": ["ledger", "trades", "watchlist"],
@@ -1307,8 +1305,6 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             # 保留旧的 pick-<strategy> id 入口（见 _panel_pick），
             # 已安装用户的书签/习惯不会失效。
             {"id": "pick", "title": "选股"},
-            # v2.10.0：数据导出/导入信息页（按钮在设置页，面板只读）。
-            {"id": "data", "title": "数据"},
         ],
         # 斜杠命令：宿主把它们放进输入框的 / 命令面板（快捷提示）。
         # 输入后原样透传给 Agent——靠 description 引导 Agent 调对应工具，

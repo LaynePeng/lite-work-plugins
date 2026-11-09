@@ -23,14 +23,11 @@
 """
 from __future__ import annotations
 
-import datetime as _dt
 import json as _json
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-import astock_maintenance as maint
 import astock_market as mkt
 import astock_market_mood as mood
 import astock_quant as quant
@@ -75,8 +72,6 @@ def render_panel(ctx: PanelContext, panel_id: str, config: Dict[str, Any]) -> st
     """面板总入口。任何异常都降级为可读提示，绝不让宿主面板挂掉。"""
     if panel_id == "pick" or panel_id.startswith("pick-"):
         return render_pick_panel(ctx.app, panel_id)
-    if panel_id == "data":
-        return render_data_panel(ctx)
     if panel_id != "portfolio":
         return ""
     try:
@@ -93,98 +88,6 @@ def render_panel(ctx: PanelContext, panel_id: str, config: Dict[str, Any]) -> st
     if style == "tree":
         return render_tree(ctx, d, flag)
     return render_markdown(ctx, d, flag)
-
-
-# ====================================================================== 数据面板
-
-
-def _size_text(size: int) -> str:
-    if size >= 1024 * 1024:
-        return f"{size / 1024 / 1024:.1f}MB"
-    if size >= 1024:
-        return f"{size / 1024:.1f}KB"
-    return f"{size}B"
-
-
-def render_data_panel(ctx: PanelContext) -> str:
-    """数据导出/导入面板（只读信息页 + 操作指引）。
-
-    为什么按钮不放这里：宿主面板协议只有 Markdown / lite-tree 两种**只读**
-    渲染，点不了。可点击的 `type:"action"` 只能放设置页，所以本面板负责
-    「让人找到东西」：台账在哪、导出目录里有什么、导入该按哪四步走；
-    真正的导出/导入按钮在设置页的「数据 ·」操作区。
-
-    面板每 5 秒刷新一次，这里只做 `listdir` + `stat`，不读台账、不联网。
-    """
-    try:
-        ledger = ctx.ledger()
-        ledger_path = str(getattr(ledger, "path", "") or "")
-        folder = maint.export_dir(ledger)
-    except Exception as exc:
-        logger.warning("[astock] 数据面板读取台账失败: %s", exc)
-        return (f"### 数据导出 / 导入\n\n"
-                f"台账读取失败：{type(exc).__name__}: {exc}\n\n"
-                f"检查设置页「台账文件路径」。")
-    files: List[Dict[str, Any]] = []
-    if os.path.isdir(folder):
-        try:
-            for name in os.listdir(folder):
-                if name.startswith("."):
-                    continue
-                full = os.path.join(folder, name)
-                try:
-                    stat = os.stat(full)
-                except OSError:
-                    continue
-                if not os.path.isfile(full):
-                    continue
-                files.append({"name": name, "size": stat.st_size,
-                              "mtime": stat.st_mtime})
-        except OSError as exc:
-            logger.debug("[astock] 扫描导出目录失败: %s", exc)
-    files.sort(key=lambda f: f["mtime"], reverse=True)
-
-    import_path = str(_cfg(ctx.app, "data_import_path", "") or "").strip()
-    scope = str(_cfg(ctx.app, "data_import_scope", "all") or "all").strip()
-    lines = [
-        "### 数据导出 / 导入",
-        "（JSON / CSV 格式与 DSH 版 A 股助手 dsh-astock 互通）",
-        "",
-        f"台账：`{ledger_path}`",
-        f"导出目录：`{folder}`（{len(files)} 个文件）",
-        "",
-    ]
-    if files:
-        rows = []
-        for item in files[:8]:
-            when = _dt.datetime.fromtimestamp(item["mtime"]).strftime(
-                "%m-%d %H:%M")
-            rows.append([item["name"], _size_text(item["size"]), when])
-        lines += [_table(["最近导出文件", "大小", "时间"], rows), ""]
-        if len(files) > 8:
-            lines.append(f"（只列最近 8 个，共 {len(files)} 个）")
-            lines.append("")
-    else:
-        lines += ["还没有导出文件。", ""]
-
-    lines += [
-        "**怎么导出**（设置页 → 插件 → A股助手 → 配置）：",
-        "1. 选「数据 · 导出格式」（ledger 完整台账 / trades 成交 CSV / watchlist 自选）",
-        "2. 点「数据 · 导出」；或点「数据 · 一次导出全部」生成三份",
-        "",
-        "**怎么导入**：",
-        "1. 在「数据 · 导入文件路径」填文件路径（留空＝用上面最新的导出文件）",
-        "2. 点页面底部「保存」（动作按钮只读已保存的配置）",
-        "3. 点「数据 · 预览差异（不落账）」看清会变什么",
-        "4. 点「数据 · 确认导入（落账）」才真正写台账",
-        "",
-        f"当前导入设置：路径 `{import_path or '（留空，用最新导出文件）'}`，"
-        f"范围 `{scope}`",
-        "",
-        "也可以在对话里直接说：`astock_migrate action=export` / "
-        "`astock_migrate action=import path=<文件>`。",
-    ]
-    return "\n".join(lines)
 
 
 # ====================================================================== 选股面板

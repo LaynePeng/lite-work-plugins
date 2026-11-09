@@ -863,18 +863,6 @@ class TestMaintenanceToolSurface(MaintenanceTestBase):
         self.assertIn("文件：", preview["message"])
         self.assertIn("重复 1", preview["message"])   # 同一份台账，落账时会跳过
 
-    def test_data_panel_lists_exports_and_points_to_settings(self):
-        """右栏「数据」tab：看得见导出目录与文件，并指向设置页的操作入口。"""
-        self.ledger.record_trade("600000", "buy", 10.0, 1000,
-                                 trade_date="2026-01-05")
-        maintenance.write_export(self.ledger, "ledger")
-        out = self._plugin().panel_content("data", {})
-        self.assertIn("数据导出 / 导入", out)
-        self.assertIn("exports", out)
-        self.assertIn("astock-ledger-", out)
-        self.assertIn("设置页", out)
-        self.assertIn("预览差异", out)
-
     def test_settings_action_import_missing_file_reports_path(self):
         cfg = {"astock-plugin": {
             "ledger_path": self.path,
@@ -4860,12 +4848,15 @@ class TestScanAll(unittest.TestCase):
 
 
 class TestQuantPanelTabs(unittest.TestCase):
-    """右栏面板：v2.10.0 起是「持仓 / 选股 / 数据」三个 tab，选股 tab 内三策略对比。
+    """右栏面板：v2.1.0 起是「持仓 / 选股」两个 tab，选股 tab 内做三策略对比。
 
     历史：此前是「持仓 / 动量 / 回归 / 价值」四个 tab。三 tab 的硬伤是
     面板只读、不能触发扫描，而设置页按钮一次只跑一套策略 → 另两个 tab
     永远是「尚未生成」。合并后少了两次 tab 切换，还能直接看出三套分歧。
-    v2.10.0 加「数据」tab：展示导出目录与文件，并指向设置页的导出/导入按钮。
+
+    v2.10.1 曾加过「数据」tab（列导出文件），但导出/导入按钮本来就在设置页，
+    面板这页既点不了也和设置页重复，已删除——**不要再加回来**：
+    面板只读，任何"在这里操作"的诉求都该落到设置页的 type:"action"。
     """
 
     def setUp(self):
@@ -4875,8 +4866,8 @@ class TestQuantPanelTabs(unittest.TestCase):
 
     def test_two_panels_only(self):
         ids = [p["id"] for p in self.plugin.contributes["panels"]]
-        self.assertEqual(ids, ["portfolio", "pick", "data"],
-                         "tab 应为「持仓 / 选股 / 数据」三个")
+        self.assertEqual(ids, ["portfolio", "pick"],
+                         "tab 应收敛为「持仓 / 选股」两个（导出/导入在设置页）")
 
     def test_panel_ids_unique_and_titled(self):
         panels = self.plugin.contributes["panels"]
