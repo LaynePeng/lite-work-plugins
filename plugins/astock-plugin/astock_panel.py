@@ -487,14 +487,30 @@ def _portfolio_excess(d: Dict[str, Any],
                       index_pct: Optional[float]) -> Optional[float]:
     """组合今日涨跌幅相对指数的超额（百分点）。
 
-    组合涨跌幅用**市值加权**：小仓位大涨不该代表整个组合。
-    分母是昨日市值（今日市值 / (1+涨幅) 的近似不可靠，直接用成本+
-    昨收算），这里简化为「按持仓市值加权个股涨跌幅」——精确的做法需要
-    昨收价，而 `change_pct` 已经是个股相对昨收的涨幅，加权即得组合涨幅。
+    组合涨跌幅必须用**当日盈亏 ÷ 日初持仓市值**：
+    `today_pnl` 已按逐笔口径（日初持仓 + 当日成交 − 费用）算好，
+    分母同样取日初市值，两者才是同一个时钟。
+
+    不能用「当前持仓市值加权 change_pct」：当日买入的票会把买入前的
+    涨幅整段算进组合，当日清仓的票则整段消失（权重里根本没有它）。
+    实测同一天这个近似把 −0.54% 算成 +1.17%，把「跑输」说成「跑赢」。
+
+    `day_start_mv` 缺失（老快照 / 单测桩）时才退回旧的加权近似；
+    若快照明确给了日初市值为 0（全是当日新建仓），则没有可比基准，
+    返回 None 而不是拿一个错的数用。
     """
     positions = d.get("positions") or []
     if not positions:
         return None
+    if "day_start_mv" in d:
+        base = float(d.get("day_start_mv") or 0.0)
+        today = d.get("today_pnl")
+        if today is None or base <= 0:
+            return None
+        port_pct = float(today) / base * 100.0
+        d["today_pnl_pct"] = round(port_pct, 2)      # 供上层显示
+        return mood.relative_strength(port_pct, index_pct)
+
     quotes = d.get("quotes") or {}
     total_mv = 0.0
     weighted = 0.0
@@ -569,10 +585,21 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
         out: List[str] = []
         if market_block:
             out += [market_block, "", "---", ""]
+        # 空仓不等于没有当日盈亏：当天清仓的票，盈亏仍要显示
+        today_txt = (_f(d.get("today_pnl")) if d.get("today_pnl") is not None
+                     else "-")
+        if d.get("today_pnl_incomplete"):
+            today_txt += "（不完整）"
         out += [_section("我的资产", "空仓"),
-                f"总资产 {_money(equity)}　可用资金 {_money(d.get('cash') or 0)}",
-                "",
-                "当前空仓。录入成交："
+                f"总资产 {_money(equity)}　今日 {today_txt}　"
+                f"可用资金 {_money(d.get('cash') or 0)}",
+                ""]
+        if d.get("today_pnl_incomplete"):
+            miss = "、".join(str(c) for c in
+                            (d.get("today_pnl_missing") or [])[:5])
+            out += [f"⚠️ **今日盈亏不完整**：{miss or '当日成交过多'} "
+                    f"缺现价/昨收，已按可算部分展示（不是 0）。", ""]
+        out += ["当前空仓。录入成交："
                 "`astock_record side=buy code=... price=... shares=...`"]
         if wline.strip():
             out += ["", "---", "", _section("盯盘"), "", wline.strip()]
@@ -590,11 +617,17 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
     #    不是大盘信息，放一起用户才看得出「市场涨 vs 我涨」的对照。
     total_mv = d.get("total_market_value") or 0
     pnl_v = d.get("float_pnl") or 0
-    today_pnl = d.get("today_pnl") or 0
+    today_pnl = d.get("today_pnl")
+    # 缺价时 today_pnl 为 None（不再冒充 0）：显示破折号、trend 走 flat，
+    # 否则「行情拉取失败」会被画成一条绿色的「今日 0」。
+    today_note = f"今日 {_f(today_pnl)}" if today_pnl is not None else "今日 -"
+    if d.get("today_pnl_incomplete"):
+        today_note += "（不完整）"
     cash = d.get("cash") or 0
     asset_cards: List[Dict[str, Any]] = [
-        _kpi("总资产", _money(equity), f"今日 {_f(today_pnl)}",
-             trend="up" if today_pnl >= 0 else "down"),
+        _kpi("总资产", _money(equity), today_note,
+             trend=("flat" if today_pnl is None
+                    else "up" if today_pnl >= 0 else "down")),
         _kpi("持仓市值", _money(total_mv),
              note=f"占总资产 {total_mv / equity * 100:.0f}%" if equity else ""),
         _kpi("浮动盈亏", _f(pnl_v), _pnl_pct_of(d),
@@ -608,19 +641,24 @@ def render_markdown(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
     pos_excess = _portfolio_excess(d, sh_pct_now)
     if pos_excess is not None:
         rs = mood.rs_verdict(pos_excess)
+        tail = "（数据不完整）" if d.get("today_pnl_incomplete") else ""
         if rs and rs != "基本同步":
             asset_cards.append(_kpi(
                 "今日超额", f"{pos_excess:+.2f}pp", rs,
-                note=("持仓拖了后腿" if pos_excess < 0 else "持仓强于大盘"),
+                note=("持仓拖了后腿" if pos_excess < 0 else "持仓强于大盘") + tail,
                 trend="up" if pos_excess >= 0 else "down"))
         else:
             asset_cards.append(_kpi(
                 "今日超额", f"{pos_excess:+.2f}pp", "基本同步",
-                note=f"vs 上证 {_pct(sh_pct_now)}", trend="flat"))
+                note=f"vs 上证 {_pct(sh_pct_now)}{tail}", trend="flat"))
     out += [_section("我的资产", f"{len(d['positions'])} 只持仓"),
             "```kpi",
             _json.dumps({"items": asset_cards}, ensure_ascii=False),
             "```", ""]
+    if d.get("today_pnl_incomplete"):
+        miss = "、".join(str(c) for c in (d.get("today_pnl_missing") or [])[:5])
+        out += [f"⚠️ **今日盈亏不完整**：{miss or '当日成交过多'} 缺现价/昨收，"
+                f"已按可算部分展示（不是 0）。", ""]
 
     # ── ③ 持仓：**一只一张卡片**（v2.5.4，用户明确要求："每一个持仓一个卡片"）
     cfg = ctx.hints_cfg()
@@ -876,7 +914,8 @@ def render_tree(ctx: PanelContext, d: Dict[str, Any], flag: str) -> str:
             "tone": "ok" if (d["float_pnl"] or 0) >= 0 else "warn",
             "meta": [f"市值 {_money(d['total_market_value'])}",
                      f"浮盈 {_f(d['float_pnl'])}",
-                     f"今日 {_f(d['today_pnl'])}",
+                     (f"今日 {_f(d.get('today_pnl'))}"
+                      + ("（不完整）" if d.get("today_pnl_incomplete") else "")),
                      f"可用 {_money(d['cash'])}"],
             "chips": ([flag.split("：")[0].replace("*", "").strip()]
                       if flag else []) + [

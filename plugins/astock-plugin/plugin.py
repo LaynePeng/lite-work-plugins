@@ -288,7 +288,8 @@ import astock_quant as quant
 import astock_quant_tool as quant_tool
 import astock_sentiment_data as senti_data
 import astock_tools as tools_decl
-from astock_ledger import Ledger, LedgerError, default_ledger_path
+from astock_ledger import (Ledger, LedgerError, default_ledger_path,
+                          today_pnl_breakdown)
 
 logger = logging.getLogger("litework.plugins.astock")
 
@@ -1038,7 +1039,7 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
     """A 股助手：行情研究 + 手工交易台账 + 下单提示（不含任何委托通道）。"""
 
     name = PLUGIN_NAME
-    version = "2.10.1"
+    version = "2.10.2"
 
     #: 纯只读工具（宿主 lite-work >= 2.1.1 的 `ToolPlugin.read_only_tools` 协议）。
     #:
@@ -1742,6 +1743,10 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         此前自选股**从不取行情**，看板里每只自选都落到 `if not q:` 分支显示
         「（行情未取到）」——实测 5 只自选里 4 张卡片是空的，看着像坏了。
         默认 False：`astock_hint` 等调用方自行按需补拉，避免重复请求。
+
+        「今日盈亏」按 `today_pnl_breakdown()` 逐笔重算（日初持仓 + 当日成交
+        − 当日费用），因此行情**必须覆盖当日清仓的代码**——它们已不在
+        `positions` 里，只拉持仓行情会让那部分亏损整段消失。
         """
         ledger = self._get_ledger()
         positions = ledger.list_positions()
@@ -1749,21 +1754,37 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
         realized = ledger.realized_pnl()
         fees_total = ledger.total_fee()
 
+        # 当日成交：算「今日盈亏」必须逐笔重算，不能只看当前持仓——
+        # 当日清仓的票已经不在 positions 里，不读流水就等于把它的亏损
+        # 从账上抹掉（实测把 −55.62 显示成 +109.00）。
+        today = dt.date.today().isoformat()
+        today_trades = ledger.trades(start=today, end=today, limit=500)
+
         quotes: Dict[str, Dict[str, Any]] = {}
-        if positions:
+        # 行情要覆盖「当日成交过但已清仓」的代码，否则拿不到现价（及其昨收），
+        # 那部分盈亏只能跳过 → 当日盈亏再次失真。
+        codes_needed: List[str] = []
+        for row in list(positions) + list(today_trades):
+            code = str(row.get("code") or "")
+            if code and code not in codes_needed:
+                codes_needed.append(code)
+        if codes_needed:
             items = []
-            for p in positions:
+            for code in codes_needed:
                 try:
-                    code, venue = mkt.normalize_code(p["code"])
+                    c, venue = mkt.normalize_code(code)
                 except ValueError:
                     continue
-                items.append((code, venue, "stock"))
+                items.append((c, venue, "stock"))
             if items:
-                try:
-                    for q in data.fetch_quotes(items):
-                        quotes[q.code] = q.as_dict()
-                except data.DataError as exc:
-                    logger.warning("[astock] 持仓行情获取失败: %s", exc)
+                # 分批请求：持仓 + 当日清仓可能超过一次上限（50），
+                # 截断会把排在后面的清仓代码丢掉 → 那部分盈亏又漏算。
+                for i in range(0, len(items), MAX_QUOTE_BATCH):
+                    try:
+                        for q in data.fetch_quotes(items[i:i + MAX_QUOTE_BATCH]):
+                            quotes[q.code] = q.as_dict()
+                    except data.DataError as exc:
+                        logger.warning("[astock] 持仓行情获取失败: %s", exc)
 
         # 自选股行情（只在需要时打，行情源有限速）
         watch_quotes: Dict[str, Dict[str, Any]] = {}
@@ -1788,10 +1809,18 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                 except data.DataError as exc:
                     logger.warning("[astock] 自选行情获取失败: %s", exc)
 
+        # 当日盈亏 = 日初持仓段 + 当日买入段 + 当日卖出段 − 当日费用（逐笔重算）。
+        # 旧的 `(q["change"]) * p["shares"]` 只在「昨天就持有、今天没动」时
+        # 成立：当日买入虚增、当日清仓漏算、费用从不扣，方向都可能反。
+        pnl = today_pnl_breakdown(positions, today_trades, quotes)
+        total_today_pnl = pnl["total"]
+        per_code_pnl = pnl["per_code"]
+        truncated = len(today_trades) >= 500      # trades() 上限，超过则统计不全
+        missing_codes = list(pnl["missing"])
+
         rows = []
         total_mv = 0.0
         total_float_pnl = 0.0
-        total_today_pnl = 0.0
         for p in positions:
             q = quotes.get(p["code"]) or {}
             price = q.get("price") or p["cost_price"]
@@ -1799,14 +1828,14 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             total_mv += mv
             float_pnl = (price - p["cost_price"]) * p["shares"]
             total_float_pnl += float_pnl
-            today_pnl = (q.get("change") or 0) * p["shares"]
-            total_today_pnl += today_pnl
+            # 缺价时为 None → 表格显示 "-"，不冒充当日持平
+            today_pnl = per_code_pnl.get(p["code"])
             pnl_pct = mkt.pct_change(price, p["cost_price"])
             rows.append([
                 f"{p['name'] or '-'}({p['code']})", p["shares"],
                 _f(p["cost_price"], 3), _f(price),
                 f"{_f(float_pnl)} ({_pct(pnl_pct)})",
-                f"{_f(today_pnl)}",
+                _f(today_pnl),
                 _f(p["available_today"], 0), _money(mv),
             ])
 
@@ -1825,13 +1854,18 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
             ["可用资金", f"{float(cash['balance'] or 0):,.2f} 元"],
             ["账户总市值", f"{equity:,.2f} 元"],
             ["浮动盈亏", f"{total_float_pnl:+,.2f} 元"],
-            ["今日盈亏", f"{total_today_pnl:+,.2f} 元"],
+            ["今日盈亏（含当日费用）",
+             f"{total_today_pnl:+,.2f} 元" if total_today_pnl is not None else "-"],
             ["已实现盈亏（累计）", f"{realized['realized_pnl']:+,.2f} 元"],
             ["累计交易费用", f"{fees_total:,.2f} 元"],
             ["持仓数量", f"{len(positions)} 只"],
         ]))
         if not quotes and positions:
             lines += ["", "⚠️ 行情获取失败，上表现价用成本价代替，盈亏仅供参考。"]
+        if pnl["incomplete"] or truncated:
+            why = "、".join(missing_codes[:8]) or "当日成交超过 500 笔"
+            lines += ["", f"⚠️ **今日盈亏不完整**：{why} 缺现价/昨收，"
+                          f"已按可算部分展示（不是 0）。"]
         return {
             "text": "\n".join(lines),
             "data": {
@@ -1841,7 +1875,11 @@ class AstockPlugin(MarketToolsMixin, LedgerToolsMixin,
                 "total_market_value": total_mv, "equity": equity,
                 "cash": float(cash["balance"] or 0),
                 "float_pnl": round(total_float_pnl, 2),
-                "today_pnl": round(total_today_pnl, 2),
+                "today_pnl": total_today_pnl,
+                "today_pnl_incomplete": bool(pnl["incomplete"] or truncated),
+                "today_pnl_missing": missing_codes,
+                "today_fee": pnl["fees"],
+                "day_start_mv": pnl["day_start_mv"],
                 "realized_pnl": realized["realized_pnl"],
             },
         }

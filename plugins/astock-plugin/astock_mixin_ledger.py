@@ -466,6 +466,11 @@ class LedgerToolsMixin:
         if not spec:
             return ""
         lines = [board.render_board_json(spec), ""]
+        if data_.get("today_pnl_incomplete"):
+            miss = "、".join(str(c) for c in
+                            (data_.get("today_pnl_missing") or [])[:5])
+            lines += [f"⚠️ **今日盈亏不完整**：{miss or '当日成交过多'} "
+                      f"缺现价/昨收，已按可算部分展示（不是 0）。", ""]
         # 看板是"扫一眼"的视图，明细数字仍需可核对 → 附一行口径说明
         lines.append(
             f"共 {len(data_['positions'])} 只持仓、"

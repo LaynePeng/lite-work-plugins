@@ -173,6 +173,7 @@ backtest_tool = astock.backtest_tool  # 回测取数/缓存/卡片接入层
 archive_mod = astock.archive_mod      # 本地历史行情存档（v2.0.0）
 maintenance = astock.maint            # 台账导出/导入（v2.10.0，与 dsh-astock 互通）
 astock_actions = astock.actions       # 操作指示（先卖后买）（v2.0.0）
+import astock_ledger                   # 台账层模块（当日盈亏重算函数）
 
 
 # ---------------------------------------------------------------- 市场规则
@@ -518,6 +519,210 @@ class TestLedgerCashAndWatch(LedgerTestBase):
         self.assertEqual(self.ledger.list_positions(), [])
         self.assertEqual(self.ledger.trades(), [])
         self.assertEqual(self.ledger.realized_pnl()["realized_pnl"], 0.0)
+
+
+# ---------------------------------------------------------------- 当日盈亏
+
+
+class TestTodayPnl(LedgerTestBase):
+    """`today_pnl_breakdown`：当日盈亏必须按「日初持仓 + 当日成交 − 费用」重算。
+
+    回归背景（2026-11-10 实盘）：`(q["change"]) * p["shares"]` 只在
+    「昨天就持有、今天一股没动」时成立。当日买入虚增、当日清仓漏算、
+    费用从不扣，真实 −55.62 被显示成 +109.00（方向反了），且同一个错数
+    同时进看板标题 / KPI 卡 / 状态栏 / 超额卡。
+    """
+
+    def _trades_today(self):
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        return self.ledger.trades(start=today, end=today, limit=500)
+
+    def test_buy_today_uses_fill_price_not_prev_close(self):
+        """当日新建仓：基准是成交价，不是昨收（旧写法会把自己买入前的涨算成收益）。"""
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        r = self.ledger.record_trade("002241", "buy", 25.73, 100,
+                                     trade_date=today, name="歌尔股份")
+        res = astock_ledger.today_pnl_breakdown(
+            self.ledger.list_positions(), self._trades_today(),
+            {"002241": {"price": 25.69, "prev_close": 24.74,
+                        "change": 0.95, "change_pct": 3.84}})
+        expect = round((25.69 - 25.73) * 100 - r["fee"], 2)
+        self.assertAlmostEqual(res["total"], expect, places=2)
+        self.assertLess(res["total"], 0, "当日买入后下跌应亏，不能显示成赚")
+        # 全是当日新建仓 → 没有日初市值，超额收益也就没有基准
+        self.assertEqual(res["day_start_mv"], 0.0)
+
+    def test_sell_cleared_today_still_counted(self):
+        """当日清仓：持仓表里已没有它，但亏损必须仍计入（行情要按流水补拉）。"""
+        import datetime as dt
+        yday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("002532", "buy", 12.0, 100,
+                                 trade_date=yday, name="天山铝业")
+        sell = self.ledger.record_trade("002532", "sell", 11.61, 100,
+                                        trade_date=today, name="天山铝业")
+        self.assertEqual(self.ledger.list_positions(), [])
+        res = astock_ledger.today_pnl_breakdown(
+            self.ledger.list_positions(), self._trades_today(),
+            {"002532": {"price": 11.61, "prev_close": 12.16,
+                        "change": -0.55, "change_pct": -4.52}})
+        expect = round((11.61 - 12.16) * 100 - sell["fee"], 2)
+        self.assertAlmostEqual(res["total"], expect, places=2)
+        self.assertIn("002532", res["per_code"])
+        self.assertIn("002532", res["cleared"])
+
+    def test_fees_are_deducted(self):
+        """当日有成交：费用必须扣（价格没动时当日盈亏就是 −费用）。"""
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        r = self.ledger.record_trade("002241", "buy", 25.73, 100,
+                                     trade_date=today, name="歌尔股份")
+        res = astock_ledger.today_pnl_breakdown(
+            self.ledger.list_positions(), self._trades_today(),
+            {"002241": {"price": 25.73, "prev_close": 25.0}})
+        self.assertAlmostEqual(res["total"], -r["fee"], places=2)
+        self.assertAlmostEqual(res["fees"], r["fee"], places=2)
+
+    def test_reported_case_closes_to_broker(self):
+        """实盘四只票的完整回归：−55.62（旧口径 +109.00）。"""
+        import datetime as dt
+        yday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("002532", "buy", 12.00, 100,
+                                 trade_date=yday, name="天山铝业")
+        self.ledger.record_trade("510500", "buy", 6.60, 500,
+                                 trade_date=yday, name="中证500ETF")
+        self.ledger.record_trade("512890", "buy", 1.24, 3000,
+                                 trade_date=yday, name="红利低波ETF")
+        self.ledger.record_trade("002532", "sell", 11.61, 100,
+                                 trade_date=today, name="天山铝业",
+                                 fee_override=5.59)
+        self.ledger.record_trade("002241", "buy", 25.73, 100,
+                                 trade_date=today, name="歌尔股份",
+                                 fee_override=5.03)
+        quotes = {
+            "002532": {"price": 11.61, "prev_close": 12.16, "change": -0.55},
+            "002241": {"price": 25.69, "prev_close": 24.74, "change": 0.95},
+            "510500": {"price": 6.67, "prev_close": 6.612, "change": 0.058},
+            "512890": {"price": 1.24, "prev_close": 1.245, "change": -0.005},
+        }
+        res = astock_ledger.today_pnl_breakdown(
+            self.ledger.list_positions(), self._trades_today(), quotes)
+        # 日初市值：100×12.16 + 500×6.612 + 3000×1.245 = 8257.00
+        self.assertAlmostEqual(res["day_start_mv"], 8257.00, places=2)
+        self.assertAlmostEqual(res["total"], -55.62, places=2)
+        self.assertFalse(res["incomplete"])
+        # 逐段核对：清仓 −55 − 费 5.59；新建仓 −4 − 费 5.03；两只 ETF +29 / −15
+        self.assertAlmostEqual(res["per_code"]["002532"], -60.59, places=2)
+        self.assertAlmostEqual(res["per_code"]["002241"], -9.03, places=2)
+        self.assertAlmostEqual(res["per_code"]["510500"], 29.00, places=2)
+        self.assertAlmostEqual(res["per_code"]["512890"], -15.00, places=2)
+
+    def test_missing_quote_is_not_silently_zero(self):
+        """缺价不冒充 0：全部拿不到价时 total=None 且标 incomplete。"""
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("002241", "buy", 25.73, 100,
+                                 trade_date=today, name="歌尔股份")
+        res = astock_ledger.today_pnl_breakdown(
+            self.ledger.list_positions(), self._trades_today(), {})
+        self.assertIsNone(res["total"])
+        self.assertTrue(res["incomplete"])
+        self.assertIn("002241", res["missing"])
+
+    def test_prev_close_can_come_from_change_field(self):
+        """有的源只给涨跌额不给昨收：用 price−change 还原，不因此整段跳过。"""
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("510500", "buy", 6.60, 500,
+                                 trade_date=(dt.date.today()
+                                             - dt.timedelta(days=1)).isoformat(),
+                                 name="中证500ETF")
+        res = astock_ledger.today_pnl_breakdown(
+            self.ledger.list_positions(), self._trades_today(),
+            {"510500": {"price": 6.67, "change": 0.058}})
+        self.assertFalse(res["incomplete"], res["missing"])
+        self.assertAlmostEqual(res["total"], 500 * 0.058, places=2)
+
+
+class TestSnapshotTodayPnl(LedgerTestBase):
+    """`_snapshot` 端到端：行情必须覆盖「当日清仓」的代码，数据体带完整性标记。"""
+
+    def _plugin(self):
+        pl = astock.AstockPlugin()
+        pl._app = types.SimpleNamespace(
+            workspace=self.tmp,
+            config={"astock-plugin": {"ledger_path": self.path}})
+        return pl
+
+    def _seed(self):
+        import datetime as dt
+        yday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        today = dt.date.today().isoformat()
+        self.ledger.record_trade("002532", "buy", 12.00, 100,
+                                 trade_date=yday, name="天山铝业")
+        self.ledger.record_trade("510500", "buy", 6.60, 500,
+                                 trade_date=yday, name="中证500ETF")
+        self.ledger.record_trade("512890", "buy", 1.24, 3000,
+                                 trade_date=yday, name="红利低波ETF")
+        self.ledger.record_trade("002532", "sell", 11.61, 100,
+                                 trade_date=today, name="天山铝业",
+                                 fee_override=5.59)
+        self.ledger.record_trade("002241", "buy", 25.73, 100,
+                                 trade_date=today, name="歌尔股份",
+                                 fee_override=5.03)
+
+    def _quotes(self):
+        import astock_data as d
+        return {
+            "002532": d.Quote(code="002532", venue="sz", name="天山铝业",
+                              price=11.61, prev_close=12.16, change=-0.55),
+            "002241": d.Quote(code="002241", venue="sz", name="歌尔股份",
+                              price=25.69, prev_close=24.74, change=0.95),
+            "510500": d.Quote(code="510500", venue="sh", name="中证500ETF",
+                              price=6.67, prev_close=6.612, change=0.058),
+            "512890": d.Quote(code="512890", venue="sh", name="红利低波ETF",
+                              price=1.24, prev_close=1.245, change=-0.005),
+        }
+
+    def _run_snapshot(self, quotes):
+        import astock_data as d
+        from unittest.mock import patch
+        asked = []
+        pool = {q.code: q for q in quotes}
+
+        def fake_fetch(items, use_cache=True):
+            asked.extend(c for c, _v, _k in items)
+            return [pool[c] for c, _v, _k in items if c in pool]
+
+        pl = self._plugin()
+        with patch.object(d, "fetch_quotes", fake_fetch):
+            snap = pl._snapshot()
+        return snap["data"], snap["text"], asked
+
+    def test_snapshot_total_closes_and_fetches_cleared_code(self):
+        self._seed()
+        data, text, asked = self._run_snapshot(list(self._quotes().values()))
+        self.assertAlmostEqual(data["today_pnl"], -55.62, places=2)
+        self.assertFalse(data["today_pnl_incomplete"])
+        self.assertAlmostEqual(data["day_start_mv"], 8257.00, places=2)
+        # 已清仓的天山必须被拉行情，否则它的 −55 会整段消失
+        self.assertIn("002532", asked)
+        self.assertIn("002241", asked)
+        self.assertIn("今日盈亏（含当日费用）", text)
+        self.assertIn("-55.62", text)
+
+    def test_snapshot_marks_incomplete_when_cleared_quote_missing(self):
+        self._seed()
+        quotes = [q for q in self._quotes().values() if q.code != "002532"]
+        data, text, _asked = self._run_snapshot(quotes)
+        self.assertTrue(data["today_pnl_incomplete"])
+        self.assertIn("002532", data["today_pnl_missing"])
+        self.assertIn("今日盈亏不完整", text)
+        # 拿不到价的不是 0 而是"没算"，总计只含可算部分
+        self.assertAlmostEqual(data["today_pnl"], 4.97, places=2)
 
 
 # ---------------------------------------------------------------- 台账导出/导入
@@ -2754,6 +2959,47 @@ class TestPanelRender(unittest.TestCase):
         mkt = _fences(out, "kpi")[0]["items"]
         self.assertNotIn("今日超额", [it["label"] for it in mkt])
 
+    def test_excess_uses_day_start_mv_not_current_weight(self):
+        """今日超额的分母是**日初持仓市值**，不是「当前市值加权 change_pct」。
+
+        实盘回归：当日新建仓的歌尔 +3.84% 被整段算进组合、当日清仓的天山
+        −5.67% 整段消失，组合被算成 +1.17%，把「跑输」说成「跑赢」。
+        正确口径：当日盈亏 −45.00 / 日初市值 8257 = −0.54%。
+        """
+        pl = self._plugin("markdown")
+        quote = {"price": 25.69, "prev_close": 24.74, "change_pct": 3.84}
+        pos = [{"code": "002241", "name": "歌尔股份", "shares": 100,
+                "cost_price": 25.73, "available_today": 0}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {"002241": quote}, "watch_quotes": {},
+            "total_market_value": 2569.0, "equity": 2569.0, "cash": 0.0,
+            "float_pnl": -4.0, "today_pnl": -45.0, "day_start_mv": 8257.0,
+            "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        exc = next((it for it in _fences(out, "kpi")[1]["items"]
+                    if it["label"] == "今日超额"), None)
+        self.assertIsNotNone(exc, "给了日初市值就该能算超额")
+        # −0.54% vs 上证 +1.08% → 约 −1.62pp，跑输（旧口径会算成 +1.17% 跑赢）
+        self.assertIn("跑输", exc.get("delta", ""))
+        self.assertEqual(exc["trend"], "down")
+        self.assertIn("拖了后腿", exc.get("note", ""))
+
+    def test_incomplete_today_pnl_is_flagged_not_zero(self):
+        """当日盈亏算不全时显式提示，KPI 卡不画成绿色的「今日 0」。"""
+        pl = self._plugin("markdown")
+        pos = [{"code": "002532", "name": "天山铝业", "shares": 0,
+                "cost_price": 11.8, "available_today": 0}]
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": pos, "quotes": {}, "watch_quotes": {},
+            "total_market_value": 0.0, "equity": 100.0, "cash": 100.0,
+            "float_pnl": 0.0, "today_pnl": None, "day_start_mv": 0.0,
+            "today_pnl_incomplete": True,
+            "today_pnl_missing": ["002532"], "realized_pnl": 0.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("今日盈亏不完整", out)
+        self.assertIn("今日 -（不完整）", out)
+        self.assertIn("002532", out)
+
     def test_tree_is_valid_litetree_json(self):
         import json
         pl = self._snapshot_stub(self._plugin("tree"))
@@ -2799,6 +3045,17 @@ class TestPanelRender(unittest.TestCase):
             "today_pnl": 0.0, "realized_pnl": 0.0}}
         out = pl.panel_content("portfolio", {})
         self.assertIn("空仓", out)
+
+    def test_empty_portfolio_still_reports_today_pnl(self):
+        """清仓后的当日盈亏仍要显示：空仓不等于今天没发生盈亏。"""
+        pl = self._plugin("markdown")
+        pl._snapshot = lambda **kw: {"data": {
+            "positions": [], "quotes": {}, "watch_quotes": {},
+            "total_market_value": 0.0, "equity": 19940.06, "cash": 19940.06,
+            "float_pnl": 0.0, "today_pnl": -55.62, "day_start_mv": 8257.0,
+            "realized_pnl": -55.0}}
+        out = pl.panel_content("portfolio", {})
+        self.assertIn("今日 -55.62", out)
 
     def test_broken_ledger_degrades_gracefully(self):
         pl = self._plugin()

@@ -128,6 +128,123 @@ def _json_loads(text: str, default: Any = None) -> Any:
         return default
 
 
+# ------------------------------------------------------ 当日盈亏（逐笔重算）
+
+def today_pnl_breakdown(positions: Iterable[Dict[str, Any]],
+                        trades: Iterable[Dict[str, Any]],
+                        quotes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """按「日初持仓 + 当日成交」逐段重算当日盈亏（含当日费用）。
+
+    为什么不能再用「涨跌额 × 当前持仓」：`change` = 现价 − 昨收，这个式子
+    只在「昨天就持有、今天一股没动」时成立。当日买入会把**买入前**的涨幅
+    算成自己的收益，当日清仓的股票在 positions 表里已经消失、亏损直接漏算，
+    费用也从未计入。实测一例：真实 −55.62 被显示成 +109.00，方向都反了。
+
+    口径（与券商「当日盈亏」闭合，可用「今日总资产 − 昨日总资产」复核）：
+
+        日初持仓 × (现价 − 昨收)
+        + Σ 当日买入 × (现价 − 买入成交价)
+        + Σ 当日卖出 × (卖出成交价 − 现价)
+        − 当日全部费用
+
+    这是无出入金时的现金流恒等式：今日盈亏 ＝（收盘市值 + 当日现金）
+    −（昨收市值 + 昨日现金）。当日买入后仍持有的部分只算「成交价 → 现价」，
+    清仓部分只算「昨收 → 成交价」，与 `positions` 里还剩多少股无关。
+
+    **缺价不补齐**（这里的静默 0 会让亏损日看起来平盘）：
+      · 现价缺失 → 该代码整段算不了，记进 `missing`、`incomplete=True`；
+      · 昨收缺失且日初有持仓 → 同样跳过（不拿成本价/买入价冒充昨收）。
+      全部算不出来时 `total=None`，调用方必须显示「-/不完整」而不是 0。
+    """
+
+    def norm(code: Any) -> str:
+        try:
+            c, _ = normalize_code(str(code or ""))
+            return c
+        except ValueError:
+            return str(code or "")
+
+    cur_shares: Dict[str, int] = {}
+    for p in positions:
+        code = norm(p.get("code"))
+        cur_shares[code] = cur_shares.get(code, 0) + int(
+            to_float(p.get("shares"), 0) or 0)
+
+    by_code: Dict[str, Dict[str, List[Dict[str, float]]]] = {}
+    fees_by_code: Dict[str, float] = {}
+    for t in trades:
+        code = norm(t.get("code"))
+        side = str(t.get("side") or "").strip().lower()
+        if side not in ("buy", "sell"):
+            continue
+        price = to_float(t.get("price"), None)
+        shares = int(to_float(t.get("shares"), 0) or 0)
+        if price is None or shares <= 0:
+            continue
+        bucket = by_code.setdefault(code, {"buy": [], "sell": []})
+        bucket[side].append({"price": float(price), "shares": shares})
+        fees_by_code[code] = (fees_by_code.get(code, 0.0)
+                              + float(to_float(t.get("fee"), 0.0) or 0.0))
+
+    qmap: Dict[str, Dict[str, Any]] = {}
+    for key, q in (quotes or {}).items():
+        qmap[norm(key)] = q or {}
+
+    per_code: Dict[str, float] = {}
+    missing: List[str] = []
+    day_start_mv = 0.0
+    raw_total = 0.0
+    codes = list(dict.fromkeys(list(cur_shares) + list(by_code)))
+    for code in codes:
+        q = qmap.get(code) or {}
+        close = to_float(q.get("price"), None)
+        prev = to_float(q.get("prev_close"), None)
+        buys = by_code.get(code, {}).get("buy") or []
+        sells = by_code.get(code, {}).get("sell") or []
+        bought = sum(b["shares"] for b in buys)
+        sold = sum(s["shares"] for s in sells)
+        # 日初股数 = 当前股数 − 当日买入 + 当日卖出（清仓票会落回 0）
+        open_held = cur_shares.get(code, 0) - bought + sold
+        if close is None:
+            missing.append(code)
+            continue
+        if prev is None and q.get("change") is not None:
+            chg = to_float(q.get("change"), None)
+            if chg is not None:
+                prev = close - chg
+        if open_held and prev is None:
+            missing.append(code)
+            continue
+        seg = 0.0
+        if open_held:
+            seg += (close - prev) * open_held
+            day_start_mv += float(prev) * open_held
+        for b in buys:
+            seg += (close - b["price"]) * b["shares"]
+        for s in sells:
+            seg += (s["price"] - close) * s["shares"]
+        seg -= fees_by_code.get(code, 0.0)
+        raw_total += seg
+        per_code[code] = round(seg, 2)
+
+    counted_fee = round(sum(fees_by_code.get(c, 0.0) for c in per_code), 2)
+    if per_code:
+        total: Optional[float] = round(raw_total, 2)
+    elif codes:
+        total = None          # 有仓/有成交但一个价都拿不到：不冒充 0
+    else:
+        total = 0.0
+    return {
+        "total": total,
+        "per_code": per_code,
+        "fees": counted_fee,
+        "day_start_mv": round(day_start_mv, 2),
+        "incomplete": bool(missing),
+        "missing": missing,
+        "cleared": [c for c in by_code if not cur_shares.get(c)],
+    }
+
+
 class LedgerError(RuntimeError):
     """台账操作失败（消息面向 Agent，说明原因与可行动作）。"""
 

@@ -243,11 +243,14 @@ def build_board(data: Dict[str, Any], hints_cfg: Any,
 
     if not any(buckets.values()):
         return None
+    today_txt = _f(data.get("today_pnl"))
+    if data.get("today_pnl_incomplete"):
+        today_txt += "，不完整"
     return {
         "title": (f"持仓看板 · {len(positions)} 只持仓"
                   f"｜市值 {_money(total_mv)}"
                   f"｜浮盈 {_f(data.get('float_pnl'))}"
-                  f"（今日 {_f(data.get('today_pnl'))}）"
+                  f"（今日 {today_txt}）"
                   f"｜可用 {_money(data.get('cash'))}"),
         "columns": [{"name": name, "cards": buckets[name]} for name in
                     (COLUMN_URGENT, COLUMN_HOLDING, COLUMN_IDLE)],
