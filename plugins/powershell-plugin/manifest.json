@@ -1,0 +1,15 @@
+{
+  "name": "powershell-plugin",
+  "version": "1.0.0",
+  "description": "Windows 原生命令执行层：持久 PowerShell 会话（同一会话内连续命令 2–30ms，对比每次新建进程 220–400ms）+ Unix 写法自动翻译（ls -la / rm -rf / cat|head / grep / find / a && b / export / $HOME / /dev/null → PowerShell 等价物，每处改写都回显）+ UTF-8 编码治理（含子进程 PYTHONUTF8，Get-Content 自动补 -Encoding UTF8）+ 输出治理（表格 4000 列宽、关进度条、去 CLIXML 噪声、超长保留头尾）。工具：ps_run（前台/后台执行，fresh=true 用一次性干净进程）、ps_session（会话与后台任务管理）。零第三方依赖，只用标准库 + 宿主稳定接口。",
+  "path": "plugins/powershell-plugin",
+  "tools": [
+    "ps_run",
+    "ps_session"
+  ],
+  "permissions": {
+    "exec": [
+      "*"
+    ]
+  }
+}
